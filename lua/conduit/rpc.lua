@@ -17,6 +17,7 @@ Rpc.__index = Rpc
 ---@field on_stderr? fun(data: string)
 ---@field on_exit? fun(code: integer, signal: integer)
 
+-- decode json object to lua table
 local function decode(line)
     local options = {
         luanil = {
@@ -31,6 +32,7 @@ end
 ---@param opts conduit.RpcOpts
 ---@return conduit.Rpc?, string?
 function Rpc.start(cmd, opts)
+    -- init default config for rpc opts
     local table = {
         next_id = 0,
         pending = {},
@@ -43,6 +45,7 @@ function Rpc.start(cmd, opts)
         cwd = opts.cwd,
         env = opts.env,
         stdin = true,
+        -- call stdout on main thread
         stdout = function(_, data)
             if data then
                 vim.schedule(function()
@@ -50,6 +53,7 @@ function Rpc.start(cmd, opts)
                 end)
             end
         end,
+        -- call stderr on main thread
         stderr = function(_, data)
             if data and opts.on_stderr then
                 vim.schedule(function()
@@ -73,7 +77,9 @@ function Rpc:_send(msg)
     if self.closed then
         return
     end
+    -- add jsonrpc version to message
     msg.jsonrpc = "2.0"
+    -- send via protected call
     pcall(self.proc.write, self.proc, vim.json.encode(msg) .. "\n")
 end
 

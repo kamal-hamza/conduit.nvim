@@ -52,11 +52,13 @@ function Agent:start(cb)
     end
     self.state = "starting"
 
+    -- check if the agent cmd is executable
     local cmd = { self.spec.cmd, unpack(self.spec.args or {}) }
     if vim.fn.executable(self.spec.cmd) == 0 then
         return self:_started(("executable not found: %s"):format(self.spec.cmd))
     end
 
+    -- create rpc object
     local rpc, err = Rpc.start(cmd, {
         cwd = vim.fn.getcwd(),
         env = self.spec.env,
@@ -73,13 +75,17 @@ function Agent:start(cb)
             self:_on_exit(code)
         end,
     })
+    -- if not rpc then return error
     if not rpc then
         return self:_started(err)
     end
+    -- store rpc instance
     self.rpc = rpc
 
+    -- initial rpc request handshake
     rpc:request("initialize", {
         protocolVersion = PROTOCOL_VERSION,
+        -- no terminal capabilties, only fs
         clientCapabilities = {
             fs = { readTextFile = true, writeTextFile = true },
             terminal = false,
