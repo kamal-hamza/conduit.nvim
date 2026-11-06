@@ -451,3 +451,12 @@ test("api: every :Conduit subcommand resolves", function()
         assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
     end
 end)
+
+test("agent: requests after the agent exits fail cleanly", function()
+    local agent = require("conduit.agent").new("mock", require("conduit.config").options.agents.mock)
+    local err
+    agent:prompt("gone", {}, function(e)
+        err = e
+    end)
+    assert(err == "mock is not running", err)
+end)

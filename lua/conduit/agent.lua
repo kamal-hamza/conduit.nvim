@@ -109,6 +109,18 @@ end
 
 ---Create a session, then apply the agent's configured default options
 ---(`spec.options`) merged with `overrides`.
+---Send a request, failing cleanly if the agent process isn't running
+---(e.g. it exited after a session was created).
+---@param method string
+---@param params table
+---@param cb fun(err: table?, result: any)
+function Agent:_request(method, params, cb)
+    if not self.rpc then
+        return cb({ code = -32603, message = ("%s is not running"):format(self.name) })
+    end
+    self.rpc:request(method, params, cb)
+end
+
 ---@param cwd string
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
@@ -117,7 +129,7 @@ function Agent:new_session(cwd, handler, cb, overrides)
     local params = { cwd = cwd, mcpServers = {} }
     local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
     local function attempt(retry)
-        self.rpc:request("session/new", params, function(err, result)
+        self:_request("session/new", params, function(err, result)
             if err and err.code == AUTH_REQUIRED and retry then
                 return self:authenticate(function(auth_err)
                     if auth_err then
@@ -196,7 +208,7 @@ function Agent:set_option(sid, id, value, cb)
     else
         method, params = "session/set_config_option", { sessionId = sid, configId = option.id, value = value }
     end
-    self.rpc:request(method, params, function(err, result)
+    self:_request(method, params, function(err, result)
         if err then
             return cb(errmsg(err))
         end
@@ -225,7 +237,7 @@ function Agent:authenticate(cb)
         if not choice then
             return cb("authentication cancelled")
         end
-        self.rpc:request("authenticate", { methodId = choice.id }, function(err)
+        self:_request("authenticate", { methodId = choice.id }, function(err)
             cb(err and errmsg(err) or nil)
         end)
     end)
@@ -235,7 +247,7 @@ end
 ---@param prompt table[] ACP ContentBlocks
 ---@param cb fun(err: string?, result: table?)
 function Agent:prompt(session_id, prompt, cb)
-    self.rpc:request("session/prompt", { sessionId = session_id, prompt = prompt }, function(err, result)
+    self:_request("session/prompt", { sessionId = session_id, prompt = prompt }, function(err, result)
         cb(err and errmsg(err) or nil, result)
     end)
 end
