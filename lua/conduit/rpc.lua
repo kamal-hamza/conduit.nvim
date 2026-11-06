@@ -18,14 +18,27 @@ Rpc.__index = Rpc
 ---@field on_exit? fun(code: integer, signal: integer)
 
 local function decode(line)
-    return pcall(vim.json.decode, line, { luanil = { object = true, array = true } })
+    local options = {
+        luanil = {
+            object = true,
+            array = true,
+        },
+    }
+    return pcall(vim.json.decode, line, options)
 end
 
 ---@param cmd string[]
 ---@param opts conduit.RpcOpts
 ---@return conduit.Rpc?, string?
 function Rpc.start(cmd, opts)
-    local self = setmetatable({ next_id = 0, pending = {}, buf = "", opts = opts, closed = false }, Rpc)
+    local table = {
+        next_id = 0,
+        pending = {},
+        buf = "",
+        opts = opts,
+        closed = false
+    }
+    local self = setmetatable(table, Rpc)
     local ok, proc = pcall(vim.system, cmd, {
         cwd = opts.cwd,
         env = opts.env,
