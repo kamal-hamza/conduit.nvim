@@ -1,0 +1,310 @@
+--- An ACP agent subprocess. Neovim acts as the ACP *client*.
+--- Spec: https://agentclientprotocol.com
+local Rpc = require("conduit.rpc")
+local log = require("conduit.log")
+local options = require("conduit.options")
+
+local PROTOCOL_VERSION = 1
+local AUTH_REQUIRED = -32000
+
+---@class conduit.SessionHandler
+---@field on_update fun(self, update: table)
+---@field request_permission fun(self, params: table, respond: fun(err: table?, result: any))
+---@field on_agent_exit fun(self, code: integer)
+
+---@class conduit.Agent
+---@field name string
+---@field spec conduit.AgentSpec
+---@field rpc? conduit.Rpc
+---@field info? table Result of `initialize`
+---@field state "idle"|"starting"|"ready"
+---@field sessions table<string, conduit.SessionHandler>
+---@field options table<string, conduit.Option[]> Session options by session id
+local Agent = {}
+Agent.__index = Agent
+
+---@param err table|string
+---@return string
+local function errmsg(err)
+    if type(err) == "table" then
+        local msg = err.message or vim.inspect(err)
+        local details = type(err.data) == "table" and err.data.details
+        return details and ("%s: %s"):format(msg, details) or msg
+    end
+    return tostring(err)
+end
+
+---@param name string
+---@param spec conduit.AgentSpec
+function Agent.new(name, spec)
+    return setmetatable({ name = name, spec = spec, state = "idle", sessions = {}, options = {}, waiting = {} }, Agent)
+end
+
+---Spawn the agent and run the `initialize` handshake.
+---@param cb fun(err: string?)
+function Agent:start(cb)
+    if self.state == "ready" then
+        return cb(nil)
+    end
+    table.insert(self.waiting, cb)
+    if self.state == "starting" then
+        return
+    end
+    self.state = "starting"
+
+    local cmd = { self.spec.cmd, unpack(self.spec.args or {}) }
+    if vim.fn.executable(self.spec.cmd) == 0 then
+        return self:_started(("executable not found: %s"):format(self.spec.cmd))
+    end
+
+    local rpc, err = Rpc.start(cmd, {
+        cwd = vim.fn.getcwd(),
+        env = self.spec.env,
+        on_request = function(method, params, respond)
+            self:_on_request(method, params, respond)
+        end,
+        on_notification = function(method, params)
+            self:_on_notification(method, params)
+        end,
+        on_stderr = function(data)
+            log.debug(("%s stderr: %s"):format(self.name, data))
+        end,
+        on_exit = function(code)
+            self:_on_exit(code)
+        end,
+    })
+    if not rpc then
+        return self:_started(err)
+    end
+    self.rpc = rpc
+
+    rpc:request("initialize", {
+        protocolVersion = PROTOCOL_VERSION,
+        clientCapabilities = {
+            fs = { readTextFile = true, writeTextFile = true },
+            terminal = false,
+        },
+        clientInfo = { name = "conduit.nvim", version = require("conduit").version },
+    }, function(e, result)
+        if e then
+            rpc:stop()
+            return self:_started("initialize failed: " .. errmsg(e))
+        end
+        self.info = result or {}
+        self.state = "ready"
+        self:_started(nil)
+    end)
+end
+
+function Agent:_started(err)
+    if err then
+        self.state = "idle"
+    end
+    local waiting = self.waiting
+    self.waiting = {}
+    for _, cb in ipairs(waiting) do
+        cb(err)
+    end
+end
+
+---Create a session, then apply the agent's configured default options
+---(`spec.options`) merged with `overrides`.
+---@param cwd string
+---@param handler conduit.SessionHandler
+---@param cb fun(err: string?, session_id: string?, result: table?)
+---@param overrides? table<string, string>
+function Agent:new_session(cwd, handler, cb, overrides)
+    local params = { cwd = cwd, mcpServers = {} }
+    local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
+    local function attempt(retry)
+        self.rpc:request("session/new", params, function(err, result)
+            if err and err.code == AUTH_REQUIRED and retry then
+                return self:authenticate(function(auth_err)
+                    if auth_err then
+                        return cb(auth_err)
+                    end
+                    attempt(false)
+                end)
+            elseif err then
+                return cb(errmsg(err))
+            end
+            local sid = result.sessionId
+            self.sessions[sid] = handler
+            self.options[sid] = options.from_session(result)
+            self:_apply_defaults(sid, defaults, function()
+                cb(nil, sid, result)
+            end)
+        end)
+    end
+    attempt(true)
+end
+
+---@param sid string
+---@param defaults table<string, string>
+---@param cb fun()
+function Agent:_apply_defaults(sid, defaults, cb)
+    local keys = vim.tbl_keys(defaults)
+    table.sort(keys)
+    local function step(i)
+        local key = keys[i]
+        if not key then
+            return cb()
+        end
+        local option = options.find(self.options[sid] or {}, key)
+        if not option then
+            log.warn(("%s has no %q option, ignoring default"):format(self.name, key))
+            return step(i + 1)
+        end
+        if option.current == defaults[key] then
+            return step(i + 1)
+        end
+        self:set_option(sid, option.id, defaults[key], function(err)
+            if err then
+                log.warn(("could not set %s=%s: %s"):format(key, defaults[key], err))
+            end
+            step(i + 1)
+        end)
+    end
+    step(1)
+end
+
+---@param sid string
+---@return conduit.Option[]
+function Agent:get_options(sid)
+    return self.options[sid] or {}
+end
+
+---@param sid string
+---@param id string Option id
+---@param value string
+---@param cb? fun(err: string?)
+function Agent:set_option(sid, id, value, cb)
+    cb = cb or function(err)
+        if err then
+            log.error(err)
+        end
+    end
+    local option = options.find(self:get_options(sid), id)
+    if not option then
+        return cb(("unknown option %q"):format(id))
+    end
+    local method, params
+    if option.legacy == "mode" then
+        method, params = "session/set_mode", { sessionId = sid, modeId = value }
+    elseif option.legacy == "model" then
+        method, params = "session/set_model", { sessionId = sid, modelId = value }
+    else
+        method, params = "session/set_config_option", { sessionId = sid, configId = option.id, value = value }
+    end
+    self.rpc:request(method, params, function(err, result)
+        if err then
+            return cb(errmsg(err))
+        end
+        if result and result.configOptions then
+            self.options[sid] = options.from_config_options(result.configOptions)
+        else
+            option.current = value
+        end
+        cb(nil)
+    end)
+end
+
+---Ask the user to pick one of the agent's advertised auth methods.
+---@param cb fun(err: string?)
+function Agent:authenticate(cb)
+    local methods = self.info and self.info.authMethods or {}
+    if #methods == 0 then
+        return cb(self.name .. " requires authentication but advertised no auth methods")
+    end
+    vim.ui.select(methods, {
+        prompt = self.name .. " requires authentication",
+        format_item = function(m)
+            return m.description and ("%s: %s"):format(m.name, m.description) or m.name
+        end,
+    }, function(choice)
+        if not choice then
+            return cb("authentication cancelled")
+        end
+        self.rpc:request("authenticate", { methodId = choice.id }, function(err)
+            cb(err and errmsg(err) or nil)
+        end)
+    end)
+end
+
+---@param session_id string
+---@param prompt table[] ACP ContentBlocks
+---@param cb fun(err: string?, result: table?)
+function Agent:prompt(session_id, prompt, cb)
+    self.rpc:request("session/prompt", { sessionId = session_id, prompt = prompt }, function(err, result)
+        cb(err and errmsg(err) or nil, result)
+    end)
+end
+
+---@param session_id string
+function Agent:cancel(session_id)
+    if self.rpc then
+        self.rpc:notify("session/cancel", { sessionId = session_id })
+    end
+end
+
+function Agent:stop()
+    if self.rpc then
+        self.rpc:stop()
+    end
+end
+
+function Agent:_on_request(method, params, respond)
+    if method == "fs/read_text_file" then
+        local result, err = require("conduit.fs").read(params)
+        respond(err, result)
+    elseif method == "fs/write_text_file" then
+        local result, err = require("conduit.fs").write(params)
+        respond(err, result)
+    elseif method == "session/request_permission" then
+        local session = self.sessions[params.sessionId]
+        if not session then
+            return respond(nil, { outcome = { outcome = "cancelled" } })
+        end
+        session:request_permission(params, respond)
+    else
+        respond({ code = -32601, message = "Method not found: " .. method })
+    end
+end
+
+function Agent:_on_notification(method, params)
+    if method == "session/update" then
+        local sid, update = params.sessionId, params.update
+        if update.sessionUpdate == "config_option_update" then
+            self.options[sid] = options.from_config_options(update.configOptions or {})
+        elseif update.sessionUpdate == "current_mode_update" then
+            local mode = options.find(self:get_options(sid), "mode")
+            if mode then
+                mode.current = update.currentModeId
+            end
+        end
+        local session = self.sessions[sid]
+        if session then
+            session:on_update(params.update)
+        end
+    else
+        log.debug(("%s: unhandled notification %s"):format(self.name, method))
+    end
+end
+
+function Agent:_on_exit(code)
+    log.debug(("%s exited with code %d"):format(self.name, code))
+    local was_starting = self.state == "starting"
+    self.state = "idle"
+    self.rpc = nil
+    local sessions = self.sessions
+    self.sessions = {}
+    self.options = {}
+    for _, session in pairs(sessions) do
+        session:on_agent_exit(code)
+    end
+    if was_starting then
+        self:_started(("agent exited during startup (code %d), see :Conduit log"):format(code))
+    end
+end
+
+return Agent
