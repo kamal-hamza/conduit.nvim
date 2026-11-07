@@ -1235,14 +1235,15 @@ test("mcp: skips servers it can't send, warning once each", function()
             },
         },
         ok = { command = "sh" },
-    }
+    } --[[@as conduit.McpServers]] -- deliberately invalid entries
     local agent = { name = "skipper", spec = { cmd = "fake" }, info = { agentCapabilities = {} } }
     local mcp = require("conduit.mcp")
-    local servers
+    local found ---@type table[]?
     local warned = warnings(function()
-        servers = mcp.servers(agent)
+        found = mcp.servers(agent)
         mcp.servers(agent)
     end)
+    local servers = assert(found)
     config.mcp_servers = {}
     assert(#servers == 1 and servers[1].name == "ok", vim.inspect(servers))
     assert(#warned == 6, vim.inspect(warned))
@@ -1276,7 +1277,10 @@ test("mcp: every session method sends the servers", function()
     ---@param open fun(cb: fun(err: string?, sid: string?, result: table?))
     ---@return table servers, string sid
     local function sent(open)
-        local done, err, sid, result
+        local done = false
+        local err ---@type string?
+        local sid ---@type string?
+        local result ---@type table?
         open(function(e, s, r)
             done, err, sid, result = true, e, s, r
         end)
@@ -1284,11 +1288,13 @@ test("mcp: every session method sends the servers", function()
             return done
         end, "session to open")
         assert(not err, err)
-        return assert(result)._meta.mcpServers, sid
+        local meta = assert(assert(result)._meta) --[[@as table]]
+        return meta.mcpServers, assert(sid)
     end
 
     local cwd = vim.fn.getcwd()
-    local servers, sid
+    local servers ---@type table
+    local sid = "" ---@type string
     warnings(function()
         servers, sid = sent(function(cb)
             agent:new_session(cwd, null_handler, cb)
@@ -1314,14 +1320,19 @@ test("mcp: inline requests only get servers with inline.mcp_servers", function()
     local config = require("conduit.config").options
     config.mcp_servers = { tool = { command = "sh" } }
     local agent = assert(conduit.agent("mock"))
-    local request = agent._request
+    local request = agent._request --[[@as fun(self: conduit.Agent, method: string, params: table, cb: fun(err: table?, result: any))]]
     local sent = {}
-    agent._request = function(self, method, params, cb)
+    ---@param self conduit.Agent
+    ---@param method string
+    ---@param params table
+    ---@param cb fun(err: table?, result: any)
+    local function spy(self, method, params, cb)
         if method == "session/new" then
             table.insert(sent, #params.mcpServers)
         end
         return request(self, method, params, cb)
     end
+    rawset(agent, "_request", spy)
     local inline = require("conduit.inline")
     for _, enabled in ipairs({ false, true }) do
         config.inline.mcp_servers = enabled
@@ -1333,7 +1344,7 @@ test("mcp: inline requests only get servers with inline.mcp_servers", function()
         end, "inline edit")
         vim.cmd("bwipeout!")
     end
-    agent._request = request
+    rawset(agent, "_request", nil) -- back to the class method
     config.inline.mcp_servers = false
     config.mcp_servers = {}
     assert(vim.deep_equal(sent, { 0, 1 }), vim.inspect(sent))
