@@ -14,12 +14,15 @@ local M = {}
 ---@field persist boolean Keep a local index of threads (ids and titles, not transcripts)
 ---@field max_listed integer Most past threads to fetch from the agent
 ---@field hide_inline boolean Leave inline requests' sessions out of thread lists
+---@field notify boolean Notify when a thread you're not looking at finishes or needs permission
 
 ---@class conduit.UiConfig
 ---@field width number
 ---@field input_height integer
 ---@field icons boolean
 ---@field spinner string[]
+---@field picker "auto"|"snacks"|"telescope"|"fzf_lua"|"mini_pick"|"select"|conduit.PickerProvider
+---@field thread_bar boolean
 ---@field inline { width: { min: integer, max: integer } }
 
 ---@class conduit.Config
@@ -46,6 +49,13 @@ M.defaults = {
         icons = false,
         -- Progress animation frames; a single frame disables the animation.
         spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+        -- Picker for threads and search: "auto" uses snacks.nvim, telescope.nvim, fzf-lua
+        -- or mini.pick when loaded (in that order), else vim.ui.select. Or name one, or
+        -- pass a function that takes a conduit.PickerSpec.
+        picker = "auto",
+        -- Show threads as tabs in the chat's winbar; state and options move to the
+        -- prompt's winbar.
+        thread_bar = true,
         inline = {
             -- Width of the inline prompt and answer floats, in columns.
             width = { min = 40, max = 84 },
@@ -79,6 +89,8 @@ M.defaults = {
         max_listed = 200,
         -- Leave inline requests' sessions out of thread lists.
         hide_inline = true,
+        -- Notify when a thread you're not looking at finishes a turn or asks for permission.
+        notify = true,
     },
     log_level = vim.log.levels.WARN,
 }

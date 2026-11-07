@@ -23,6 +23,7 @@ local M = {}
 ---global server off in an agent's `mcp_servers`.
 ---@alias conduit.McpServers table<string, conduit.McpServer|false>|conduit.McpServer[]
 
+---@type table<string, boolean>
 local TYPES = { stdio = true, http = true, sse = true }
 
 -- Problems already reported, so each is warned about once per agent and server.
@@ -106,7 +107,8 @@ end
 ---@param caps? table Agent `mcpCapabilities`; nil skips the transport check
 ---@return table? entry, string? err Why the server can't be sent
 function M.build(name, server, caps)
-    local kind = server.type or "stdio"
+    -- User config: `type` can hold anything, whatever the annotation says.
+    local kind = server.type or "stdio" ---@type string
     if not TYPES[kind] then
         return nil, ("unknown type %q"):format(tostring(kind))
     end

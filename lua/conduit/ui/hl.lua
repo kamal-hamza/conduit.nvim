@@ -19,6 +19,15 @@ local GROUPS = {
     ConduitInlinePending = { link = "CursorLine" },
     ConduitInlineSign = { link = "DiagnosticInfo" },
     ConduitInlineStatus = { link = "Comment" },
+    ConduitThreadActive = { link = "Title" },
+    ConduitThreadInactive = { link = "Comment" },
+    ConduitThreadSeparator = { link = "WinSeparator" },
+    ConduitThreadBusy = { link = "DiagnosticInfo" },
+    ConduitThreadUnread = { link = "DiagnosticWarn" },
+    ConduitThreadWaiting = { link = "DiagnosticError" },
+    ConduitThreadNew = { link = "Special" },
+    ConduitThreadMeta = { link = "Comment" },
+    ConduitSearchMatch = { link = "Search" },
 }
 
 local function apply()
@@ -50,7 +59,7 @@ M.WINHIGHLIGHT = "NormalFloat:ConduitNormal,FloatBorder:ConduitBorder,FloatTitle
 local NO_TITLE = { [""] = true, none = true, shadow = true }
 
 ---Border for floats: nil defers to the user's 'winborder' when it's set.
----@return string?
+---@return "rounded"?
 function M.border()
     return NO_TITLE[vim.o.winborder] and "rounded" or nil
 end

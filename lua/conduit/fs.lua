@@ -2,12 +2,22 @@
 --- over the disk so agents see (and edit) what the user sees.
 local M = {}
 
+---Normalized path with symlinks resolved: Neovim names buffers by their real
+---path, while agents may send one through a symlink (e.g. macOS's /var).
+---@param path string
+---@return string
+local function canonical(path)
+    path = vim.fs.normalize(path)
+    return vim.uv.fs_realpath(path) or path
+end
+
 ---@param path string
 ---@return integer?
 local function find_buf(path)
-    path = vim.fs.normalize(path)
+    path = canonical(path)
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-        if vim.api.nvim_buf_is_loaded(buf) and vim.fs.normalize(vim.api.nvim_buf_get_name(buf)) == path then
+        local name = vim.api.nvim_buf_get_name(buf)
+        if vim.api.nvim_buf_is_loaded(buf) and name ~= "" and canonical(name) == path then
             return buf
         end
     end
