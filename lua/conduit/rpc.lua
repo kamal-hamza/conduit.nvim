@@ -38,7 +38,7 @@ function Rpc.start(cmd, opts)
         pending = {},
         buf = "",
         opts = opts,
-        closed = false
+        closed = false,
     }
     local self = setmetatable(table, Rpc)
     local ok, proc = pcall(vim.system, cmd, {
