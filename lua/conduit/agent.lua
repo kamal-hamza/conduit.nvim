@@ -460,7 +460,7 @@ function Agent:_on_notification(method, params)
                 mode.current = update.currentModeId
             end
         end
-        local session = self.sessions[sid]
+        local session = self.sessions[sid] ---@type conduit.SessionHandler?
         if session then
             session:on_update(params.update)
         end
