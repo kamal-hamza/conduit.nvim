@@ -7,10 +7,17 @@ local M = {}
 ---@field options? table<string, string> Session options applied to every new session, keyed by
 ---option id or category, e.g. `{ model = "opus", effort = "high", mode = "acceptEdits" }`
 
+---@class conduit.UiConfig
+---@field width number
+---@field input_height integer
+---@field icons boolean
+---@field spinner string[]
+---@field inline { width: { min: integer, max: integer } }
+
 ---@class conduit.Config
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
----@field ui { width: number, input_height: integer }
+---@field ui conduit.UiConfig
 ---@field inline { agent?: string, options: table<string, string> }
 ---@field mentions { completion: "auto"|"blink"|"native" }
 ---@field log_level integer
@@ -25,6 +32,14 @@ M.defaults = {
         -- Fraction of the editor width (<= 1) or an absolute column count.
         width = 0.4,
         input_height = 6,
+        -- Nerd Font glyphs in float titles.
+        icons = false,
+        -- Progress animation frames; a single frame disables the animation.
+        spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+        inline = {
+            -- Width of the inline prompt and answer floats, in columns.
+            width = { min = 40, max = 84 },
+        },
     },
     inline = {
         -- Agent for inline edits; defaults to `default_agent`.

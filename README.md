@@ -56,6 +56,11 @@ require("conduit").setup({
   ui = {
     width = 0.4,       -- fraction of the editor width, or a column count
     input_height = 6,
+    icons = false,     -- Nerd Font glyphs in float titles
+    spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }, -- one frame turns the animation off
+    inline = {
+      width = { min = 40, max = 84 }, -- inline prompt and answer float width
+    },
   },
   inline = {
     agent = nil,       -- agent for inline edits, defaults to default_agent
@@ -151,14 +156,18 @@ to read itself. Files over 256 KB and binary files are always sent as links.
 ### Inline requests
 
 Select some lines and run `:'<,'>Conduit inline` (`<leader>ai` in the example
-keymaps). A floating prompt opens under the cursor, with `@` completion. Ask
-for a change or ask a question in the same prompt:
+keymaps). A floating prompt opens under the selection (or above it, near the
+bottom of the window), with `@` completion. Its title shows the agent, the mode
+and the lines it's about. Ask for a change or ask a question in the same prompt:
 
 - **Auto** (default): the agent decides. If you ask for a change, the
   selection is rewritten in place as one undoable change. If you ask a
   question, the answer streams into a float under the selection.
 - **Edit** / **Ask** force one or the other. Cycle modes with `<C-t>`, or start
-  the prompt with `!` (edit) or `?` (ask).
+  the prompt with `!` (edit) or `?` (ask); the title updates as you type.
+
+In the prompt, `<CR>` sends, `<S-CR>` adds a line, `<C-c>` (insert) or `q` /
+`<Esc>` (normal) closes it, and `g?` (normal) lists every key.
 
 In the answer float:
 
@@ -169,12 +178,29 @@ In the answer float:
 | `c` | Move the conversation into the chat window, keeping the session |
 | `<C-c>` | Cancel the answer |
 | `q` / `<Esc>` | Close |
+| `g?` | List these keys |
 
-The selection stays highlighted while the request is running or the answer is
-open. You can also pass the request on the command line, e.g.
+While the request runs, the selection is marked in the sign column and a
+spinner above it shows what the agent is doing (thinking, running a tool,
+writing). The mark stays while the answer is open. You can also pass the request on the command line, e.g.
 `:'<,'>Conduit inline why is this slow?`. `:Conduit ask` and `:Conduit edit`
 force a mode. Each request runs in its own throwaway session, so set
 `inline.options` to a fast model and low effort to make them quick.
+
+The floats and inline decorations use these highlight groups, linked to
+standard groups by default:
+
+| Group | Default link | Used for |
+| --- | --- | --- |
+| `ConduitNormal`, `ConduitBorder`, `ConduitTitle` | `NormalFloat`, `FloatBorder`, `FloatTitle` | Float background, border, answer title |
+| `ConduitAgent` | `Title` | Agent name in titles and the status line |
+| `ConduitContext` | `Comment` | File and lines in the prompt title |
+| `ConduitModeAuto`, `ConduitModeEdit`, `ConduitModeAsk` | `Special`, `DiagnosticWarn`, `DiagnosticInfo` | Mode label |
+| `ConduitHintKey`, `ConduitHintDesc` | `Special`, `Comment` | Key hints in footers |
+| `ConduitPlaceholder` | `Comment` | Empty prompt placeholder |
+| `ConduitSpinner` | `DiagnosticInfo` | Progress spinner |
+| `ConduitInlinePending`, `ConduitInlineSign` | `CursorLine`, `DiagnosticInfo` | The range while a request runs |
+| `ConduitInlineStatus` | `Comment` | Progress text |
 
 Run `:checkhealth conduit` to check that your agents can be found.
 
@@ -199,6 +225,8 @@ lua/conduit/
 ├── ui/chat.lua   -- transcript + input buffers, session/update rendering
 ├── ui/prompt.lua  -- floating prompt for inline requests (modes, @ completion)
 ├── ui/answer.lua  -- floating answer window anchored under the selection
+├── ui/hl.lua      -- highlight groups and float helpers (borders, key hints)
+├── ui/spinner.lua -- animated progress indicator
 ├── ui/render.lua  -- markview.nvim integration
 ├── ui/permission.lua
 ├── health.lua    -- :checkhealth conduit
