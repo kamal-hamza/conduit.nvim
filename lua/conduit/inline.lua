@@ -457,7 +457,7 @@ function M.run(opts)
             end
             self:_status("thinking…")
             self:_send(prompt, opts.instruction)
-        end, config.options.inline.options)
+        end, config.options.inline.options, { mcp = config.options.inline.mcp_servers })
     end)
     return self
 end

@@ -37,13 +37,15 @@ See https://agentclientprotocol.com for the protocol.
       spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
       inline = { width = { min = 40, max = 84 } },
     },
-    inline = { agent = nil, options = {} },
+    inline = { agent = nil, options = {}, mcp_servers = false },
+    mcp_servers = {},
     mentions = { completion = "auto" },
     threads = { scope = "cwd", persist = true, max_listed = 200, hide_inline = true },
     log_level = vim.log.levels.WARN,
   })
 <
-Each agent takes `cmd`, plus optional `args`, `env` and `options`. Calling
+Each agent takes `cmd`, plus optional `args`, `env`, `options` and
+`mcp_servers` (see |conduit-mcp|). Calling
 setup() is optional if you're happy with the defaults.
 
 `ui.icons` adds Nerd Font glyphs to float titles. `ui.spinner` is the progress
@@ -61,6 +63,40 @@ them for inline edits. Values depend on the agent; see |:Conduit| `option`.
 in the current directory) or "all"; `persist` keeps a local index of thread ids
 and titles (never transcripts); `max_listed` caps how many past threads are
 fetched; `hide_inline` leaves inline requests' sessions out of thread lists.
+
+                                                                *conduit-mcp*
+`mcp_servers` lists MCP servers that conduit passes to the agent with every
+session (`mcpServers` in ACP). The agent starts them and can use their tools;
+conduit never runs them itself. Servers are keyed by name:
+>lua
+  mcp_servers = {
+    github = {
+      command = "github-mcp",
+      args = {},
+      env = { GITHUB_TOKEN = function() return os.getenv("GH_TOKEN") end },
+    },
+    docs = { type = "http", url = "https://example.com/mcp", headers = {} },
+  },
+<
+`type` is "stdio" (default), "http" or "sse". Stdio servers take `command`
+(looked up in PATH and sent as an absolute path), `args` and `env`. HTTP and
+SSE servers take `url` and `headers`. Values in `env`, `headers` and `args` can
+be functions, called when a session opens. `enabled = false`, or a function
+that returns false, turns a server off. A list of servers with `name` fields is
+accepted too.
+
+An agent's own `mcp_servers` replace global ones of the same name, and `false`
+leaves a global server out for that agent: >lua
+  agents = { gemini = { cmd = "gemini", mcp_servers = { docs = false } } }
+<
+Servers that can't be sent are skipped with a warning: the command isn't
+found, `url` is missing, or the agent doesn't advertise the transport in
+`mcpCapabilities` (every agent supports stdio). Inline requests open a new
+session each time, so they leave servers out unless `inline.mcp_servers` is
+true. |:checkhealth| conduit shows what each agent would get.
+
+Claude Code also loads servers from its own config (`~/.claude.json`,
+`.mcp.json`); a server listed in both places starts twice.
 
 ==============================================================================
 3. COMMANDS                                                 *conduit-commands*

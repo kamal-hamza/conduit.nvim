@@ -19,8 +19,45 @@ function M.check()
         end
     end
 
-    vim.health.start("conduit.nvim: threads")
     local agents = package.loaded["conduit"] and require("conduit").agents or {}
+
+    vim.health.start("conduit.nvim: MCP servers")
+    local mcp = require("conduit.mcp")
+    local any_server = false
+    for name, spec in vim.spairs(options.agents) do
+        local agent = agents[name]
+        -- Transport support is only known once the agent has started.
+        local caps = agent and agent.info and mcp.capabilities(agent) or nil
+        for server_name, server in vim.spairs(mcp.configured(spec)) do
+            any_server = true
+            local label = ("%s: %s"):format(name, server_name)
+            if not mcp.enabled(server) then
+                vim.health.info(label .. " (disabled)")
+            else
+                ---@cast server conduit.McpServer
+                local entry, err = mcp.build(server_name, server, caps)
+                local kind = server.type or "stdio"
+                if not entry then
+                    vim.health.warn(("%s (%s): %s"):format(label, kind, err))
+                else
+                    local target = entry.command or entry.url
+                    local note = ""
+                    if not caps and kind ~= "stdio" then
+                        note = "; start the agent to check it supports " .. kind
+                    end
+                    vim.health.ok(("%s (%s): `%s`%s"):format(label, kind, target, note))
+                end
+            end
+        end
+    end
+    if not any_server then
+        vim.health.info("None configured (`mcp_servers`)")
+    end
+    if options.inline.mcp_servers ~= true then
+        vim.health.info("Inline requests run without MCP servers (`inline.mcp_servers`)")
+    end
+
+    vim.health.start("conduit.nvim: threads")
     local any = false
     for name, agent in vim.spairs(agents) do
         if agent.info then

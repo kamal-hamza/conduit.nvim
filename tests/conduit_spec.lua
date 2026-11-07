@@ -1097,3 +1097,209 @@ test("threads: continue reopens the most recent past thread", function()
     assert(conduit.current == chat and other ~= chat)
     drop_agent("continuer")
 end)
+
+---A handler for sessions a test opens directly.
+---@type conduit.SessionHandler
+local null_handler = {
+    on_update = function() end,
+    request_permission = function(_, _, respond)
+        respond(nil, { outcome = { outcome = "cancelled" } })
+    end,
+    on_agent_exit = function() end,
+}
+
+---Collect log warnings while `fn` runs.
+---@param fn fun()
+---@return string[]
+local function warnings(fn)
+    local log = require("conduit.log")
+    local orig, out = log.warn, {}
+    log.warn = function(msg)
+        table.insert(out, msg)
+    end
+    local ok, err = pcall(fn)
+    log.warn = orig
+    assert(ok, err)
+    return out
+end
+
+test("mcp: builds stdio and http servers in ACP shape", function()
+    local config = require("conduit.config").options
+    local sh = vim.fn.exepath("sh")
+    config.mcp_servers = {
+        local_tool = {
+            command = "sh",
+            args = { "-c", 42 },
+            env = {
+                ZED = "z",
+                TOKEN = function()
+                    return "secret"
+                end,
+            },
+        },
+        docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer x" } },
+    }
+    local agent = {
+        name = "fake",
+        spec = { cmd = "fake" },
+        info = { agentCapabilities = { mcpCapabilities = { http = true } } },
+    }
+    local servers = require("conduit.mcp").servers(agent)
+    config.mcp_servers = {}
+    assert(
+        vim.deep_equal(servers, {
+            {
+                type = "http",
+                name = "docs",
+                url = "https://example.com/mcp",
+                headers = { { name = "Authorization", value = "Bearer x" } },
+            },
+            {
+                name = "local_tool",
+                command = sh,
+                args = { "-c", "42" },
+                env = { { name = "TOKEN", value = "secret" }, { name = "ZED", value = "z" } },
+            },
+        }),
+        vim.inspect(servers)
+    )
+end)
+
+test("mcp: accepts a list and per-agent overrides", function()
+    local config = require("conduit.config").options
+    config.mcp_servers = {
+        { name = "one", command = "sh" },
+        { name = "two", command = "sh" },
+        { name = "three", command = "sh", enabled = false },
+    }
+    local agent = {
+        name = "fake",
+        spec = { cmd = "fake", mcp_servers = { two = false, four = { command = "sh", args = { "x" } } } },
+    }
+    local names = vim.tbl_map(function(s)
+        return s.name
+    end, require("conduit.mcp").servers(agent))
+    config.mcp_servers = {}
+    assert(vim.deep_equal(names, { "four", "one" }), vim.inspect(names))
+end)
+
+test("mcp: skips servers it can't send, warning once each", function()
+    local config = require("conduit.config").options
+    config.mcp_servers = {
+        nocmd = {},
+        missing = { command = "conduit-no-such-mcp-server" },
+        nourl = { type = "http" },
+        http = { type = "http", url = "https://example.com/mcp" },
+        weird = { type = "carrier-pigeon", url = "x" },
+        broken = {
+            command = "sh",
+            env = {
+                TOKEN = function()
+                    error("hidden-value")
+                end,
+            },
+        },
+        ok = { command = "sh" },
+    }
+    local agent = { name = "skipper", spec = { cmd = "fake" }, info = { agentCapabilities = {} } }
+    local mcp = require("conduit.mcp")
+    local servers
+    local warned = warnings(function()
+        servers = mcp.servers(agent)
+        mcp.servers(agent)
+    end)
+    config.mcp_servers = {}
+    assert(#servers == 1 and servers[1].name == "ok", vim.inspect(servers))
+    assert(#warned == 6, vim.inspect(warned))
+    local text = table.concat(warned, "\n")
+    for _, want in ipairs({
+        "missing command",
+        "command not found: conduit-no-such-mcp-server",
+        "missing url",
+        "doesn't support http",
+        'unknown type "carrier-pigeon"',
+        "env.TOKEN",
+    }) do
+        assert(text:find(want, 1, true), want .. " in " .. text)
+    end
+end)
+
+test("mcp: every session method sends the servers", function()
+    local config = require("conduit.config").options
+    config.mcp_servers = {
+        tool = { command = "sh", env = { A = "1" } },
+        docs = { type = "http", url = "https://example.com/mcp" },
+        events = { type = "sse", url = "https://example.com/sse" },
+    }
+    local agent = thread_agent("mcper", ALL_CAPS, "--mcp=http")
+    local sh = vim.fn.exepath("sh")
+    local want = {
+        { type = "http", name = "docs", url = "https://example.com/mcp", headers = {} },
+        { name = "tool", command = sh, args = {}, env = { { name = "A", value = "1" } } },
+    }
+
+    ---@param open fun(cb: fun(err: string?, sid: string?, result: table?))
+    ---@return table servers, string sid
+    local function sent(open)
+        local done, err, sid, result
+        open(function(e, s, r)
+            done, err, sid, result = true, e, s, r
+        end)
+        wait_for(function()
+            return done
+        end, "session to open")
+        assert(not err, err)
+        return assert(result)._meta.mcpServers, sid
+    end
+
+    local cwd = vim.fn.getcwd()
+    local servers, sid
+    warnings(function()
+        servers, sid = sent(function(cb)
+            agent:new_session(cwd, null_handler, cb)
+        end)
+    end)
+    assert(vim.deep_equal(servers, want), vim.inspect(servers))
+    local ref = { session_id = sid, cwd = cwd }
+    for _, method in ipairs({ "load_session", "resume_session", "fork_session" }) do
+        servers = sent(function(cb)
+            agent[method](agent, ref, null_handler, cb)
+        end)
+        assert(vim.deep_equal(servers, want), method .. ": " .. vim.inspect(servers))
+    end
+    servers = sent(function(cb)
+        agent:new_session(cwd, null_handler, cb, nil, { mcp = false })
+    end)
+    assert(vim.tbl_isempty(servers), vim.inspect(servers))
+    config.mcp_servers = {}
+    drop_agent("mcper")
+end)
+
+test("mcp: inline requests only get servers with inline.mcp_servers", function()
+    local config = require("conduit.config").options
+    config.mcp_servers = { tool = { command = "sh" } }
+    local agent = assert(conduit.agent("mock"))
+    local request = agent._request
+    local sent = {}
+    agent._request = function(self, method, params, cb)
+        if method == "session/new" then
+            table.insert(sent, #params.mcpServers)
+        end
+        return request(self, method, params, cb)
+    end
+    local inline = require("conduit.inline")
+    for _, enabled in ipairs({ false, true }) do
+        config.inline.mcp_servers = enabled
+        vim.cmd.enew()
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { "local a = 1" })
+        conduit.inline(1, 1, "uppercase it")
+        wait_for(function()
+            return next(inline.jobs) == nil
+        end, "inline edit")
+        vim.cmd("bwipeout!")
+    end
+    agent._request = request
+    config.inline.mcp_servers = false
+    config.mcp_servers = {}
+    assert(vim.deep_equal(sent, { 0, 1 }), vim.inspect(sent))
+end)
