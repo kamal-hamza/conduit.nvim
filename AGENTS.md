@@ -52,6 +52,8 @@ lua/conduit/
   ui/chat.lua           Chat transcript + prompt buffers, session/update rendering
   ui/prompt.lua         Floating prompt (modes, @ completion)
   ui/answer.lua         Floating answer window anchored to a buffer line
+  ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
+  ui/spinner.lua        Animated progress indicator (uv timer)
   ui/permission.lua     Permission requests via vim.ui.select
   ui/render.lua         markview.nvim integration
 tests/

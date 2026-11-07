@@ -30,7 +30,13 @@ See https://agentclientprotocol.com for the protocol.
       gemini = { cmd = "gemini", args = { "--experimental-acp" } },
       codex = { cmd = "npx", args = { "-y", "@agentclientprotocol/codex-acp" } },
     },
-    ui = { width = 0.4, input_height = 6 },
+    ui = {
+      width = 0.4,
+      input_height = 6,
+      icons = false,
+      spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+      inline = { width = { min = 40, max = 84 } },
+    },
     inline = { agent = nil, options = {} },
     mentions = { completion = "auto" },
     threads = { scope = "cwd", persist = true, max_listed = 200, hide_inline = true },
@@ -39,6 +45,11 @@ See https://agentclientprotocol.com for the protocol.
 <
 Each agent takes `cmd`, plus optional `args`, `env` and `options`. Calling
 setup() is optional if you're happy with the defaults.
+
+`ui.icons` adds Nerd Font glyphs to float titles. `ui.spinner` is the progress
+animation; a single frame turns it off. `ui.inline.width` bounds the inline
+prompt and answer floats. Floats use 'winborder' when it has a top edge, else
+a rounded border.
 
                                                             *conduit-options*
 `options` are session options applied to every new session, keyed by option id
@@ -154,9 +165,17 @@ Set `mentions = { completion = "blink" | "native" }` to force one.
 
                                                              *conduit-inline*
 Inline requests work on a range. Without a request on the command line, a
-floating prompt opens with `@` completion: <CR> submits, <S-CR> adds a line,
-<C-t> cycles the mode (Auto, Edit, Ask), and <Esc><Esc> cancels. A leading `?`
-forces Ask and `!` forces Edit.
+floating prompt opens under the range (above it near the bottom of the window)
+with `@` completion. Its title shows the agent, the mode and the lines:
+
+  <CR>      Submit
+  <S-CR>    Add a line (insert)
+  <C-t>     Cycle the mode (Auto, Edit, Ask)
+  <C-c>     Cancel (insert)
+  q <Esc>   Close (normal)
+  g?        List the keys (normal)
+
+A leading `?` forces Ask and `!` forces Edit; the title updates as you type.
 
 In Auto mode the agent decides: changes replace the range as one undoable
 change, and answers stream into a float under the range. In the float:
@@ -166,10 +185,32 @@ change, and answers stream into a float under the range. In the float:
   c         Move the conversation into the chat, keeping the session
   <C-c>     Cancel the answer
   q <Esc>   Close
+  g?        List the keys
 
-The range is highlighted (`ConduitInlinePending`) while a request runs or its
-answer is open, with progress shown above it (`ConduitInlineStatus`). Each
-request runs in its own session; see `inline.options` in |conduit-setup|.
+While a request runs or its answer is open, the range is highlighted
+(`ConduitInlinePending`) and marked in the sign column (`ConduitInlineSign`),
+and a spinner above it shows progress (`ConduitInlineStatus`). Each request
+runs in its own session; see `inline.options` in |conduit-setup|.
+
+                                                         *conduit-highlights*
+Highlight groups, all defined with `default` links so colorschemes can
+override them:
+
+  ConduitNormal         NormalFloat     Float background
+  ConduitBorder         FloatBorder     Float border
+  ConduitTitle          FloatTitle      Answer title
+  ConduitAgent          Title           Agent name
+  ConduitContext        Comment         File and lines in the prompt title
+  ConduitModeAuto       Special         Mode label: Auto
+  ConduitModeEdit       DiagnosticWarn  Mode label: Edit
+  ConduitModeAsk        DiagnosticInfo  Mode label: Ask
+  ConduitHintKey        Special         Keys in footer hints
+  ConduitHintDesc       Comment         Descriptions in footer hints
+  ConduitPlaceholder    Comment         Empty prompt placeholder
+  ConduitSpinner        DiagnosticInfo  Progress spinner
+  ConduitInlinePending  CursorLine      Range while a request runs
+  ConduitInlineSign     DiagnosticInfo  Sign column mark on the range
+  ConduitInlineStatus   Comment         Progress text
 
 ==============================================================================
 5. LUA API                                                       *conduit-api*

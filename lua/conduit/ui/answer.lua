@@ -1,5 +1,7 @@
 --- A floating markdown window anchored under a line of a buffer, for
 --- streaming inline answers.
+local hl = require("conduit.ui.hl")
+
 local M = {}
 
 ---@class conduit.Answer
@@ -13,13 +15,14 @@ Answer.__index = Answer
 ---@class conduit.AnswerOpts
 ---@field win integer Window to anchor to
 ---@field row integer 0-based buffer row to open below
----@field title string
+---@field title conduit.Chunks
 ---@field keys? table<string, fun()> Normal-mode keymaps in the float
 ---@field on_close? fun()
 
 ---@param opts conduit.AnswerOpts
 ---@return conduit.Answer
 function M.open(opts)
+    hl.setup()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].filetype = "conduit"
@@ -27,21 +30,21 @@ function M.open(opts)
     pcall(vim.treesitter.start, buf, "markdown")
     vim.bo[buf].modifiable = false
 
-    local width = math.max(30, math.min(90, vim.api.nvim_win_get_width(opts.win) - 6))
     local win = vim.api.nvim_open_win(buf, true, {
         relative = "win",
         win = opts.win,
         bufpos = { opts.row, 0 },
         row = 1,
-        col = 2,
-        width = width,
+        col = 0,
+        width = hl.width(opts.win),
         height = 1,
         style = "minimal",
-        border = "rounded",
-        title = (" %s "):format(opts.title),
+        border = hl.border(),
+        title = opts.title,
         title_pos = "left",
     })
     vim.wo[win].wrap = true
+    vim.wo[win].winhighlight = hl.WINHIGHLIGHT
     vim.wo[win].linebreak = true
     vim.wo[win].conceallevel = 2
     require("conduit.ui.render").attach(buf)
@@ -54,7 +57,7 @@ function M.open(opts)
     }, Answer)
 
     for lhs, fn in pairs(opts.keys or {}) do
-        vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true })
+        vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, desc = "conduit answer" })
     end
     vim.api.nvim_create_autocmd("WinClosed", {
         pattern = tostring(win),
@@ -96,10 +99,10 @@ function Answer:append(text)
     end
 end
 
----@param text string
-function Answer:footer(text)
+---@param chunks conduit.Chunks
+function Answer:footer(chunks)
     if self:is_open() then
-        vim.api.nvim_win_set_config(self.win, { footer = (" %s "):format(text), footer_pos = "right" })
+        vim.api.nvim_win_set_config(self.win, { footer = chunks, footer_pos = "right" })
     end
 end
 

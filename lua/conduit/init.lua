@@ -227,9 +227,13 @@ function M.inline(line1, line2, instruction, mode)
         local text, chosen = require("conduit.ui.prompt").parse_prefix(instruction, mode or "auto")
         return run(text, chosen)
     end
+    local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
+    local lines = line1 == line2 and tostring(line1) or ("%d-%d"):format(line1, line2)
     require("conduit.ui.prompt").open({
-        title = line1 == line2 and ("Line %d"):format(line1) or ("Lines %d-%d"):format(line1, line2),
+        title = name ~= "" and ("%s:%s"):format(name, lines) or ("lines " .. lines),
+        agent = config.options.inline.agent or config.options.default_agent,
         mode = mode or "auto",
+        anchor = { win = win, first = line1 - 1, last = line2 - 1 },
         on_submit = run,
     })
 end

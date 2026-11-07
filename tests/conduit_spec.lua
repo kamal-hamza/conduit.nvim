@@ -180,6 +180,17 @@ test("inline: rewrites the selected lines", function()
     vim.cmd("bwipeout!")
 end)
 
+---Text of a float's title or footer chunks.
+---@param win integer
+---@param key "title"|"footer"
+---@return string
+local function chunks_text(win, key)
+    local cfg = vim.api.nvim_win_get_config(win) --[[@as table]]
+    return table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, cfg[key] or {}))
+end
+
 local function fixture()
     local root = vim.fn.tempname()
     vim.fn.mkdir(root .. "/sub", "p")
@@ -366,6 +377,10 @@ test("inline: auto mode answers questions in a float under the selection", funct
     assert(text:find("This code **adds** things.", 1, true), text)
     assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "buffer must not change")
     assert(vim.api.nvim_win_get_config(job.answer.win).relative == "win")
+    assert(chunks_text(job.answer.win, "title"):find("mock", 1, true), chunks_text(job.answer.win, "title"))
+    local footer = chunks_text(job.answer.win, "footer")
+    assert(footer:find("a apply", 1, true) and footer:find("g? keys", 1, true), footer)
+    assert(not job.spinner:is_running(), "spinner should stop when the turn ends")
 
     job:follow_up("follow: more please")
     wait_turn(job)
@@ -426,16 +441,11 @@ test("prompt: <C-t> cycles the mode and prefixes override it", function()
         end,
     })
     vim.cmd.stopinsert()
-    ---@return string
-    local function title()
-        local cfg = vim.api.nvim_win_get_config(win) --[[@as table]]
-        return cfg.title[1][1]
-    end
-    assert(title():find("Auto", 1, true), title())
+    assert(chunks_text(win, "title"):find("Auto", 1, true), chunks_text(win, "title"))
     vim.api.nvim_buf_call(buf, function()
         vim.fn.maparg("<C-t>", "n", false, true).callback()
     end)
-    assert(title():find("Edit", 1, true), title())
+    assert(chunks_text(win, "title"):find("Edit", 1, true), chunks_text(win, "title"))
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "do it" })
     vim.api.nvim_buf_call(buf, function()
         vim.fn.maparg("<CR>", "n", false, true).callback()
@@ -444,6 +454,106 @@ test("prompt: <C-t> cycles the mode and prefixes override it", function()
         return got_mode ~= nil
     end, "submit")
     assert(got_mode == "edit", got_mode)
+end)
+
+test("prompt: title shows agent, mode and context; prefixes update it live", function()
+    vim.cmd.enew()
+    local code_win = vim.api.nvim_get_current_win()
+    local buf, win = require("conduit.ui.prompt").open({
+        title = "init.lua:3-5",
+        agent = "mock",
+        mode = "auto",
+        anchor = { win = code_win, first = 0, last = 0 },
+        on_submit = function() end,
+    })
+    vim.cmd.stopinsert()
+    local title = chunks_text(win, "title")
+    assert(title:find("mock", 1, true) and title:find("Auto", 1, true), title)
+    assert(title:find("init.lua:3-5", 1, true), title)
+    local footer = chunks_text(win, "footer")
+    assert(footer:find("<CR> send", 1, true) and footer:find("g? keys", 1, true), footer)
+
+    local ns = vim.api.nvim_create_namespace("conduit.prompt")
+    local function placeholder()
+        return #vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}) > 0
+    end
+    assert(placeholder(), "empty prompt shows a placeholder")
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "? why" })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+    assert(chunks_text(win, "title"):find("Ask", 1, true), chunks_text(win, "title"))
+    assert(not placeholder(), "placeholder goes away once there's text")
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "!fix" })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+    assert(chunks_text(win, "title"):find("Edit", 1, true), chunks_text(win, "title"))
+
+    vim.api.nvim_win_close(win, true)
+    vim.cmd("bwipeout!")
+end)
+
+test("prompt: opens under the range, above it near the bottom, else at the cursor", function()
+    vim.cmd.enew()
+    vim.cmd("only")
+    local win = vim.api.nvim_get_current_win()
+    local lines = {}
+    for i = 1, 200 do
+        lines[i] = "line " .. i
+    end
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+    vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    vim.cmd("normal! zt")
+    local placement = require("conduit.ui.prompt").placement
+    local height = vim.api.nvim_win_get_height(win)
+
+    local below = placement({ win = win, first = 1, last = 2 })
+    assert(below.relative == "win" and below.bufpos[1] == 2 and below.row == 1, vim.inspect(below))
+
+    local above = placement({ win = win, first = height - 3, last = height - 1 })
+    assert(above.relative == "win" and above.bufpos[1] == height - 3 and above.anchor == "SW", vim.inspect(above))
+
+    local hidden = placement({ win = win, first = 150, last = 160 })
+    assert(hidden.relative == "cursor", vim.inspect(hidden))
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: shows a spinner status and marks the range while running", function()
+    local buf = inline_buf()
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "    local a = 1" })
+    local job = assert(conduit.inline(2, 3, "uppercase it"))
+    assert(job.spinner:is_running(), "spinner runs while busy")
+    local ns = vim.api.nvim_create_namespace("conduit.inline")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })
+    local status, range
+    for _, m in ipairs(marks) do
+        local d = m[4] or {}
+        if d.virt_lines then
+            status = d
+        elseif d.line_hl_group then
+            range = d
+        end
+    end
+    assert(range and range.line_hl_group == "ConduitInlinePending" and range.sign_hl_group == "ConduitInlineSign")
+    assert(status and status.virt_lines_above, vim.inspect(marks))
+    local line = table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, status.virt_lines[1]))
+    assert(vim.startswith(line, "    "), "status is indented like the range: " .. line)
+    assert(line:find("mock", 1, true) and line:find(":Conduit cancel", 1, true), line)
+
+    wait_for(function()
+        return job.cleaned
+    end, "inline edit")
+    assert(not job.spinner:is_running(), "spinner stops when done")
+    vim.cmd("bwipeout!")
+end)
+
+test("highlights: conduit groups survive :colorscheme", function()
+    require("conduit.ui.hl").setup()
+    vim.cmd.colorscheme("default")
+    local pending = vim.api.nvim_get_hl(0, { name = "ConduitInlinePending" })
+    assert(pending.link == "CursorLine", vim.inspect(pending))
+    assert(vim.api.nvim_get_hl(0, { name = "ConduitModeEdit" }).link == "DiagnosticWarn")
 end)
 
 test("api: every :Conduit subcommand resolves", function()

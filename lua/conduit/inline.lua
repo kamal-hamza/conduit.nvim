@@ -3,13 +3,11 @@
 --- and "ask" force one or the other. Each request runs in its own session, so it
 --- doesn't touch chat history (but can be moved into the chat).
 local config = require("conduit.config")
+local hl = require("conduit.ui.hl")
 
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("conduit.inline")
-
-vim.api.nvim_set_hl(0, "ConduitInlinePending", { default = true, link = "Visual" })
-vim.api.nvim_set_hl(0, "ConduitInlineStatus", { default = true, link = "Comment" })
 
 ---@class conduit.InlineJob: conduit.SessionHandler
 ---@field agent conduit.Agent
@@ -25,6 +23,9 @@ vim.api.nvim_set_hl(0, "ConduitInlineStatus", { default = true, link = "Comment"
 ---@field busy boolean
 ---@field cancelled boolean
 ---@field marks { first: integer, last: integer, hl: integer, status?: integer } Extmark ids
+---@field spinner conduit.Spinner
+---@field phase? string What the agent is doing, while busy
+---@field indent string Leading whitespace of the range's first line, for the status line
 ---@field writes integer `b:conduit_writes` when the request started
 ---@field cleaned? boolean
 ---@field adopted? boolean The chat took over the session
@@ -57,7 +58,17 @@ Reply with ONLY <replace>, then the full replacement for the selected lines in o
 
 local REPLACE = "<replace>"
 
-local KEYS_HINT = "a apply code · f follow up · c open in chat · q close"
+---Answer float keys shown in its footer.
+local KEYS = { { "a", "apply" }, { "f", "follow up" }, { "c", "chat" }, { "q", "close" }, { "g?", "keys" } }
+
+---Answer float keys listed by `g?`.
+local HELP = {
+    { "a", "replace the lines with the answer's last code block" },
+    { "f", "ask a follow-up in the same session" },
+    { "c", "move the conversation into the chat" },
+    { "<C-c>", "cancel the reply" },
+    { "q, <Esc>", "close" },
+}
 
 ---Pull the replacement out of a reply: the body of `<replace>…</replace>` if
 ---present, then everything between the first opening fence and the last
@@ -76,13 +87,32 @@ function Job:_range()
     return first, last
 end
 
----@param msg? string Status shown above the range; nil clears it
+---@param msg? string What the agent is doing; nil when it's done
 function Job:_status(msg)
+    self.phase = msg
+    if msg then
+        self.spinner:start()
+    else
+        self.spinner:stop()
+    end
+    self:_render_status()
+end
+
+---Show the phase above the range, or in the answer float's footer once it's open.
+function Job:_render_status()
+    local msg = self.phase
     if self.answer then
-        return self.answer:footer(msg and ("%s · %s"):format(self.agent.name, msg) or KEYS_HINT)
+        if not msg then
+            return self.answer:footer(hl.keys(KEYS))
+        end
+        local chunks = { ---@type conduit.Chunks
+            { " " .. self.spinner:frame() .. " ", "ConduitSpinner" },
+            { msg, "ConduitInlineStatus" },
+        }
+        return self.answer:footer(vim.list_extend(chunks, hl.keys({ { "<C-c>", "cancel" } })))
     end
     local first = self:_range()
-    if not first then
+    if self.cleaned or not first then
         return
     end
     if not msg then
@@ -94,7 +124,15 @@ function Job:_status(msg)
     end
     self.marks.status = vim.api.nvim_buf_set_extmark(self.buf, ns, first, 0, {
         id = self.marks.status,
-        virt_lines = { { { ("  %s: %s"):format(self.agent.name, msg), "ConduitInlineStatus" } } },
+        virt_lines = {
+            {
+                { self.indent },
+                { self.spinner:frame() .. " ", "ConduitSpinner" },
+                { self.agent.name, "ConduitAgent" },
+                { " · " .. msg, "ConduitInlineStatus" },
+                { "   :Conduit cancel", "ConduitHintDesc" },
+            },
+        },
         virt_lines_above = true,
     })
 end
@@ -137,7 +175,7 @@ function Job:_open_answer()
     self.answer = require("conduit.ui.answer").open({
         win = win,
         row = last or vim.api.nvim_win_get_cursor(win)[1] - 1,
-        title = ("%s · %s"):format(self.agent.name, request),
+        title = { hl.agent(self.agent.name), { (" %s "):format(request), "ConduitTitle" } },
         keys = {
             q = function()
                 self:close()
@@ -156,6 +194,9 @@ function Job:_open_answer()
             end,
             ["<C-c>"] = function()
                 self:cancel()
+            end,
+            ["g?"] = function()
+                hl.echo_keys("conduit answer", HELP)
             end,
         },
         on_close = function()
@@ -176,7 +217,9 @@ function Job:on_update(update)
             self.shown = #self.text
             self:_status("writing…")
         elseif self.kind == "edit" then
-            self:_status(("writing… (%d chars)"):format(#self.text))
+            -- Completed lines inside the code block streamed so far.
+            local _, lines = (self.text:match("```[^\n]*\n(.*)$") or ""):gsub("\n", "")
+            self:_status(("writing · %d %s"):format(lines, lines == 1 and "line" or "lines"))
         end
     elseif kind == "agent_thought_chunk" then
         self:_status("thinking…")
@@ -262,6 +305,7 @@ function Job:_cleanup()
         return
     end
     self.cleaned = true
+    self.spinner:stop()
     if self.busy then
         self:cancel()
     end
@@ -317,7 +361,7 @@ function Job:follow_up(question)
         return send(question)
     end
     vim.api.nvim_set_current_win(answer.win)
-    require("conduit.ui.prompt").open({ title = "Follow up", on_submit = send })
+    require("conduit.ui.prompt").open({ title = "Follow up", agent = self.agent.name, on_submit = send })
 end
 
 ---Move the conversation into the chat window, keeping the session.
@@ -347,6 +391,7 @@ end
 ---@param opts conduit.InlineOpts
 ---@return conduit.InlineJob
 function M.run(opts)
+    hl.setup()
     local buf, line1, line2 = opts.buf, opts.line1, opts.line2
     local lines = vim.api.nvim_buf_get_lines(buf, line1 - 1, line2, false)
     local self = setmetatable({
@@ -360,14 +405,23 @@ function M.run(opts)
         busy = false,
         cancelled = false,
         writes = vim.b[buf].conduit_writes or 0,
+        indent = (" "):rep(vim.api.nvim_buf_call(buf, function()
+            return vim.fn.indent(line1)
+        end)),
     }, Job)
+    self.spinner = require("conduit.ui.spinner").new(function()
+        self:_render_status()
+    end)
     self.marks = {
         first = vim.api.nvim_buf_set_extmark(buf, ns, line1 - 1, 0, {}),
         last = vim.api.nvim_buf_set_extmark(buf, ns, line2 - 1, 0, {}),
+        -- One ranged mark puts the line highlight and the sign on every line.
         hl = vim.api.nvim_buf_set_extmark(buf, ns, line1 - 1, 0, {
             end_row = line2 - 1,
             end_col = #lines[#lines],
-            hl_group = "ConduitInlinePending",
+            line_hl_group = "ConduitInlinePending",
+            sign_text = "▎",
+            sign_hl_group = "ConduitInlineSign",
         }),
     }
     M.jobs[self] = true
