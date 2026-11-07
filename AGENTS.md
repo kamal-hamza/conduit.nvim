@@ -45,6 +45,8 @@ lua/conduit/
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks
   blink.lua             blink.cmp source for @ mentions
   inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
+  threads.lua           Threads: live registry, switching, picker, past threads, close/delete/fork
+  history.lua           Local thread index (ids, titles, cwd, timestamps; never transcripts)
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
   ui/chat.lua           Chat transcript + prompt buffers, session/update rendering
@@ -65,6 +67,12 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   **handler** (`conduit.SessionHandler`: `on_update`, `request_permission`,
   `on_agent_exit`), either a `Chat` or an inline `Job`. Session option state
   lives on the agent (`agent.options[sid]`), not on handlers.
+- Every chat is a **thread** registered in `threads.lua`; `conduit.current` reads
+  `threads.current`. Switching swaps the thread's buffers into the existing chat
+  windows (`Chat:show`) rather than opening new ones.
+- Thread features beyond live chats are gated on capabilities via
+  `Agent:supports()` (`load` = `loadSession`, the rest are
+  `sessionCapabilities.*`). Never call an optional session method without it.
 - Moving an inline conversation into the chat (`Job:to_chat`) re-points
   `agent.sessions[sid]` at a new `Chat`. The ACP session itself is reused.
 - Prompts are lists of ACP content blocks. `mentions.blocks()` turns typed
@@ -79,6 +87,9 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   protocol behaviour, teach the mock to exercise it and assert on the result.
 - The mock runs under `nvim -l`, so it can use `vim.json`. It reads stdin
   synchronously; `request()` blocks until the matching response arrives.
+- The mock takes flags: `--legacy` (modes/models instead of configOptions),
+  `--threads=load,list,...` (session capabilities) and `--seed` (past sessions
+  to list and load). Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
   stubs such as `vim.ui.select`, and reset config you change.
@@ -107,6 +118,13 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 - **Large refactors.** When removing or moving functions in `init.lua`, check
   that every `:Conduit` subcommand still resolves; there's a test for it, so
   keep it up to date when adding subcommands.
+
+- **session/load replays before it responds.** The history arrives as
+  `session/update` notifications ahead of the response, so `_open_session`
+  registers the handler under the known session id *before* sending the
+  request. Otherwise the replay is silently dropped.
+- **Tool titles can contain newlines** (multi-line shell commands). Anything
+  written with `nvim_buf_set_lines` must be split or trimmed first.
 
 ## Making changes
 

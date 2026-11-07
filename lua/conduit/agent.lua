@@ -6,6 +6,16 @@ local options = require("conduit.options")
 
 local PROTOCOL_VERSION = 1
 local AUTH_REQUIRED = -32000
+local NOT_FOUND = -32002
+
+---Optional session features an agent may advertise in `initialize`.
+---`load` is the top-level `loadSession`; the rest live in `sessionCapabilities`
+---(`fork` and `title` are still unstable in ACP).
+---@alias conduit.SessionCap "load"|"list"|"resume"|"close"|"delete"|"fork"|"title"
+
+---@class conduit.SessionRef
+---@field session_id string
+---@field cwd string
 
 ---@class conduit.SessionHandler
 ---@field on_update fun(self, update: table)
@@ -113,8 +123,6 @@ function Agent:_started(err)
     end
 end
 
----Create a session, then apply the agent's configured default options
----(`spec.options`) merged with `overrides`.
 ---Send a request, failing cleanly if the agent process isn't running
 ---(e.g. it exited after a session was created).
 ---@param method string
@@ -127,15 +135,37 @@ function Agent:_request(method, params, cb)
     self.rpc:request(method, params, cb)
 end
 
----@param cwd string
+---Whether the agent advertised an optional session feature. Only known once started.
+---@param cap conduit.SessionCap
+---@return boolean
+function Agent:supports(cap)
+    local caps = self.info and self.info.agentCapabilities or {}
+    if cap == "load" then
+        return caps.loadSession == true
+    end
+    local session_caps = caps.sessionCapabilities
+    return type(session_caps) == "table" and session_caps[cap] ~= nil
+end
+
+---Open a session with `method` (session/new, load, resume or fork), retrying once
+---after authentication, and record its options.
+---@param method string
+---@param params table
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
----@param overrides? table<string, string>
-function Agent:new_session(cwd, handler, cb, overrides)
-    local params = { cwd = cwd, mcpServers = {} }
-    local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
+---@param defaults? table<string, string> Options to apply once the session exists
+function Agent:_open_session(method, params, handler, cb, defaults)
+    -- session/load replays history as session/update notifications *before* it
+    -- responds, so the handler has to be registered under the known id first.
+    local known = (method == "session/load" or method == "session/resume") and params.sessionId or nil
     local function attempt(retry)
-        self:_request("session/new", params, function(err, result)
+        if known then
+            self.sessions[known] = handler
+        end
+        self:_request(method, params, function(err, result)
+            if err and known and self.sessions[known] == handler then
+                self.sessions[known] = nil
+            end
             if err and err.code == AUTH_REQUIRED and retry then
                 return self:authenticate(function(auth_err)
                     if auth_err then
@@ -146,15 +176,142 @@ function Agent:new_session(cwd, handler, cb, overrides)
             elseif err then
                 return cb(errmsg(err))
             end
-            local sid = result.sessionId
+            result = result or {}
+            local sid = known or result.sessionId
+            if type(sid) ~= "string" then
+                return cb(method .. " returned no session id")
+            end
             self.sessions[sid] = handler
             self.options[sid] = options.from_session(result)
+            if not defaults then
+                return cb(nil, sid, result)
+            end
             self:_apply_defaults(sid, defaults, function()
                 cb(nil, sid, result)
             end)
         end)
     end
     attempt(true)
+end
+
+---Create a session, then apply the agent's configured default options
+---(`spec.options`) merged with `overrides`.
+---@param cwd string
+---@param handler conduit.SessionHandler
+---@param cb fun(err: string?, session_id: string?, result: table?)
+---@param overrides? table<string, string>
+function Agent:new_session(cwd, handler, cb, overrides)
+    local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
+    self:_open_session("session/new", { cwd = cwd, mcpServers = {} }, handler, cb, defaults)
+end
+
+---Load a past session (`loadSession`). The agent replays its history through
+---`handler:on_update` before `cb` runs. Its options are kept as they were.
+---@param ref conduit.SessionRef
+---@param handler conduit.SessionHandler
+---@param cb fun(err: string?, session_id: string?, result: table?)
+function Agent:load_session(ref, handler, cb)
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    self:_open_session("session/load", params, handler, cb)
+end
+
+---Resume a past session without replaying its history (`sessionCapabilities.resume`).
+---@param ref conduit.SessionRef
+---@param handler conduit.SessionHandler
+---@param cb fun(err: string?, session_id: string?, result: table?)
+function Agent:resume_session(ref, handler, cb)
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    self:_open_session("session/resume", params, handler, cb)
+end
+
+---Fork a session into a new one with the same context (`sessionCapabilities.fork`).
+---@param ref conduit.SessionRef The session to fork
+---@param handler conduit.SessionHandler Handler for the new session
+---@param cb fun(err: string?, session_id: string?, result: table?)
+function Agent:fork_session(ref, handler, cb)
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    self:_open_session("session/fork", params, handler, cb)
+end
+
+---List past sessions (`sessionCapabilities.list`), following `nextCursor` pages.
+---@param opts { cwd?: string, max?: integer }
+---@param cb fun(err: string?, sessions: table[]) ACP SessionInfo objects
+function Agent:list_sessions(opts, cb)
+    local out, max = {}, opts.max or 200
+    local function page(cursor)
+        self:_request("session/list", { cwd = opts.cwd, cursor = cursor }, function(err, result)
+            if err then
+                return cb(errmsg(err), out)
+            end
+            for _, info in ipairs(result and result.sessions or {}) do
+                if #out >= max then
+                    break
+                end
+                if type(info.sessionId) == "string" then
+                    table.insert(out, info)
+                end
+            end
+            local next_cursor = result and result.nextCursor
+            if type(next_cursor) == "string" and #out < max then
+                return page(next_cursor)
+            end
+            cb(nil, out)
+        end)
+    end
+    page(nil)
+end
+
+---Forget a session and, if the agent supports `session/close`, free its resources
+---there. Closing an unknown session counts as success.
+---@param sid string
+---@param cb? fun(err: string?)
+function Agent:close_session(sid, cb)
+    cb = cb
+        or function(err)
+            if err then
+                log.warn(("could not close session %s: %s"):format(sid, err))
+            end
+        end
+    self.sessions[sid] = nil
+    self.options[sid] = nil
+    if not self.rpc or not self:supports("close") then
+        return cb(nil)
+    end
+    self:_request("session/close", { sessionId = sid }, function(err)
+        cb(err and err.code ~= NOT_FOUND and errmsg(err) or nil)
+    end)
+end
+
+---Delete a session from the agent's history (`sessionCapabilities.delete`).
+---@param sid string
+---@param cb fun(err: string?, deleted: boolean) `deleted` is false when unsupported
+function Agent:delete_session(sid, cb)
+    if not self:supports("delete") then
+        return cb(nil, false)
+    end
+    self:_request("session/delete", { sessionId = sid }, function(err)
+        if err and err.code ~= NOT_FOUND then
+            return cb(errmsg(err), false)
+        end
+        cb(nil, true)
+    end)
+end
+
+---Set a session's title (`sessionCapabilities.title`). `cb` gets the title the
+---agent stored, which may be normalized.
+---@param sid string
+---@param title string
+---@param cb fun(err: string?, title: string?)
+function Agent:set_title(sid, title, cb)
+    if not self:supports("title") then
+        return cb(nil, title)
+    end
+    self:_request("session/set_title", { sessionId = sid, title = title }, function(err, result)
+        if err then
+            return cb(errmsg(err))
+        end
+        cb(nil, type(result) == "table" and type(result.title) == "string" and result.title or title)
+    end)
 end
 
 ---@param sid string

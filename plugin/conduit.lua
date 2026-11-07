@@ -28,6 +28,39 @@ local subcommands = {
     toggle = function()
         require("conduit").toggle()
     end,
+    threads = function(args)
+        require("conduit").threads(args[1])
+    end,
+    continue = function(args)
+        require("conduit").continue_thread(args[1])
+    end,
+    thread = function(args)
+        local conduit = require("conduit")
+        local action = table.remove(args, 1)
+        local actions = {
+            new = function()
+                conduit.new()
+            end,
+            next = conduit.thread_next,
+            prev = conduit.thread_prev,
+            close = conduit.thread_close,
+            delete = function()
+                conduit.thread_delete()
+            end,
+            fork = conduit.thread_fork,
+            rename = function()
+                conduit.thread_rename(#args > 0 and table.concat(args, " ") or nil)
+            end,
+        }
+        local fn = actions[action or ""]
+        if not fn then
+            return vim.notify(
+                "[conduit] usage: :Conduit thread new|next|prev|close|delete|fork|rename [title]",
+                vim.log.levels.ERROR
+            )
+        end
+        fn()
+    end,
     cancel = function()
         require("conduit").cancel()
     end,
@@ -63,8 +96,9 @@ local subcommands = {
     end,
 }
 
-local takes_agent = { open = true, new = true }
+local takes_agent = { open = true, new = true, threads = true, continue = true }
 local takes_value = { model = "model", effort = "effort", mode = "mode" }
+local thread_actions = { "new", "next", "prev", "close", "delete", "fork", "rename" }
 
 ---Option ids, or values of option `key`, from the current chat's session.
 ---@param key? string
@@ -108,6 +142,8 @@ end, {
             candidates = vim.tbl_keys(require("conduit.config").options.agents)
         elseif #words == 3 and takes_value[words[2]] then
             candidates = session_options(takes_value[words[2]])
+        elseif #words == 3 and words[2] == "thread" then
+            candidates = vim.deepcopy(thread_actions)
         elseif #words == 3 and words[2] == "option" then
             candidates = session_options()
         elseif #words == 4 and words[2] == "option" then
