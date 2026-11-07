@@ -46,7 +46,8 @@ lua/conduit/
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks
   blink.lua             blink.cmp source for @ mentions
   inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
-  threads.lua           Threads: live registry, switching, picker, past threads, close/delete/fork
+  threads.lua           Threads: live registry, switching (MRU, goto, resume), picker, search,
+                        thread bar, events, past threads, close/delete/fork
   history.lua           Local thread index (ids, titles, cwd, timestamps; never transcripts)
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
@@ -56,6 +57,7 @@ lua/conduit/
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
   ui/spinner.lua        Animated progress indicator (uv timer)
   ui/permission.lua     Permission requests via vim.ui.select
+  ui/picker.lua         Picker specs shown with snacks/telescope/fzf-lua/mini.pick or vim.ui.select
   ui/render.lua         markview.nvim integration
 tests/
   run.lua               Minimal test runner (test(), wait_for())

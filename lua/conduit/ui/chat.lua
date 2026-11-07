@@ -11,6 +11,8 @@ local status_icons = {
     failed = "✗",
 }
 
+local KEYS_HINT = "<CR> send · @ file · <C-c> cancel · go options · gs threads · g<Tab> alternate · q close"
+
 local plan_icons = {
     pending = "[ ]",
     in_progress = "[~]",
@@ -35,6 +37,9 @@ local plan_icons = {
 ---@field last_kind? string
 ---@field plan? { mark: integer, size: integer }
 ---@field commands? table[]
+---@field last_used? integer When it was last made current (see `conduit.threads`)
+---@field unread? boolean Finished a turn while you weren't looking at it
+---@field waiting? boolean A permission request is waiting for an answer
 local Chat = {}
 Chat.__index = Chat
 
@@ -73,6 +78,7 @@ end
 ---@param agent conduit.Agent
 ---@return conduit.Chat
 function Chat.new(agent)
+    require("conduit.ui.hl").setup()
     count = count + 1
     local self = setmetatable({ agent = agent, busy = false, tools = {}, last_kind = nil }, Chat)
     self.transcript = scratch(("conduit://%s/%d"):format(agent.name, count), "conduit")
@@ -117,6 +123,9 @@ function Chat:_keymaps()
         vim.keymap.set("n", "[t", function()
             require("conduit.threads").cycle(-1)
         end, { buffer = buf, desc = "Previous thread" })
+        vim.keymap.set("n", "g<Tab>", function()
+            require("conduit.threads").alternate()
+        end, { buffer = buf, desc = "Alternate thread" })
     end
 end
 
@@ -162,6 +171,7 @@ function Chat:show(twin, iwin)
         vim.wo[win].winfixwidth = true
     end
     vim.wo[iwin].winfixheight = true
+    self.unread = false
     self:_refresh_winbar()
     self:_scroll()
 end
@@ -215,26 +225,49 @@ function Chat:_refresh_winbar()
             table.insert(parts, options.current_name(option))
         end
     end
+    local function escape(s)
+        return (s:gsub("%%", "%%%%"))
+    end
+    local threads = require("conduit.threads")
+    local status = escape(table.concat(parts, " · "))
+    -- The thread bar takes the whole transcript winbar, so state and options move
+    -- to the prompt's.
+    local bar = config.options.ui.thread_bar and threads.index(self) ~= nil
     if twin then
-        local threads = require("conduit.threads")
-        local title = ("%s · %s"):format(self.agent.name, self:display_title())
-        local i, n = threads.index(self), #threads.list
-        if i and n > 1 then
-            title = ("%s (%d/%d)"):format(title, i, n)
+        if bar then
+            vim.wo[twin].winbar = threads.bar(self, vim.api.nvim_win_get_width(twin) - 1)
+        else
+            local title = ("%s · %s"):format(self.agent.name, self:display_title())
+            local i, n = threads.index(self), #threads.list
+            if i and n > 1 then
+                title = ("%s (%d/%d)"):format(title, i, n)
+            end
+            vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(escape(title), status)
         end
-        local function escape(s)
-            return (s:gsub("%%", "%%%%"))
-        end
-        vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(escape(title), escape(table.concat(parts, " · ")))
     end
     if iwin then
-        vim.wo[iwin].winbar = " prompt %= <CR> send · @ file · <C-c> cancel · go options · gs threads · q close "
+        local left = bar and escape(self.agent.name) .. " · " .. status or "prompt"
+        vim.wo[iwin].winbar = (" %s %%= %s "):format(left, KEYS_HINT)
     end
 end
 
 function Chat:_set_busy(busy)
     self.busy = busy
-    self:_refresh_winbar()
+    require("conduit.threads").changed(self)
+end
+
+---Whether you can see this thread: it's current and its windows are open.
+---@return boolean
+function Chat:_visible()
+    return require("conduit.threads").current == self and self:is_open()
+end
+
+---Tell the user about a thread they aren't looking at.
+---@param msg string
+function Chat:_alert(msg)
+    if config.options.threads.notify then
+        vim.notify(("[conduit] %s: %s"):format(self:display_title(), msg), vim.log.levels.INFO)
+    end
 end
 
 function Chat:_scroll()
@@ -383,7 +416,7 @@ function Chat:on_update(update)
             end
         end
         local pos = vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, tool.mark, {})
-        if pos[1] then
+        if #pos > 0 then
             self:_edit(function(buf)
                 vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + 1, false, { tool_line(tool) })
             end)
@@ -393,13 +426,14 @@ function Chat:on_update(update)
         for _, entry in ipairs(update.entries or {}) do
             table.insert(lines, ("- %s %s"):format(plan_icons[entry.status] or "[ ]", entry.content))
         end
-        local pos = self.plan and vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, self.plan.mark, {})
-        if pos and pos[1] then
+        local plan = self.plan
+        local pos = plan and vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, plan.mark, {})
+        if plan and pos and #pos > 0 then
             -- Plans are sent in full each time; replace this turn's plan in place.
             self:_edit(function(buf)
-                vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + self.plan.size, false, lines)
+                vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + plan.size, false, lines)
             end)
-            self.plan.size = #lines
+            plan.size = #lines
         else
             local row = self:_append_lines(lines)
             self.plan = { mark = vim.api.nvim_buf_set_extmark(self.transcript, ns, row, 0, {}), size = #lines }
@@ -413,7 +447,7 @@ function Chat:on_update(update)
             self.title = update.title
         end
         self:_record(type(update.updatedAt) == "string" and update.updatedAt or nil)
-        self:_refresh_winbar()
+        require("conduit.threads").changed(self)
     elseif kind == "current_mode_update" or kind == "config_option_update" then
         -- The agent keeps the option state; just redraw.
         self:_refresh_winbar()
@@ -424,7 +458,16 @@ function Chat:request_permission(params, respond)
     local call = params.toolCall or {}
     local known = self.tools[call.toolCallId] or {}
     local title = call.title or known.title or "run a tool"
-    require("conduit.ui.permission").ask(self.agent.name, title, params, respond)
+    self.waiting = true
+    require("conduit.threads").changed(self)
+    if not self:_visible() then
+        self:_alert("needs permission to " .. title)
+    end
+    require("conduit.ui.permission").ask(self.agent.name, title, params, function(err, result)
+        self.waiting = false
+        require("conduit.threads").changed(self)
+        respond(err, result)
+    end)
 end
 
 function Chat:on_agent_exit(code)
@@ -461,7 +504,7 @@ function Chat:rename(title, cb)
     cb = cb or function() end
     self.title, self.custom_title = title, true
     self:_record()
-    self:_refresh_winbar()
+    require("conduit.threads").changed(self)
     if not self.session_id then
         return cb(nil)
     end
@@ -471,7 +514,7 @@ function Chat:rename(title, cb)
         end
         self.title = stored or title
         self:_record()
-        self:_refresh_winbar()
+        require("conduit.threads").changed(self)
         cb(nil)
     end)
 end
@@ -650,6 +693,10 @@ function Chat:submit()
         end
         local blocks = require("conduit.mentions").blocks(text, self.agent)
         self.agent:prompt(assert(self.session_id), blocks, function(perr, result)
+            if require("conduit.threads").index(self) and not self:_visible() then
+                self.unread = true
+                self:_alert(perr and "the turn failed" or "the agent replied")
+            end
             self:_set_busy(false)
             self:_record()
             if perr then
