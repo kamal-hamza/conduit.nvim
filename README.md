@@ -65,7 +65,9 @@ require("conduit").setup({
   inline = {
     agent = nil,       -- agent for inline edits, defaults to default_agent
     options = {},      -- session options for inline edits, e.g. { model = "haiku", effort = "low" }
+    mcp_servers = false, -- give inline sessions the MCP servers too
   },
+  mcp_servers = {},    -- MCP servers handed to the agent, see below
   mentions = {
     completion = "auto", -- "auto" (blink.cmp if loaded), "blink" or "native"
   },
@@ -94,6 +96,48 @@ agents = {
 Keys are option ids or ACP categories (`model`, `mode`, `thought_level`), and
 `effort` is accepted as an alias for `thought_level`. The values depend on the
 agent; `:Conduit option` lists what yours offers.
+
+### MCP servers
+
+`mcp_servers` lists [MCP](https://modelcontextprotocol.io) servers that conduit
+passes to the agent when it opens a session (`mcpServers` in ACP). The agent
+starts them and can use their tools in that session. conduit never runs or talks
+to them itself.
+
+```lua
+require("conduit").setup({
+  mcp_servers = {
+    github = {
+      command = "github-mcp",  -- looked up in PATH and sent as an absolute path
+      args = {},
+      env = { GITHUB_TOKEN = function() return os.getenv("GH_TOKEN") end },
+    },
+    docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer ..." } },
+  },
+  agents = {
+    -- Per-agent servers replace global ones of the same name; false leaves one out.
+    gemini = { cmd = "gemini", args = { "--experimental-acp" }, mcp_servers = { docs = false } },
+  },
+})
+```
+
+- `type` is `"stdio"` (the default), `"http"` or `"sse"`. Stdio servers take
+  `command`, `args` and `env`. HTTP and SSE servers take `url` and `headers`.
+- Values in `env`, `headers` and `args` can be functions. They're called when
+  a session opens, so tokens don't have to live in your config.
+- `enabled = false` (or a function that returns false) turns a server off.
+- A list of servers with `name` fields works too.
+- Servers that can't be sent are skipped with a warning: the command isn't in
+  PATH, `url` is missing, or the agent doesn't support the transport. Agents
+  advertise HTTP and SSE support in `mcpCapabilities`; every agent supports stdio.
+- Inline requests open a new session each time, so they leave MCP servers out
+  unless you set `inline.mcp_servers = true`. An inline conversation moved into
+  the chat keeps its session, and with it no servers.
+- `:checkhealth conduit` shows what each agent would get.
+
+Claude Code already loads servers from its own config (`~/.claude.json`,
+`.mcp.json`). A server listed there and here starts twice, so use `mcp_servers`
+for servers you want with every agent.
 
 ## Usage
 

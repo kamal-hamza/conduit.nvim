@@ -42,6 +42,7 @@ lua/conduit/
                         and agent→client requests (fs/*, request_permission)
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
+  mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks
   blink.lua             blink.cmp source for @ mentions
   inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
@@ -90,8 +91,9 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 - The mock runs under `nvim -l`, so it can use `vim.json`. It reads stdin
   synchronously; `request()` blocks until the matching response arrives.
 - The mock takes flags: `--legacy` (modes/models instead of configOptions),
-  `--threads=load,list,...` (session capabilities) and `--seed` (past sessions
-  to list and load). Thread tests register extra mock agents with these.
+  `--threads=load,list,...` (session capabilities), `--seed` (past sessions
+  to list and load) and `--mcp=http,sse` (MCP transports). Session methods echo
+  the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
   stubs such as `vim.ui.select`, and reset config you change.

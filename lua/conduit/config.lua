@@ -6,6 +6,8 @@ local M = {}
 ---@field env? table<string, string> Extra environment variables
 ---@field options? table<string, string> Session options applied to every new session, keyed by
 ---option id or category, e.g. `{ model = "opus", effort = "high", mode = "acceptEdits" }`
+---@field mcp_servers? conduit.McpServers MCP servers for this agent, replacing global ones of the
+---same name; `false` leaves a global server out
 
 ---@class conduit.ThreadsConfig
 ---@field scope "cwd"|"all" Which past threads to list: this directory's, or all of them
@@ -24,7 +26,8 @@ local M = {}
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
 ---@field ui conduit.UiConfig
----@field inline { agent?: string, options: table<string, string> }
+---@field inline { agent?: string, options: table<string, string>, mcp_servers: boolean }
+---@field mcp_servers conduit.McpServers
 ---@field mentions { completion: "auto"|"blink"|"native" }
 ---@field threads conduit.ThreadsConfig
 ---@field log_level integer
@@ -53,7 +56,15 @@ M.defaults = {
         agent = nil,
         -- Session options for inline edits, layered over the agent's `options`.
         options = {},
+        -- Give inline sessions the MCP servers too. Each inline request opens a new
+        -- session, so the agent would start every server per request.
+        mcp_servers = false,
     },
+    -- MCP servers handed to the agent for every session, keyed by name, e.g.
+    -- `github = { command = "github-mcp", env = { TOKEN = function() return os.getenv("GH") end } }`
+    -- or `docs = { type = "http", url = "https://example.com/mcp", headers = {} }`.
+    -- conduit doesn't run them; the agent does.
+    mcp_servers = {},
     mentions = {
         -- `@` completion: "auto" uses blink.cmp when it's loaded, else the native popup.
         completion = "auto",
