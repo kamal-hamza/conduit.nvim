@@ -3,13 +3,51 @@
 -- Prompts of the form `edit <path>` read the file's first line, ask for
 -- permission, then upper-case the file. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
--- mode). Prompts starting "follow:" get a follow-up answer. Anything else is
--- echoed back.
+-- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
+-- names the session with a `session_info_update`. Anything else is echoed back.
 --
 -- Pass `--legacy` to advertise `modes`/`models` instead of `configOptions`.
+--
+-- Threads: `--threads=load,list,resume,close,delete,fork,title` advertises those
+-- session capabilities. Every session's history is recorded so session/load can
+-- replay it. `--seed` starts with past sessions (see `seed()`); session/list
+-- pages two at a time.
 io.stdout:setvbuf("no")
 
-local legacy = vim.tbl_contains(_G.arg or {}, "--legacy")
+local argv = _G.arg or {}
+local legacy = vim.tbl_contains(argv, "--legacy")
+local caps = {}
+for _, a in ipairs(argv) do
+    local list = a:match("^%-%-threads=(.+)$")
+    for cap in (list or ""):gmatch("[^,]+") do
+        caps[cap] = true
+    end
+end
+
+---@class MockSession
+---@field cwd string
+---@field title? string
+---@field updated_at string
+---@field history table[] Recorded session updates, replayed by session/load
+---@field closed? boolean
+
+---@type table<string, MockSession>
+local store = {}
+local RECORDED = {
+    user_message_chunk = true,
+    agent_message_chunk = true,
+    agent_thought_chunk = true,
+    tool_call = true,
+    tool_call_update = true,
+    plan = true,
+}
+-- Current agent message id per session, attached to agent chunks.
+local message_ids = {}
+local turns = 0
+
+local function now()
+    return os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
 local config = {
     model = { "fast", { "fast", "smart" } },
     effort = { "high", { "low", "high" } },
@@ -35,19 +73,75 @@ local function request(method, params)
 end
 
 local function update(sid, u)
+    local s = store[sid] --[[@as MockSession?]]
+    if s and RECORDED[u.sessionUpdate] then
+        table.insert(s.history, u)
+    end
     send({ method = "session/update", params = { sessionId = sid, update = u } })
 end
 
 local function say(sid, text)
-    update(sid, { sessionUpdate = "agent_message_chunk", content = { type = "text", text = text } })
+    update(sid, {
+        sessionUpdate = "agent_message_chunk",
+        messageId = message_ids[sid],
+        content = { type = "text", text = text },
+    })
+end
+
+local function text_chunk(kind, id, text)
+    return { sessionUpdate = kind, messageId = id, content = { type = "text", text = text } }
+end
+
+local function seed()
+    local cwd = vim.fn.getcwd()
+    store["past-1"] = {
+        cwd = cwd,
+        title = "Old work",
+        updated_at = "2026-01-03T10:00:00Z",
+        history = {
+            text_chunk("user_message_chunk", "u1", "hello past"),
+            text_chunk("agent_message_chunk", "a1", "hi from the past"),
+            { sessionUpdate = "tool_call", toolCallId = "old", title = "Read notes", status = "completed" },
+            { sessionUpdate = "tool_call", toolCallId = "sh", title = "Run make\nand make test", status = "failed" },
+            text_chunk("user_message_chunk", "u2", "first part"),
+            text_chunk("user_message_chunk", "u3", "second part"),
+            text_chunk("agent_message_chunk", "a3", "both parts answered"),
+        },
+    }
+    store["past-2"] = {
+        cwd = cwd,
+        title = "Older work",
+        updated_at = "2026-01-02T10:00:00Z",
+        history = { text_chunk("user_message_chunk", "u1", "older question") },
+    }
+    store["past-3"] = { cwd = cwd, updated_at = "2026-01-01T10:00:00Z", history = {} }
+    store["elsewhere"] = {
+        cwd = "/somewhere/else",
+        title = "Other project",
+        updated_at = "2026-01-04T10:00:00Z",
+        history = {},
+    }
+end
+if vim.tbl_contains(argv, "--seed") then
+    seed()
 end
 
 local handlers = {}
 
 handlers.initialize = function()
+    local session_caps = vim.empty_dict()
+    for _, cap in ipairs({ "list", "resume", "close", "delete", "fork", "title" }) do
+        if caps[cap] then
+            session_caps[cap] = vim.empty_dict()
+        end
+    end
     return {
         protocolVersion = 1,
-        agentCapabilities = { loadSession = false, promptCapabilities = { embeddedContext = true } },
+        agentCapabilities = {
+            loadSession = caps.load == true,
+            sessionCapabilities = session_caps,
+            promptCapabilities = { embeddedContext = true },
+        },
         authMethods = {},
     }
 end
@@ -72,9 +166,10 @@ local function config_options()
 end
 
 local sessions = 0
-handlers["session/new"] = function()
+handlers["session/new"] = function(params)
     sessions = sessions + 1
     local sid = sessions == 1 and "mock-session" or ("mock-session-" .. sessions)
+    store[sid] = { cwd = params.cwd, updated_at = now(), history = {} }
     if legacy then
         return {
             sessionId = sid,
@@ -104,9 +199,126 @@ handlers["session/set_model"] = function()
     return vim.empty_dict()
 end
 
+local NOT_FOUND = { code = -32002, message = "Resource not found" }
+
+local function need(cap)
+    if not caps[cap] then
+        return { code = -32601, message = "Method not found" }
+    end
+end
+
+handlers["session/list"] = function(params)
+    local err = need("list")
+    if err then
+        return nil, err
+    end
+    local all = {}
+    for sid, s in pairs(store) do
+        if not params.cwd or params.cwd == s.cwd then
+            table.insert(all, { sessionId = sid, cwd = s.cwd, title = s.title, updatedAt = s.updated_at })
+        end
+    end
+    table.sort(all, function(a, b)
+        return a.updatedAt > b.updatedAt
+    end)
+    local first = tonumber(params.cursor or "1") --[[@as integer?]]
+    if not first then
+        return nil, { code = -32602, message = "Invalid cursor" }
+    end
+    local page = vim.list_slice(all, first, first + 1)
+    return { sessions = page, nextCursor = first + 2 <= #all and tostring(first + 2) or nil }
+end
+
+handlers["session/load"] = function(params)
+    local err = need("load")
+    if err then
+        return nil, err
+    end
+    local s = store[params.sessionId]
+    if not s then
+        return nil, NOT_FOUND
+    end
+    -- Replay without recording, then respond.
+    for _, u in ipairs(s.history) do
+        send({ method = "session/update", params = { sessionId = params.sessionId, update = u } })
+    end
+    s.closed = nil
+    return { configOptions = config_options() }
+end
+
+handlers["session/resume"] = function(params)
+    local err = need("resume")
+    if err then
+        return nil, err
+    end
+    -- Sessions from an earlier process aren't in the store; resume them empty.
+    store[params.sessionId] = store[params.sessionId] or { cwd = params.cwd, updated_at = now(), history = {} }
+    store[params.sessionId].closed = nil
+    return { configOptions = config_options() }
+end
+
+handlers["session/close"] = function(params)
+    local err = need("close")
+    if err then
+        return nil, err
+    end
+    local s = store[params.sessionId]
+    if not s or s.closed then
+        return nil, NOT_FOUND
+    end
+    s.closed = true
+    return vim.empty_dict()
+end
+
+handlers["session/delete"] = function(params)
+    local err = need("delete")
+    if err then
+        return nil, err
+    end
+    store[params.sessionId] = nil
+    return vim.empty_dict()
+end
+
+local forks = 0
+handlers["session/fork"] = function(params)
+    local err = need("fork")
+    if err then
+        return nil, err
+    end
+    local s = store[params.sessionId]
+    if not s then
+        return nil, NOT_FOUND
+    end
+    forks = forks + 1
+    local sid = "fork-" .. forks
+    store[sid] = { cwd = params.cwd, updated_at = now(), history = vim.deepcopy(s.history) }
+    return { sessionId = sid, configOptions = config_options() }
+end
+
+handlers["session/set_title"] = function(params)
+    local err = need("title")
+    if err then
+        return nil, err
+    end
+    local s = store[params.sessionId]
+    if not s then
+        return nil, NOT_FOUND
+    end
+    -- Normalize, to check the client shows the stored title.
+    s.title = vim.trim(params.title)
+    return { title = s.title }
+end
+
 handlers["session/prompt"] = function(params)
     local sid = params.sessionId
     local text = params.prompt[1].text
+    turns = turns + 1
+    message_ids[sid] = "a" .. turns
+    local s = store[sid]
+    if s then
+        s.updated_at = now()
+        table.insert(s.history, text_chunk("user_message_chunk", "u" .. turns, text))
+    end
     update(sid, { sessionUpdate = "agent_thought_chunk", content = { type = "text", text = "pondering" } })
 
     local code = text:match("````[^\n]*\n(.-)\n````")
@@ -120,6 +332,15 @@ handlers["session/prompt"] = function(params)
             say(sid, "<rep")
             say(sid, "lace>\n```lua\n" .. code:upper() .. "\n```\n</replace>")
         end
+        return { stopReason = "end_turn" }
+    end
+    local title = text:match("^title (.+)$")
+    if title then
+        if s then
+            s.title = title
+        end
+        update(sid, { sessionUpdate = "session_info_update", title = title })
+        say(sid, "renamed")
         return { stopReason = "end_turn" }
     end
     if text:match("^follow:") then
@@ -172,7 +393,12 @@ for line in io.lines() do
     local msg = vim.json.decode(line)
     local handler = msg.method and handlers[msg.method]
     if msg.id ~= nil and handler then
-        send({ id = msg.id, result = handler(msg.params) })
+        local result, err = handler(msg.params or {})
+        if err then
+            send({ id = msg.id, error = err })
+        else
+            send({ id = msg.id, result = result == nil and vim.empty_dict() or result })
+        end
     elseif msg.id ~= nil and msg.method then
         send({ id = msg.id, error = { code = -32601, message = "Method not found" } })
     end

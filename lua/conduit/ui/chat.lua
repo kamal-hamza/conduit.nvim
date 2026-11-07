@@ -24,14 +24,26 @@ local plan_icons = {
 ---@field input integer
 ---@field busy boolean
 ---@field tools table<string, table>
+---@field title? string Set by the agent (`session_info_update`), the user, or from the first prompt
+---@field custom_title? boolean The user named the thread; agent titles don't replace it
+---@field cwd? string Working directory of the session
+---@field loading? boolean A past session is being loaded
+---@field replaying? boolean History is being replayed into the transcript
+---@field muted? boolean Ignore replayed content (reloading a session that's already shown)
+---@field resume_id? string Session to restore on the next prompt (after the agent exited)
+---@field message_id? string ACP `messageId` of the message being rendered
+---@field last_kind? string
+---@field plan? { mark: integer, size: integer }
+---@field commands? table[]
 local Chat = {}
 Chat.__index = Chat
 
 local count = 0
 
 ---@param content? table ACP ContentBlock
+---@param link_resources? boolean Show embedded resources as links (e.g. replayed @mentions)
 ---@return string
-local function content_text(content)
+local function content_text(content, link_resources)
     if not content then
         return ""
     elseif content.type == "text" then
@@ -39,7 +51,11 @@ local function content_text(content)
     elseif content.type == "resource_link" then
         return ("[%s](%s)"):format(content.name or content.uri, content.uri)
     elseif content.type == "resource" and content.resource then
-        return content.resource.text or ("<%s>"):format(content.resource.uri)
+        local uri = content.resource.uri or ""
+        if link_resources then
+            return ("\n[%s](%s)"):format(uri:match("[^/]+/?$") or uri, uri)
+        end
+        return content.resource.text or ("<%s>"):format(uri)
     end
     return ("<%s>"):format(content.type or "unknown")
 end
@@ -89,6 +105,18 @@ function Chat:_keymaps()
         vim.keymap.set("n", "go", function()
             self:pick_option()
         end, { buffer = buf, desc = "Session options (model, effort, mode)" })
+        vim.keymap.set("n", "gs", function()
+            require("conduit.threads").pick()
+        end, { buffer = buf, desc = "Pick a thread" })
+        vim.keymap.set("n", "gn", function()
+            require("conduit").new(self.agent.name)
+        end, { buffer = buf, desc = "New thread" })
+        vim.keymap.set("n", "]t", function()
+            require("conduit.threads").cycle(1)
+        end, { buffer = buf, desc = "Next thread" })
+        vim.keymap.set("n", "[t", function()
+            require("conduit.threads").cycle(-1)
+        end, { buffer = buf, desc = "Previous thread" })
     end
 end
 
@@ -110,25 +138,49 @@ function Chat:open()
         local width = math.floor(ui.width <= 1 and vim.o.columns * ui.width or ui.width)
         vim.cmd("botright vsplit")
         twin = vim.api.nvim_get_current_win()
-        vim.api.nvim_win_set_buf(twin, self.transcript)
         vim.api.nvim_win_set_width(twin, width)
         vim.cmd("belowright split")
         iwin = vim.api.nvim_get_current_win()
-        vim.api.nvim_win_set_buf(iwin, self.input)
         vim.api.nvim_win_set_height(iwin, ui.input_height)
-        for _, win in ipairs({ twin, iwin }) do
-            vim.wo[win].wrap = true
-            vim.wo[win].linebreak = true
-            vim.wo[win].number = false
-            vim.wo[win].relativenumber = false
-            vim.wo[win].signcolumn = "no"
-            vim.wo[win].winfixwidth = true
-        end
-        vim.wo[iwin].winfixheight = true
-        self:_refresh_winbar()
-        self:_scroll()
+        self:show(twin, iwin)
     end
     vim.api.nvim_set_current_win(iwin or twin)
+end
+
+---Show this chat in existing windows (e.g. when switching threads).
+---@param twin integer Transcript window
+---@param iwin integer Input window
+function Chat:show(twin, iwin)
+    vim.api.nvim_win_set_buf(twin, self.transcript)
+    vim.api.nvim_win_set_buf(iwin, self.input)
+    for _, win in ipairs({ twin, iwin }) do
+        vim.wo[win].wrap = true
+        vim.wo[win].linebreak = true
+        vim.wo[win].number = false
+        vim.wo[win].relativenumber = false
+        vim.wo[win].signcolumn = "no"
+        vim.wo[win].winfixwidth = true
+    end
+    vim.wo[iwin].winfixheight = true
+    self:_refresh_winbar()
+    self:_scroll()
+end
+
+---@return string
+function Chat:display_title()
+    return self.title or "New thread"
+end
+
+---Use the first line of the first prompt as the title until the agent names the session.
+---@param text string
+function Chat:_default_title(text)
+    if self.title then
+        return
+    end
+    local line = vim.trim(vim.split(text, "\n", { plain = true })[1] or "")
+    if line ~= "" then
+        self.title = vim.fn.strcharlen(line) > 50 and (vim.fn.strcharpart(line, 0, 49) .. "…") or line
+    end
 end
 
 function Chat:close()
@@ -150,7 +202,12 @@ end
 
 function Chat:_refresh_winbar()
     local twin, iwin = self:wins()
-    local parts = { self.busy and "working…" or (self.session_id and "ready" or "not started") }
+    local state = self.loading and "loading…"
+        or self.busy and "working…"
+        or self.session_id and "ready"
+        or self.resume_id and "disconnected"
+        or "not started"
+    local parts = { state }
     local opts = self.session_id and self.agent:get_options(self.session_id) or {}
     for _, key in ipairs({ "model", "thought_level", "mode" }) do
         local option = options.find(opts, key)
@@ -159,11 +216,19 @@ function Chat:_refresh_winbar()
         end
     end
     if twin then
-        local status = table.concat(parts, " · "):gsub("%%", "%%%%")
-        vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(self.agent.name, status)
+        local threads = require("conduit.threads")
+        local title = ("%s · %s"):format(self.agent.name, self:display_title())
+        local i, n = threads.index(self), #threads.list
+        if i and n > 1 then
+            title = ("%s (%d/%d)"):format(title, i, n)
+        end
+        local function escape(s)
+            return (s:gsub("%%", "%%%%"))
+        end
+        vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(escape(title), escape(table.concat(parts, " · ")))
     end
     if iwin then
-        vim.wo[iwin].winbar = " prompt %= <CR> send · @ file · <C-c> cancel · go options · q close "
+        vim.wo[iwin].winbar = " prompt %= <CR> send · @ file · <C-c> cancel · go options · gs threads · q close "
     end
 end
 
@@ -185,8 +250,11 @@ function Chat:_edit(fn)
     vim.bo[buf].modifiable = true
     local ok, err = pcall(fn, buf)
     vim.bo[buf].modifiable = false
-    self:_scroll()
-    require("conduit.ui.render").refresh(buf)
+    -- A replay can be thousands of chunks; scroll and render once at the end.
+    if not self.replaying then
+        self:_scroll()
+        require("conduit.ui.render").refresh(buf)
+    end
     if not ok then
         error(err)
     end
@@ -220,32 +288,84 @@ function Chat:_append_lines(lines)
 end
 
 ---Start a new transcript section unless we're already in one of this kind.
-function Chat:_section(kind, header)
+---@param kind string
+---@param header string
+---@param message_id? string ACP `messageId`; a new id starts a new section of the same kind
+---@return boolean started
+function Chat:_section(kind, header, message_id)
+    if message_id and message_id ~= self.message_id then
+        if self.message_id and self.last_kind == kind then
+            self.last_kind = nil
+        end
+        self.message_id = message_id
+    end
     if self.last_kind == kind then
-        return
+        return false
     end
     self.last_kind = kind
     -- The trailing empty line is where streamed text continues.
     self:_append_lines({ "", header, "", "" })
+    return true
+end
+
+---Empty the transcript (before replaying a session into it).
+function Chat:_clear()
+    self:_edit(function(buf)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+        vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    end)
+    self.tools, self.plan, self.last_kind, self.message_id = {}, nil, nil, nil
+end
+
+---Replace the transcript with a copy of `other`'s (e.g. for a fork).
+---@param other conduit.Chat
+function Chat:copy_transcript(other)
+    local lines = vim.api.nvim_buf_get_lines(other.transcript, 0, -1, false)
+    self:_clear()
+    self:_edit(function(buf)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    end)
 end
 
 ---@param tool table
+---@return string
 local function tool_line(tool)
-    return ("%s %s"):format(status_icons[tool.status or "pending"] or "•", tool.title or tool.kind or "tool call")
+    local title = tool.title or tool.kind or "tool call"
+    -- Titles can span lines (e.g. a multi-line shell command); show the first.
+    local first = title:match("^[^\n]*")
+    if first ~= title then
+        first = first .. " …"
+    end
+    return ("%s %s"):format(status_icons[tool.status or "pending"] or "•", first)
 end
+
+local CONTENT_UPDATES = {
+    agent_message_chunk = true,
+    agent_thought_chunk = true,
+    user_message_chunk = true,
+    tool_call = true,
+    tool_call_update = true,
+    plan = true,
+}
 
 ---@param update table ACP SessionUpdate
 function Chat:on_update(update)
     local kind = update.sessionUpdate
+    if self.muted and CONTENT_UPDATES[kind] then
+        return
+    end
     if kind == "agent_message_chunk" then
-        self:_section("agent", "## " .. self.agent.name)
+        self:_section("agent", "## " .. self.agent.name, update.messageId)
         self:_append_text(content_text(update.content))
     elseif kind == "agent_thought_chunk" then
-        self:_section("thought", "### Thinking")
+        self:_section("thought", "### Thinking", update.messageId)
         self:_append_text(content_text(update.content))
     elseif kind == "user_message_chunk" then
-        self:_section("user", "## You")
-        self:_append_text(content_text(update.content))
+        if self:_section("user", "## You", update.messageId) then
+            -- A new turn (when replaying): plans are per turn.
+            self.plan = nil
+        end
+        self:_append_text(content_text(update.content, true))
     elseif kind == "tool_call" then
         self.last_kind = "tool"
         local tool = vim.deepcopy(update)
@@ -287,6 +407,13 @@ function Chat:on_update(update)
         end
     elseif kind == "available_commands_update" then
         self.commands = update.availableCommands
+    elseif kind == "session_info_update" then
+        -- rpc decodes JSON null as nil, so a cleared title keeps the old one.
+        if type(update.title) == "string" and update.title ~= "" and not self.custom_title then
+            self.title = update.title
+        end
+        self:_record(type(update.updatedAt) == "string" and update.updatedAt or nil)
+        self:_refresh_winbar()
     elseif kind == "current_mode_update" or kind == "config_option_update" then
         -- The agent keeps the option state; just redraw.
         self:_refresh_winbar()
@@ -301,9 +428,128 @@ function Chat:request_permission(params, respond)
 end
 
 function Chat:on_agent_exit(code)
+    -- Keep the transcript and remember the session, to restore it on the next prompt.
+    self.resume_id = self.session_id or self.resume_id
     self.session_id = nil
+    self.muted, self.replaying = false, false
     self:_set_busy(false)
     self:_notice(("agent exited (code %d)"):format(code))
+end
+
+---Save this thread to the local index.
+---@param updated_at? string ISO 8601; defaults to now
+function Chat:_record(updated_at)
+    local sid = self.session_id
+    if not sid then
+        return
+    end
+    require("conduit.history").record({
+        agent = self.agent.name,
+        session_id = sid,
+        cwd = self.cwd or vim.fn.getcwd(),
+        title = self.title,
+        custom_title = self.custom_title or nil,
+        updated_at = updated_at,
+    })
+end
+
+---Name the thread. User titles stick: the agent's generated titles won't replace them.
+---Agents that support `session/set_title` store it too.
+---@param title string
+---@param cb? fun(err: string?)
+function Chat:rename(title, cb)
+    cb = cb or function() end
+    self.title, self.custom_title = title, true
+    self:_record()
+    self:_refresh_winbar()
+    if not self.session_id then
+        return cb(nil)
+    end
+    self.agent:set_title(self.session_id, title, function(err, stored)
+        if err then
+            return cb(err)
+        end
+        self.title = stored or title
+        self:_record()
+        self:_refresh_winbar()
+        cb(nil)
+    end)
+end
+
+---Open a past session in this (empty) chat: load it, replaying its history into
+---the transcript, or resume it without history when that's all the agent can do.
+---@param info conduit.ThreadInfo
+---@param cb? fun(err: string?)
+function Chat:load(info, cb)
+    cb = cb or function() end
+    self.cwd = info.cwd
+    self.title = self.title or info.title
+    self.custom_title = self.custom_title or info.custom_title
+    self.loading = true
+    self:_set_busy(true)
+    local function opened(err, sid)
+        self.loading, self.replaying = false, false
+        self:_set_busy(false)
+        if err then
+            self:_notice("could not open the thread: " .. err)
+            return cb(err)
+        end
+        self.session_id = sid
+        self:_record(info.updated_at)
+        self:_scroll()
+        require("conduit.ui.render").refresh(self.transcript)
+        self:_refresh_winbar()
+        cb(nil)
+    end
+    self.agent:start(function(err)
+        if err then
+            return opened(err)
+        end
+        local ref = { session_id = info.session_id, cwd = info.cwd }
+        if self.agent:supports("load") then
+            self:_clear()
+            self.replaying = true
+            self.agent:load_session(ref, self, opened)
+        elseif self.agent:supports("resume") then
+            self.agent:resume_session(ref, self, function(rerr, sid)
+                if not rerr then
+                    self:_notice("resumed; the agent doesn't replay earlier messages")
+                end
+                opened(rerr, sid)
+            end)
+        else
+            opened(self.agent.name .. " can't load sessions")
+        end
+    end)
+end
+
+---Restore `resume_id` after the agent restarted: resume it, or reload it without
+---re-rendering the transcript we still have, or else start over.
+---@param cb fun(err: string?)
+function Chat:_reconnect(cb)
+    local ref = { session_id = assert(self.resume_id), cwd = self.cwd or vim.fn.getcwd() }
+    local function done(err, sid)
+        self.muted = false
+        self.resume_id = nil
+        if err then
+            self:_notice(("could not restore the session (%s), starting a new one"):format(err))
+            return self:ensure_session(cb)
+        end
+        self.session_id = sid
+        self:_record()
+        self:_refresh_winbar()
+        cb(nil)
+    end
+    if self.agent:supports("resume") then
+        self.agent:resume_session(ref, self, done)
+    elseif self.agent:supports("load") then
+        self.muted = true
+        self.agent:load_session(ref, self, done)
+    else
+        self.resume_id = nil
+        self:_notice(self.agent.name .. " can't restore sessions; starting a new one without the earlier context")
+        self:ensure_session(cb)
+    end
 end
 
 ---@param msg string
@@ -322,8 +568,14 @@ function Chat:ensure_session(cb)
         if err then
             return cb(err)
         end
-        self.agent:new_session(vim.fn.getcwd(), self, function(serr, session_id)
+        if self.resume_id then
+            return self:_reconnect(cb)
+        end
+        local cwd = vim.fn.getcwd()
+        self.agent:new_session(cwd, self, function(serr, session_id)
             self.session_id = session_id
+            self.cwd = cwd
+            self:_record()
             self:_refresh_winbar()
             cb(serr)
         end)
@@ -335,14 +587,17 @@ end
 ---@param history { role: "user"|"agent", text: string }[]
 function Chat:adopt(session_id, history)
     self.session_id = session_id
+    self.cwd = vim.fn.getcwd()
     for _, msg in ipairs(history) do
         if msg.role == "user" then
+            self:_default_title(msg.text)
             self:_section("user", "## You")
         else
             self:_section("agent", "## " .. self.agent.name)
         end
         self:_append_text(msg.text)
     end
+    self:_record()
     self:_refresh_winbar()
 end
 
@@ -382,6 +637,7 @@ function Chat:submit()
         return
     end
     vim.api.nvim_buf_set_lines(self.input, 0, -1, false, {})
+    self:_default_title(text)
     self.plan = nil
     self:_section("user", "## You")
     self:_append_text(text)
@@ -395,6 +651,7 @@ function Chat:submit()
         local blocks = require("conduit.mentions").blocks(text, self.agent)
         self.agent:prompt(assert(self.session_id), blocks, function(perr, result)
             self:_set_busy(false)
+            self:_record()
             if perr then
                 self:_notice("error: " .. perr)
             elseif result and result.stopReason ~= "end_turn" then
@@ -419,6 +676,7 @@ function Chat:add_context(lines)
 end
 
 function Chat:destroy()
+    self:cancel()
     self:close()
     if self.session_id then
         self.agent.sessions[self.session_id] = nil

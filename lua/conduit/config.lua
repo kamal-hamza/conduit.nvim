@@ -7,6 +7,12 @@ local M = {}
 ---@field options? table<string, string> Session options applied to every new session, keyed by
 ---option id or category, e.g. `{ model = "opus", effort = "high", mode = "acceptEdits" }`
 
+---@class conduit.ThreadsConfig
+---@field scope "cwd"|"all" Which past threads to list: this directory's, or all of them
+---@field persist boolean Keep a local index of threads (ids and titles, not transcripts)
+---@field max_listed integer Most past threads to fetch from the agent
+---@field hide_inline boolean Leave inline requests' sessions out of thread lists
+
 ---@class conduit.UiConfig
 ---@field width number
 ---@field input_height integer
@@ -20,6 +26,7 @@ local M = {}
 ---@field ui conduit.UiConfig
 ---@field inline { agent?: string, options: table<string, string> }
 ---@field mentions { completion: "auto"|"blink"|"native" }
+---@field threads conduit.ThreadsConfig
 ---@field log_level integer
 M.defaults = {
     default_agent = "claude",
@@ -50,6 +57,17 @@ M.defaults = {
     mentions = {
         -- `@` completion: "auto" uses blink.cmp when it's loaded, else the native popup.
         completion = "auto",
+    },
+    threads = {
+        -- Past threads to offer: "cwd" (sessions started in the current directory) or "all".
+        scope = "cwd",
+        -- Remember threads (session ids and titles, never transcripts) in
+        -- stdpath("data")/conduit/threads.json. Agents that can load sessions but not
+        -- list them rely on it for their history.
+        persist = true,
+        max_listed = 200,
+        -- Leave inline requests' sessions out of thread lists.
+        hide_inline = true,
     },
     log_level = vim.log.levels.WARN,
 }

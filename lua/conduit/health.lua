@@ -18,6 +18,30 @@ function M.check()
             vim.health.warn(("%s: `%s` not found in PATH"):format(name, spec.cmd))
         end
     end
+
+    vim.health.start("conduit.nvim: threads")
+    local agents = package.loaded["conduit"] and require("conduit").agents or {}
+    local any = false
+    for name, agent in vim.spairs(agents) do
+        if agent.info then
+            any = true
+            local caps = vim.tbl_filter(function(cap)
+                return agent:supports(cap)
+            end, { "load", "list", "resume", "close", "delete", "fork", "title" })
+            if #caps == 0 then
+                vim.health.info(("%s: live threads only (no session capabilities)"):format(name))
+            else
+                vim.health.ok(("%s: %s"):format(name, table.concat(caps, ", ")))
+            end
+        end
+    end
+    if not any then
+        vim.health.info("Start an agent to see which thread features it supports")
+    end
+    local threads = options.threads
+    vim.health.info(
+        threads.persist and ("Thread index: " .. require("conduit.history").path) or "Thread index disabled"
+    )
     vim.health.info("Log file: " .. require("conduit.log").path)
 end
 

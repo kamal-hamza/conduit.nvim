@@ -39,6 +39,7 @@ See https://agentclientprotocol.com for the protocol.
     },
     inline = { agent = nil, options = {} },
     mentions = { completion = "auto" },
+    threads = { scope = "cwd", persist = true, max_listed = 200, hide_inline = true },
     log_level = vim.log.levels.WARN,
   })
 <
@@ -56,14 +57,29 @@ or ACP category, e.g. `{ model = "opus", effort = "high" }`. `effort` is an
 alias for the `thought_level` category. `inline.options` are layered over
 them for inline edits. Values depend on the agent; see |:Conduit| `option`.
 
+`threads` configures |conduit-threads|: `scope` is "cwd" (past threads started
+in the current directory) or "all"; `persist` keeps a local index of thread ids
+and titles (never transcripts); `max_listed` caps how many past threads are
+fetched; `hide_inline` leaves inline requests' sessions out of thread lists.
+
 ==============================================================================
 3. COMMANDS                                                 *conduit-commands*
 
                                                                     *:Conduit*
 :Conduit [toggle]       Toggle the chat window.
-:Conduit open [agent]   Open the chat. Naming a different agent starts a new
-                        chat with it.
-:Conduit new [agent]    Start a new chat and ACP session.
+:Conduit open [agent]   Open the current thread. Naming a different agent
+                        switches to its latest thread, or starts one.
+:Conduit new [agent]    Start a new thread (chat and ACP session). Earlier
+                        threads stay alive. See |conduit-threads|.
+:Conduit threads [agent]
+                        Pick a live or past thread, or start a new one.
+:Conduit continue [agent]
+                        Go back to the latest live thread, or reopen the
+                        most recent past thread in this directory.
+:Conduit thread {action} [title]
+                        `new`, `next`, `prev`; `close` the current thread
+                        (it stays in the history); `delete` it for good
+                        (asks first); `fork` it; `rename` it.
 :[range]Conduit add     Add [range] to the prompt as a fenced code block.
 :[range]Conduit inline [request]
                         Edit [range] in place or answer a question about it
@@ -91,11 +107,43 @@ The chat is a markdown transcript with a prompt buffer below it.
   <C-s>     (prompt, insert)  Send the prompt
   <C-c>     (prompt, normal)  Cancel the running turn
   go        (both)            Pick a session option (model, effort, mode)
+  gs        (both)            Pick a thread
+  gn        (both)            Start a new thread with the same agent
+  ]t  [t    (both)            Next / previous thread
   q         (both)            Close the chat window
 
 Tool permission requests are shown with |vim.ui.select()|. The buffers use the
 `conduit` and `conduit_input` filetypes with treesitter markdown highlighting,
 so markdown linters and LSPs don't attach to them.
+
+                                                            *conduit-threads*
+Each chat is a thread: one ACP session with its own transcript. Starting a new
+thread keeps the others alive, and switching shows the chosen thread in the
+same chat windows. The winbar shows the thread's title and its position, e.g.
+`(2/3)`. Titles come from the agent's `session_info_update`, from
+`:Conduit thread rename` (these stick), or from the first line of your first
+prompt. Inline answers moved into the chat (|conduit-inline|) become threads.
+
+Beyond live threads, features follow the agent's capabilities:
+
+  none                 Live threads until Neovim exits.
+  loadSession          Reopen past threads, replaying their transcript. Past
+                       threads come from conduit's local index.
+  session list         Past threads come from the agent (`session/list`),
+                       including ones started outside Neovim.
+  session resume       Reconnect after the agent restarts without a replay.
+  session close        Closing a thread frees the agent's session.
+  session delete       Deleting removes it from the agent's history. Without
+                       it, deleted threads are hidden from conduit's lists.
+  session fork         `:Conduit thread fork`.
+  session title        Renames are stored by the agent (`session/set_title`).
+
+The picker (`gs`, |:Conduit| `threads`) lists live threads, then the agent's
+past threads, then "New thread". When the agent process exits, the transcript
+stays; the next prompt restores the session by resuming it, else reloading it
+silently, else starting a new session with a notice. |:checkhealth| conduit
+shows what each running agent supports. The local index is
+`stdpath("data")/conduit/threads.json`.
 
                                                            *conduit-mentions*
 Type `@` in the chat prompt or the inline prompt to attach context:
@@ -168,9 +216,22 @@ override them:
 5. LUA API                                                       *conduit-api*
 
 require("conduit").setup({opts})         Configure the plugin.
-require("conduit").open({agent?})        Open or create a chat.
-require("conduit").new({agent?})         Start a new chat.
-require("conduit").toggle()              Toggle the current chat.
+require("conduit").open({agent?})        Open or create a thread.
+require("conduit").new({agent?})         Start a new thread.
+require("conduit").toggle()              Toggle the current thread.
+require("conduit").threads({agent?})     Pick a live or past thread.
+require("conduit").continue_thread({agent?})
+                                         Latest thread, reopening past ones.
+require("conduit").thread_next()         Switch to the next thread.
+require("conduit").thread_prev()         Switch to the previous thread.
+require("conduit").thread_close()        Close the current thread.
+require("conduit").thread_delete({opts?})
+                                         Delete it for good. `{ force = true }`
+                                         skips the confirmation.
+require("conduit").thread_fork()         Fork the current thread.
+require("conduit").thread_rename({title?})
+                                         Rename the current thread.
+require("conduit").current               The current thread (a chat), or nil.
 require("conduit").cancel()              Cancel the current turn.
 require("conduit").stop()                Stop all agents.
 require("conduit").add_range({l1}, {l2}) Add lines to the prompt.

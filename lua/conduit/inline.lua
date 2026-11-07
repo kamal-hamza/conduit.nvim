@@ -311,8 +311,7 @@ function Job:_cleanup()
     end
     M.jobs[self] = nil
     if self.session_id and not self.adopted then
-        self.agent.sessions[self.session_id] = nil
-        self.agent.options[self.session_id] = nil
+        self.agent:close_session(self.session_id)
     end
     if vim.api.nvim_buf_is_valid(self.buf) then
         vim.api.nvim_buf_clear_namespace(self.buf, ns, 0, -1)
@@ -372,6 +371,7 @@ function Job:to_chat()
     elseif not self.session_id then
         return vim.notify("[conduit] the session has ended", vim.log.levels.WARN)
     end
+    require("conduit.history").unhide(self.agent.name, self.session_id)
     local chat = require("conduit").adopt(self.agent, self.session_id, self.history)
     self.adopted = true
     self.agent.sessions[self.session_id] = chat
@@ -448,6 +448,10 @@ function M.run(opts)
         end
         self.agent:new_session(vim.fn.getcwd(), self, function(serr, sid)
             self.session_id = sid
+            if sid and config.options.threads.hide_inline then
+                -- Agents list every session; keep inline requests out of thread lists.
+                require("conduit.history").hide(self.agent.name, sid)
+            end
             if serr or self.cancelled then
                 return fail(serr)
             end

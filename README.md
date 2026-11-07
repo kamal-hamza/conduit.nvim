@@ -69,6 +69,12 @@ require("conduit").setup({
   mentions = {
     completion = "auto", -- "auto" (blink.cmp if loaded), "blink" or "native"
   },
+  threads = {
+    scope = "cwd",       -- past threads to offer: "cwd" (this directory) or "all"
+    persist = true,      -- remember thread ids and titles (not transcripts) on disk
+    max_listed = 200,    -- most past threads to fetch from the agent
+    hide_inline = true,  -- leave inline requests' sessions out of thread lists
+  },
   log_level = vim.log.levels.WARN,
 })
 ```
@@ -94,8 +100,15 @@ agent; `:Conduit option` lists what yours offers.
 | Command | Description |
 | --- | --- |
 | `:Conduit` / `:Conduit toggle` | Toggle the chat window |
-| `:Conduit open [agent]` | Open the chat, starting a new one if you name a different agent |
-| `:Conduit new [agent]` | Start a fresh session |
+| `:Conduit open [agent]` | Open the current thread, or the latest thread with `agent` (starting one if needed) |
+| `:Conduit new [agent]` | Start a new thread (fresh session); earlier threads stay alive |
+| `:Conduit threads [agent]` | Pick a live or past thread, or start a new one |
+| `:Conduit continue [agent]` | Go back to the latest thread, reopening a past one if none is live |
+| `:Conduit thread new\|next\|prev` | Start or cycle through threads |
+| `:Conduit thread close` | Close the current thread (it stays in the history) |
+| `:Conduit thread delete` | Delete the current thread for good, after confirming |
+| `:Conduit thread fork` | Fork the current thread into a new one with the same context |
+| `:Conduit thread rename [title]` | Rename the current thread |
 | `:'<,'>Conduit add` | Add the selected lines to the prompt as a fenced block |
 | `:'<,'>Conduit inline [request]` | Edit the selection or answer a question about it, inline |
 | `:'<,'>Conduit ask [question]` | Answer a question about the selection in a float |
@@ -110,8 +123,37 @@ agent; `:Conduit option` lists what yours offers.
 
 In the prompt buffer, `<CR>` (normal mode) or `<C-s>` (insert mode) sends the
 prompt and `<C-c>` cancels the turn. In both chat buffers, `go` picks a session
-option and `q` closes the chat. The winbar shows the current model, effort and
-mode. Permission requests open in `vim.ui.select`.
+option and `q` closes the chat. The winbar shows the thread title, the current
+model, effort and mode. Permission requests open in `vim.ui.select`.
+
+### Threads
+
+Each chat is a thread: one ACP session with its own transcript. `:Conduit new`
+starts another thread without discarding the current one, and switching swaps
+the thread into the same chat windows. In the chat buffers, `gs` picks a thread,
+`]t` / `[t` cycle through them and `gn` starts a new one. Threads are titled by
+the agent (`session_info_update`), by you (`:Conduit thread rename`), or by your
+first prompt until then. Inline answers moved into the chat become threads too.
+
+What else you get depends on what the agent advertises, so it works with any ACP
+agent:
+
+| Agent capability | What it adds |
+| --- | --- |
+| none | Live threads for as long as Neovim runs |
+| `loadSession` | Reopen past threads with their transcript (from conduit's local index) |
+| `sessionCapabilities.list` | Past threads come from the agent, including ones started elsewhere (e.g. its CLI) |
+| `sessionCapabilities.resume` | Threads reconnect without replaying history after the agent restarts |
+| `sessionCapabilities.close` / `delete` | Closing frees the session; deleting removes it from the agent's history |
+| `sessionCapabilities.fork` / `title` | `:Conduit thread fork`; renames are stored by the agent |
+
+The picker lists live threads, then past threads for the current agent in this
+directory (`threads.scope`), then "New thread". If the agent process exits, the
+transcript stays and the next prompt restores the session (resume, else a silent
+reload, else a fresh session with a notice). `:checkhealth conduit` shows what
+each running agent supports. The local index lives at
+`stdpath("data")/conduit/threads.json` and holds only ids, titles, directories
+and timestamps.
 
 Chat buffers use the `conduit` and `conduit_input` filetypes, so markdown
 linters and LSPs leave them alone, and they get markdown highlighting from
