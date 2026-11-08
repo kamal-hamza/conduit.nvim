@@ -43,8 +43,10 @@ lua/conduit/
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
   mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
-  mentions.lua          @ mentions: completion items, ranking, specials, content blocks
-  blink.lua             blink.cmp source for @ mentions
+  mentions.lua          @ mentions: completion items, ranking, specials, content blocks;
+                        mentions.attach also wires up / commands
+  commands.lua          / agent commands: per-buffer sources, items, input-hint ghost text
+  blink.lua             blink.cmp source for @ mentions and / commands
   inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
   threads.lua           Threads: live registry, switching (MRU, goto, resume), picker, search,
                         thread bar, events, past threads, close/delete/fork
@@ -130,6 +132,10 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   `session/update` notifications ahead of the response, so `_open_session`
   registers the handler under the known session id *before* sending the
   request. Otherwise the replay is silently dropped.
+- **Slash commands arrive after `session/new` responds** (Claude's adapter
+  sends `available_commands_update` a moment later), and the inline prompt
+  opens before any session exists. Read commands lazily through the buffer's
+  source function, and fall back to `agent.last_commands`.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
   written with `nvim_buf_set_lines` must be split or trimmed first.
 

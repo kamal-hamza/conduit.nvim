@@ -1,6 +1,7 @@
 --- `@` mentions in prompts: files, directories and special context such as
 --- `@diagnostics`. Provides completion items (for blink.cmp or the native
 --- popup) and turns mentions into ACP content blocks when sending.
+local commands = require("conduit.commands")
 local config = require("conduit.config")
 
 local M = {}
@@ -350,8 +351,52 @@ local function register_blink()
     cmp.add_filetype_source("conduit_input", "conduit")
 end
 
----Native-popup fallback: refresh the menu on every keystroke after `@`.
-local function native_trigger()
+---Whether the text before the cursor is a `/command` or `@mention` being typed.
+---@param buf integer
+---@return boolean
+local function completing(buf)
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local row, col = cursor[1], cursor[2]
+    local before = vim.api.nvim_get_current_line():sub(1, col)
+    if commands.query(before, row - 1) then
+        return #commands.list(buf) > 0
+    end
+    return M.query(before) ~= nil
+end
+
+---Native popup for `/` at the start of the prompt.
+---@param buf integer
+---@return boolean handled
+local function native_commands(buf)
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local row, col = cursor[1], cursor[2]
+    local start, query = commands.query(vim.api.nvim_get_current_line():sub(1, col), row - 1)
+    if not start or not query then
+        return false
+    end
+    local items = vim.tbl_map(function(cmd)
+        return {
+            word = cmd.name,
+            abbr = "/" .. cmd.name,
+            kind = "command",
+            menu = commands.hint(cmd),
+            info = cmd.description,
+            icase = 1,
+            equal = 1,
+        }
+    end, commands.items(buf, query))
+    if #items > 0 then
+        vim.fn.complete(start + 1, items)
+    end
+    return true
+end
+
+---Native-popup fallback: refresh the menu on every keystroke after `@` or `/`.
+---@param buf integer
+local function native_trigger(buf)
+    if native_commands(buf) then
+        return
+    end
     local col = vim.fn.col(".") - 1
     local start, query = M.query(vim.api.nvim_get_current_line():sub(1, col))
     if not start or not query then
@@ -371,18 +416,23 @@ local function native_trigger()
     vim.fn.complete(start + 1, items)
 end
 
----Set up `@` completion in insert mode in `buf`.
+---Set up `@` completion in insert mode in `buf`, plus `/` completion of the
+---agent's commands when `opts.commands` lists them.
 ---@param buf integer
-function M.attach(buf)
+---@param opts? { commands?: fun(): conduit.Command[] }
+function M.attach(buf, opts)
+    if opts and opts.commands then
+        commands.attach(buf, opts.commands)
+    end
     if use_blink() then
         register_blink()
-        -- Keep the menu open while typing a mention, even with `menu.auto_show`
-        -- off: blink starts a new context at `/` and `.`, which would hide it.
+        -- Keep the menu open while typing a mention or command, even with
+        -- `menu.auto_show` off: blink starts a new context at non-keyword
+        -- characters (`/`, `.`, `:`), which would hide it.
         vim.api.nvim_create_autocmd("TextChangedI", {
             buffer = buf,
             callback = function()
-                local before = vim.api.nvim_get_current_line():sub(1, vim.fn.col(".") - 1)
-                if not M.query(before) then
+                if not completing(buf) then
                     return
                 end
                 -- Deferred: blink hides the menu for the new context after this event.
@@ -402,7 +452,9 @@ function M.attach(buf)
     vim.bo[buf].completeopt = "menu,menuone,noinsert,popup"
     vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
         buffer = buf,
-        callback = native_trigger,
+        callback = function()
+            native_trigger(buf)
+        end,
     })
 end
 

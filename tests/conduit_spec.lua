@@ -670,6 +670,7 @@ end)
 
 test("api: every :Conduit subcommand resolves", function()
     local fns = { "open", "new", "toggle", "cancel", "stop", "add_range", "inline", "ask", "edit", "option" }
+    table.insert(fns, "commands")
     vim.list_extend(fns, { "threads", "continue_thread", "thread_next", "thread_prev", "thread_close" })
     vim.list_extend(fns, { "thread_delete", "thread_fork", "thread_rename", "thread_alternate", "thread_goto" })
     vim.list_extend(fns, { "thread_search", "resume", "status" })
@@ -679,6 +680,7 @@ test("api: every :Conduit subcommand resolves", function()
     local complete = vim.fn.getcompletion("Conduit ", "cmdline")
     local subs =
         { "inline", "ask", "edit", "stop", "model", "effort", "mode", "threads", "thread", "continue", "resume" }
+    table.insert(subs, "commands")
     for _, sub in ipairs(subs) do
         assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
     end
@@ -1908,4 +1910,165 @@ test("chat: agents without image support get a link and a warning", function()
         vim.inspect(msgs)
     )
     drop_agent("blind")
+end)
+
+---A chat whose session has received the mock's slash commands.
+---@return conduit.Chat
+local function chat_with_commands()
+    local chat = assert(conduit.new())
+    send(chat, "hi")
+    wait_for(function()
+        return #chat.agent:get_commands(chat.session_id) > 0
+    end, "available_commands_update")
+    return chat
+end
+
+local function names(list)
+    return vim.tbl_map(function(cmd)
+        return cmd.name
+    end, list)
+end
+
+test("commands: the agent keeps each session's slash commands", function()
+    local agent = require("conduit.agent").new("cmds", require("conduit.config").options.agents.mock)
+    local noop = function() end
+    local handler = { on_update = noop, request_permission = noop, on_agent_exit = noop }
+    local sid
+    agent:start(function()
+        agent:new_session(vim.fn.getcwd(), handler, function(_, s)
+            sid = s
+        end)
+    end)
+    wait_for(function()
+        return sid and agent.commands[sid] ~= nil
+    end, "commands for the new session")
+    assert(vim.deep_equal(names(agent:get_commands(sid)), { "review", "compact" }))
+    -- Before a session exists, the last list stands in.
+    assert(vim.deep_equal(names(agent:get_commands()), { "review", "compact" }))
+    agent:close_session(sid)
+    assert(agent.commands[sid] == nil, "closing forgets the session's commands")
+    agent:stop()
+end)
+
+test("commands: typing / at the start of the prompt completes agent commands", function()
+    local chat = chat_with_commands()
+    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
+    local orig = vim.fn.complete
+    local calls = {}
+    vim.fn.complete = function(col, list)
+        table.insert(calls, { col = col, list = list })
+    end
+    -- Cursor on the trailing "x" stands in for the insert-mode cursor after "re".
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "/rex" })
+    vim.api.nvim_win_set_cursor(0, { 1, 3 })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "hi /rex" })
+    vim.api.nvim_win_set_cursor(0, { 1, 6 })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
+    vim.fn.complete = orig
+    assert(#calls == 1, "only a leading / completes commands: " .. vim.inspect(calls))
+    local first = calls[1].list[1]
+    assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
+    assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
+    assert(vim.api.nvim_get_current_win() == select(2, chat:wins()))
+    assert(chat.input and vim.wo.winbar:find("/ command", 1, true), vim.wo.winbar)
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
+end)
+
+test("commands: the input hint shows after the command until arguments are typed", function()
+    local chat = chat_with_commands()
+    local ns = vim.api.nvim_get_namespaces()["conduit.commands"]
+    local function hint(line)
+        vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { line })
+        vim.api.nvim_exec_autocmds("TextChanged", { buffer = chat.input })
+        local marks = vim.api.nvim_buf_get_extmarks(chat.input, ns, 0, -1, { details = true })
+        return marks[1] and marks[1][4].virt_text[1][1]
+    end
+    assert(hint("/review ") == "optional focus", tostring(hint("/review ")))
+    assert(hint("/review") == " optional focus")
+    assert(hint("/review auth") == nil, "hint hides once arguments are typed")
+    assert(hint("/compact ") == nil, "commands without input have no hint")
+    assert(hint("/nope ") == nil)
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
+end)
+
+test("blink: / completes agent commands with their input hint", function()
+    local chat = chat_with_commands()
+    local source = require("conduit.blink").new()
+    assert(vim.tbl_contains(source:get_trigger_characters(), "/"))
+    ---@type { is_incomplete_forward: boolean, items: table[] }?
+    local got
+    source:get_completions({ cursor = { 1, 3 }, line = "/re", bufnr = chat.input }, function(res)
+        got = res
+    end)
+    got = assert(got)
+    local first = got.items[1]
+    assert(first.label == "/review" and first.labelDetails.description == "optional focus", vim.inspect(first))
+    assert(first.textEdit.newText == "review ", "commands with input get a trailing space")
+    local range = first.textEdit.range
+    assert(range.start.character == 1 and range["end"].character == 3, vim.inspect(range))
+    ---@type table?
+    local resolved
+    source:resolve(first, function(r)
+        resolved = r
+    end)
+    local doc = assert(resolved).documentation.value
+    assert(doc:find("/review", 1, true) and doc:find("Review the current changes", 1, true), doc)
+
+    ---@type { items: table[] }?
+    local later
+    source:get_completions({ cursor = { 2, 3 }, line = "/re", bufnr = chat.input }, function(res)
+        later = res
+    end)
+    assert(#assert(later).items == 0, "commands only complete on the first line")
+end)
+
+test("commands: chat prompts starting with /name run the command", function()
+    local chat = chat_with_commands()
+    send(chat, "/review auth")
+    local text = transcript(chat)
+    assert(text:find("ran review: auth (0 context)", 1, true), text)
+end)
+
+test("commands: inline commands are sent unwrapped with the selection, as an answer", function()
+    chat_with_commands():close()
+    inline_buf()
+    local job = assert(conduit.inline(2, 3, "/review naming"))
+    wait_turn(job)
+    assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
+    local text = assert(job.answer):text()
+    assert(text:find("ran review: naming (1 context)", 1, true), text)
+    job:close()
+
+    -- The inline prompt completes from the agent's last list before a session exists.
+    conduit.inline(2, 3)
+    local buf = vim.api.nvim_get_current_buf()
+    assert(vim.bo[buf].filetype == "conduit_input")
+    assert(vim.deep_equal(names(require("conduit.commands").list(buf)), { "review", "compact" }))
+    vim.cmd.stopinsert()
+    vim.api.nvim_win_close(0, true)
+    vim.cmd("bwipeout!")
+end)
+
+test("commands: :Conduit commands starts the prompt with the picked command", function()
+    local chat = chat_with_commands()
+    local orig = vim.ui.select
+    local shown
+    vim.ui.select = function(items, opts, cb)
+        shown = vim.tbl_map(opts.format_item, items)
+        cb(items[1])
+    end
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "keep this" })
+    vim.cmd("Conduit commands")
+    vim.ui.select = orig
+    vim.cmd.stopinsert()
+    assert(shown and shown[1] == "/review optional focus — Review the current changes", vim.inspect(shown))
+    local lines = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
+    assert(lines[1] == "/review keep this", vim.inspect(lines))
+    vim.cmd("Conduit commands /compact")
+    vim.cmd.stopinsert()
+    lines = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
+    assert(lines[1] == "/compact keep this", vim.inspect(lines))
+    assert(vim.tbl_contains(vim.fn.getcompletion("Conduit commands ", "cmdline"), "review"))
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
 end)
