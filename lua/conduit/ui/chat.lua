@@ -1,15 +1,9 @@
 --- A chat: one ACP session rendered as a markdown transcript plus an input buffer.
 local config = require("conduit.config")
 local options = require("conduit.options")
+local tool_ui = require("conduit.ui.tool")
 
 local ns = vim.api.nvim_create_namespace("conduit")
-
-local status_icons = {
-    pending = "○",
-    in_progress = "◐",
-    completed = "✓",
-    failed = "✗",
-}
 
 local KEYS_HINT = "<CR> send · @ file · <C-c> cancel · go options · gs threads · g<Tab> alternate · q close"
 
@@ -25,7 +19,7 @@ local plan_icons = {
 ---@field transcript integer
 ---@field input integer
 ---@field busy boolean
----@field tools table<string, table>
+---@field tools table<string, conduit.ChatTool>
 ---@field title? string Set by the agent (`session_info_update`), the user, or from the first prompt
 ---@field custom_title? boolean The user named the thread; agent titles don't replace it
 ---@field cwd? string Working directory of the session
@@ -42,34 +36,20 @@ local plan_icons = {
 local Chat = {}
 Chat.__index = Chat
 
+---Accumulated `tool_call` + `tool_call_update` fields, plus where the call is drawn.
+---@class conduit.ChatTool
+---@field toolCallId string
+---@field title? string
+---@field kind? string
+---@field status? string
+---@field content? table[]
+---@field locations? { path: string, line?: integer }[]
+---@field block? { mark: integer, size: integer } First line and line count in the transcript
+---@field expanded? boolean Shown without the preview limits
+
 local count = 0
 
----@param content? table ACP ContentBlock
----@param link_resources? boolean Show embedded resources as links (e.g. replayed @mentions)
----@return string
-local function content_text(content, link_resources)
-    if not content then
-        return ""
-    elseif content.type == "text" then
-        return content.text or ""
-    elseif content.type == "resource_link" then
-        return ("[%s](%s)"):format(content.name or content.uri, content.uri)
-    elseif content.type == "resource" and content.resource then
-        local uri = content.resource.uri or ""
-        if link_resources then
-            return ("\n[%s](%s)"):format(uri:match("[^/]+/?$") or uri, uri)
-        end
-        return content.resource.text or ("<%s>"):format(uri)
-    elseif content.type == "image" then
-        local uri = content.uri
-        local text = "[image]"
-        if type(uri) == "string" and uri ~= "" then
-            text = ("[image: %s](%s)"):format(uri:match("[^/]+$") or uri, uri)
-        end
-        return link_resources and "\n" .. text or text
-    end
-    return ("<%s>"):format(content.type or "unknown")
-end
+local content_text = tool_ui.content_text
 
 local function scratch(name, ft)
     local buf = vim.api.nvim_create_buf(false, true)
@@ -114,6 +94,22 @@ function Chat:_keymaps()
     map("n", "<C-c>", function()
         self:cancel()
     end, "Cancel turn")
+    local function tmap(lhs, fn, fallback, desc)
+        vim.keymap.set("n", lhs, function()
+            if not fn() then
+                vim.cmd.normal({ fallback, bang = true })
+            end
+        end, { buffer = self.transcript, desc = desc })
+    end
+    tmap("<CR>", function()
+        return self:toggle_tool()
+    end, vim.keycode("<CR>"), "Expand or collapse the tool call")
+    tmap("gd", function()
+        return self:open_tool_diff()
+    end, "gd", "Show the tool call's diff")
+    tmap("gf", function()
+        return self:open_tool_location()
+    end, "gf", "Open the file the tool call touched")
     for _, buf in ipairs({ self.input, self.transcript }) do
         vim.keymap.set("n", "q", function()
             self:close()
@@ -292,14 +288,18 @@ function Chat:_scroll()
 end
 
 ---Run `fn` with the transcript temporarily modifiable.
-function Chat:_edit(fn)
+---@param fn fun(buf: integer)
+---@param keep_view? boolean Don't scroll to the end (the user is editing in place)
+function Chat:_edit(fn, keep_view)
     local buf = self.transcript
     vim.bo[buf].modifiable = true
     local ok, err = pcall(fn, buf)
     vim.bo[buf].modifiable = false
     -- A replay can be thousands of chunks; scroll and render once at the end.
     if not self.replaying then
-        self:_scroll()
+        if not keep_view then
+            self:_scroll()
+        end
         require("conduit.ui.render").refresh(buf)
     end
     if not ok then
@@ -372,18 +372,219 @@ function Chat:copy_transcript(other)
     self:_edit(function(buf)
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
+    -- Keep the tool blocks expandable in the copy.
+    for id, tool in pairs(other.tools) do
+        local block = tool.block
+        local pos = block and vim.api.nvim_buf_get_extmark_by_id(other.transcript, ns, block.mark, {})
+        if block and pos and #pos > 0 then
+            local copy = vim.deepcopy(tool)
+            copy.block = {
+                mark = vim.api.nvim_buf_set_extmark(self.transcript, ns, pos[1], 0, { right_gravity = false }),
+                size = block.size,
+            }
+            self.tools[id] = copy
+        end
+    end
 end
 
----@param tool table
----@return string
-local function tool_line(tool)
-    local title = tool.title or tool.kind or "tool call"
-    -- Titles can span lines (e.g. a multi-line shell command); show the first.
-    local first = title:match("^[^\n]*")
-    if first ~= title then
-        first = first .. " …"
+---@param tool conduit.ChatTool
+---@return string[]
+function Chat:_tool_lines(tool)
+    local opts = config.options.tools
+    return tool_ui.lines(tool, {
+        expanded = tool.expanded,
+        cwd = self.cwd or vim.fn.getcwd(),
+        diff_lines = opts.diff_lines,
+        output_lines = opts.output_lines,
+        hide_output = opts.hide_output or {},
+    })
+end
+
+---Draw a tool call: append its block, or redraw it in place.
+---@param tool conduit.ChatTool
+---@param keep_view? boolean Don't scroll to the end
+function Chat:_render_tool(tool, keep_view)
+    local lines = self:_tool_lines(tool)
+    local block = tool.block
+    local pos = block and vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, block.mark, {})
+    if block and pos and #pos > 0 then
+        self:_edit(function(buf)
+            vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + block.size, false, lines)
+        end, keep_view)
+        block.size = #lines
+        return
     end
-    return ("%s %s"):format(status_icons[tool.status or "pending"] or "•", first)
+    self.last_kind = "tool"
+    local row = self:_append_lines(vim.list_extend({ "" }, lines)) + 1
+    -- Left gravity: redrawing the block replaces the marked line, which must not
+    -- push the mark onto the line below.
+    tool.block = {
+        mark = vim.api.nvim_buf_set_extmark(self.transcript, ns, row, 0, { right_gravity = false }),
+        size = #lines,
+    }
+end
+
+---The tool call drawn at a transcript row.
+---@param row integer 0-based
+---@return conduit.ChatTool?
+function Chat:tool_at(row)
+    for _, tool in pairs(self.tools) do
+        local block = tool.block
+        local pos = block and vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, block.mark, {})
+        if block and pos and #pos > 0 and row >= pos[1] and row < pos[1] + block.size then
+            return tool
+        end
+    end
+end
+
+---@return conduit.ChatTool?
+function Chat:_tool_at_cursor()
+    if vim.api.nvim_get_current_buf() ~= self.transcript then
+        return nil
+    end
+    return self:tool_at(vim.api.nvim_win_get_cursor(0)[1] - 1)
+end
+
+---Expand or collapse the tool call at `row` (default: the cursor's).
+---@param row? integer 0-based
+---@return boolean toggled
+function Chat:toggle_tool(row)
+    local tool ---@type conduit.ChatTool?
+    if row then
+        tool = self:tool_at(row)
+    else
+        tool = self:_tool_at_cursor()
+    end
+    if not tool then
+        return false
+    end
+    tool.expanded = not tool.expanded
+    self:_render_tool(tool, true)
+    -- Keep the cursor on the block's header line when it shrinks from under it.
+    local twin = vim.fn.bufwinid(self.transcript)
+    local pos = vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, assert(tool.block).mark, {})
+    if twin ~= -1 and #pos > 0 and not tool.expanded then
+        local cur = vim.api.nvim_win_get_cursor(twin)
+        if cur[1] - 1 >= pos[1] + assert(tool.block).size then
+            vim.api.nvim_win_set_cursor(twin, { pos[1] + 1, 0 })
+        end
+    end
+    return true
+end
+
+---A normal window to open files in, away from the chat.
+---@return integer
+function Chat:_target_win()
+    local twin, iwin = self:wins()
+    local function usable(win)
+        return win ~= 0
+            and vim.api.nvim_win_is_valid(win)
+            and win ~= twin
+            and win ~= iwin
+            and vim.fn.win_gettype(win) == "" -- not a float, preview or command-line window
+    end
+    local prev = vim.fn.win_getid(vim.fn.winnr("#"))
+    if usable(prev) then
+        return prev
+    end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if usable(win) then
+            return win
+        end
+    end
+    vim.cmd("topleft vsplit")
+    return vim.api.nvim_get_current_win()
+end
+
+---Open the first file the tool call at the cursor touched (`gf`).
+---@return boolean opened
+function Chat:open_tool_location()
+    local tool = self:_tool_at_cursor()
+    if not tool then
+        return false
+    end
+    local loc = (tool.locations or {})[1]
+    local diff = tool_ui.diffs(tool)[1]
+    local path = loc and loc.path or diff and diff.path
+    if not path then
+        vim.notify("[conduit] this tool call has no file location", vim.log.levels.INFO)
+        return true
+    end
+    local win = self:_target_win()
+    vim.api.nvim_set_current_win(win)
+    vim.cmd.edit(vim.fn.fnameescape(path))
+    if loc and type(loc.line) == "number" then
+        local line = math.max(1, math.min(loc.line, vim.api.nvim_buf_line_count(0)))
+        vim.api.nvim_win_set_cursor(win, { line, 0 })
+    end
+    return true
+end
+
+local diff_count = 0
+
+---Show a diff entry side by side in a new tab, with 'diff' mode on.
+---@param entry conduit.ToolDiff
+function Chat.open_diff(entry)
+    diff_count = diff_count + 1
+    local ft = vim.filetype.match({ filename = entry.path })
+    local function side(label, text)
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.bo[buf].bufhidden = "wipe"
+        vim.api.nvim_buf_set_name(buf, ("conduit://diff/%d/%s/%s"):format(diff_count, label, entry.path))
+        local lines = type(text) == "string" and text ~= "" and tool_ui.split(text) or {}
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.bo[buf].modifiable = false
+        if ft then
+            vim.bo[buf].filetype = ft
+        end
+        vim.keymap.set("n", "q", function()
+            if #vim.api.nvim_list_tabpages() > 1 then
+                vim.cmd.tabclose()
+            else
+                vim.cmd("only | enew")
+            end
+        end, { buffer = buf, desc = "Close diff" })
+        return buf
+    end
+    local old, new = side("old", entry.oldText), side("new", entry.newText)
+    vim.cmd("tab sbuffer " .. old)
+    local owin = vim.api.nvim_get_current_win()
+    vim.cmd("rightbelow vertical sbuffer " .. new)
+    local nwin = vim.api.nvim_get_current_win()
+    local path = vim.fn.fnamemodify(entry.path, ":~:.")
+    for win, label in pairs({ [owin] = "before", [nwin] = "after" }) do
+        vim.wo[win].winbar = ("%s: %s"):format(label, (path:gsub("%%", "%%%%")))
+        vim.api.nvim_win_call(win, function()
+            vim.cmd.diffthis()
+        end)
+    end
+end
+
+---Open the diff of the tool call at the cursor (`gd`), picking one if it has several.
+---@return boolean found
+function Chat:open_tool_diff()
+    local tool = self:_tool_at_cursor()
+    if not tool then
+        return false
+    end
+    local diffs = tool_ui.diffs(tool)
+    if #diffs == 0 then
+        vim.notify("[conduit] this tool call has no diff", vim.log.levels.INFO)
+    elseif #diffs == 1 then
+        Chat.open_diff(diffs[1])
+    else
+        vim.ui.select(diffs, {
+            prompt = "Diff",
+            format_item = function(d)
+                return tool_ui.relpath(d.path, self.cwd)
+            end,
+        }, function(choice)
+            if choice then
+                Chat.open_diff(choice)
+            end
+        end)
+    end
+    return true
 end
 
 local CONTENT_UPDATES = {
@@ -414,27 +615,23 @@ function Chat:on_update(update)
         end
         self:_append_text(content_text(update.content, true))
     elseif kind == "tool_call" then
-        self.last_kind = "tool"
         local tool = vim.deepcopy(update)
-        local row = self:_append_lines({ "", tool_line(tool) }) + 1
-        tool.mark = vim.api.nvim_buf_set_extmark(self.transcript, ns, row, 0, {})
+        tool.sessionUpdate = nil
+        ---@cast tool conduit.ChatTool
         self.tools[update.toolCallId] = tool
+        self:_render_tool(tool)
     elseif kind == "tool_call_update" then
         local tool = self.tools[update.toolCallId]
         if not tool then
             return self:on_update(vim.tbl_extend("force", update, { sessionUpdate = "tool_call" }))
         end
+        -- Fields that are present replace the old ones, `content` and `locations` included.
         for k, v in pairs(update) do
             if k ~= "sessionUpdate" then
                 tool[k] = v
             end
         end
-        local pos = vim.api.nvim_buf_get_extmark_by_id(self.transcript, ns, tool.mark, {})
-        if #pos > 0 then
-            self:_edit(function(buf)
-                vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + 1, false, { tool_line(tool) })
-            end)
-        end
+        self:_render_tool(tool)
     elseif kind == "plan" then
         local lines = { "", "### Plan" }
         for _, entry in ipairs(update.entries or {}) do
@@ -471,6 +668,12 @@ end
 
 function Chat:request_permission(params, respond)
     local call = params.toolCall or {}
+    -- `toolCall` is a ToolCallUpdate; it can carry the proposed diff, so draw it
+    -- before asking.
+    local id = call.toolCallId
+    if type(id) == "string" and (self.tools[id] or call.title) then
+        self:on_update(vim.tbl_extend("force", call, { sessionUpdate = "tool_call_update" }))
+    end
     local known = self.tools[call.toolCallId] or {}
     local title = call.title or known.title or "run a tool"
     self.waiting = true

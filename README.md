@@ -80,6 +80,11 @@ require("conduit").setup({
     hide_inline = true,  -- leave inline requests' sessions out of thread lists
     notify = true,       -- notify when a thread you aren't looking at replies or needs permission
   },
+  tools = {
+    diff_lines = 20,     -- diff lines previewed under a tool call, before <CR> expands it
+    output_lines = 8,    -- output lines previewed under a tool call
+    hide_output = { read = true, search = true, fetch = true }, -- kinds whose output starts hidden
+  },
   log_level = vim.log.levels.WARN,
 })
 ```
@@ -178,6 +183,24 @@ prompt and `<C-c>` cancels the turn. In both chat buffers, `go` picks a session
 option and `q` closes the chat. The chat's winbar shows the thread bar (see
 below), and the prompt's winbar shows the agent, its state and the current
 model, effort and mode. Permission requests open in `vim.ui.select`.
+
+### Tool calls
+
+Each tool call shows its status and title in the transcript. Below that come
+the files it touched, the diff of any edit it made or proposes, and its output.
+Diffs and output are cut to `tools.diff_lines` and `tools.output_lines`. Output
+from `read`, `search` and `fetch` calls (often a whole file) stays hidden until
+you expand it. When an agent asks permission for an edit, the proposed diff is
+drawn before the prompt opens. In the transcript:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Expand or collapse the tool call under the cursor |
+| `gd` | Open its diff side by side in a new tab (`q` closes it) |
+| `gf` | Open the first file it touched, at the reported line |
+
+Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
+bundle (`:TSInstall diff`); `:checkhealth conduit` reports whether it's there.
 
 ### Threads
 
@@ -380,6 +403,7 @@ lua/conduit/
 ├── commands.lua  -- / agent commands: completion items, input hints
 ├── blink.lua     -- blink.cmp source for @ mentions and / commands
 ├── ui/chat.lua   -- transcript + input buffers, session/update rendering
+├── ui/tool.lua   -- tool call blocks: status, locations, diffs, output
 ├── ui/prompt.lua  -- floating prompt for inline requests (modes, @ completion)
 ├── ui/answer.lua  -- floating answer window anchored under the selection
 ├── ui/hl.lua      -- highlight groups and float helpers (borders, key hints)

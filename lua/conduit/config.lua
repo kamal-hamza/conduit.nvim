@@ -25,6 +25,11 @@ local M = {}
 ---@field thread_bar boolean
 ---@field inline { width: { min: integer, max: integer } }
 
+---@class conduit.ToolsConfig
+---@field diff_lines integer Most diff lines shown per tool call before it's expanded
+---@field output_lines integer Most output lines shown per tool call before it's expanded
+---@field hide_output table<string, boolean> Tool kinds whose output stays hidden until expanded
+
 ---@class conduit.Config
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
@@ -33,6 +38,7 @@ local M = {}
 ---@field mcp_servers conduit.McpServers
 ---@field mentions { completion: "auto"|"blink"|"native" }
 ---@field threads conduit.ThreadsConfig
+---@field tools conduit.ToolsConfig
 ---@field log_level integer
 M.defaults = {
     default_agent = "claude",
@@ -91,6 +97,14 @@ M.defaults = {
         hide_inline = true,
         -- Notify when a thread you're not looking at finishes a turn or asks for permission.
         notify = true,
+    },
+    -- Tool calls in the chat: diffs and output are previewed under each call, up to
+    -- these many lines; <CR> on a call shows all of it.
+    tools = {
+        diff_lines = 20,
+        output_lines = 8,
+        -- Kinds whose output (often a whole file) stays hidden until expanded.
+        hide_output = { read = true, search = true, fetch = true },
     },
     log_level = vim.log.levels.WARN,
 }

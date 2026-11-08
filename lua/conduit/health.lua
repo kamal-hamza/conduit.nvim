@@ -8,6 +8,16 @@ function M.check()
         vim.health.error("Neovim >= 0.11 is required")
     end
 
+    local ok, has_diff = pcall(vim.treesitter.language.add, "diff")
+    if ok and has_diff then
+        vim.health.ok("treesitter `diff` parser (highlights tool call diffs)")
+    else
+        vim.health.warn(
+            "treesitter `diff` parser not found: tool call diffs in the chat won't be highlighted",
+            { "Install it, e.g. `:TSInstall diff` with nvim-treesitter" }
+        )
+    end
+
     local options = require("conduit.config").options
     vim.health.start("conduit.nvim: agents")
     for name, spec in vim.spairs(options.agents) do
