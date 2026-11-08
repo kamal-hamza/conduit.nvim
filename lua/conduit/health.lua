@@ -57,6 +57,27 @@ function M.check()
         vim.health.info("Inline requests run without MCP servers (`inline.mcp_servers`)")
     end
 
+    vim.health.start("conduit.nvim: prompt content")
+    local any_prompt = false
+    for name, agent in vim.spairs(agents) do
+        if agent.info then
+            any_prompt = true
+            local caps = (agent.info.agentCapabilities or {}).promptCapabilities or {}
+            local function yes(cap)
+                return caps[cap] == true and "yes" or "no"
+            end
+            local line = ("%s: images %s, embedded context %s"):format(name, yes("image"), yes("embeddedContext"))
+            if caps.image == true then
+                vim.health.ok(line)
+            else
+                vim.health.info(line .. " (@ mentioned images are sent as links)")
+            end
+        end
+    end
+    if not any_prompt then
+        vim.health.info("Start an agent to see whether it accepts images and embedded context")
+    end
+
     vim.health.start("conduit.nvim: threads")
     local any = false
     for name, agent in vim.spairs(agents) do

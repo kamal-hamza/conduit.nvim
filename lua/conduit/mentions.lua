@@ -8,6 +8,8 @@ local M = {}
 
 -- Files larger than this are sent as links for the agent to read itself.
 M.max_embed_bytes = 256 * 1024
+-- Images larger than this are sent as links (the Anthropic per-image limit).
+M.max_image_bytes = 5 * 1024 * 1024
 M.max_dir_entries = 300
 M.max_items = 100
 
@@ -240,7 +242,7 @@ function M.items(query, root)
             word = rel,
             kind = dir and "dir" or (buffers[rel] and "buffer" or "file"),
             path = vim.fs.joinpath(root, rel),
-            detail = buffers[rel] and "open buffer" or nil,
+            detail = buffers[rel] and "open buffer" or (not dir and M.is_image_name(rel) and "image" or nil),
         }
     end
 
@@ -520,11 +522,59 @@ function M.dir_listing(abs, rel)
     return ("Directory %s/ contains:\n%s"):format(rel, table.concat(entries, "\n"))
 end
 
+-- File extensions that usually hold an image, for completion details.
+local IMAGE_EXTS = { png = true, jpg = true, jpeg = true, gif = true, webp = true }
+
+---Whether `path` looks like an image from its extension (cheap, for completion).
+---@param path string
+---@return boolean
+function M.is_image_name(path)
+    return IMAGE_EXTS[(path:match("%.(%w+)$") or ""):lower()] == true
+end
+
+---The MIME type of an image file, from its signature, or nil if it isn't a
+---PNG, JPEG, GIF or WebP image. Extensions are ignored so a mislabeled text
+---file isn't sent as an image.
+---@param abs string
+---@return string?
+function M.image_mime(abs)
+    local f = io.open(abs, "rb")
+    if not f then
+        return nil
+    end
+    local head = f:read(12) or ""
+    f:close()
+    if head:sub(1, 8) == "\137PNG\r\n\26\n" then
+        return "image/png"
+    elseif head:sub(1, 3) == "\255\216\255" then
+        return "image/jpeg"
+    elseif head:sub(1, 6) == "GIF87a" or head:sub(1, 6) == "GIF89a" then
+        return "image/gif"
+    elseif head:sub(1, 4) == "RIFF" and head:sub(9, 12) == "WEBP" then
+        return "image/webp"
+    end
+end
+
+---@param abs string
+---@param uri string
+---@param mime string
+---@return table? ImageContent
+local function image_block(abs, uri, mime)
+    local f = io.open(abs, "rb")
+    if not f then
+        return nil
+    end
+    local bytes = f:read("*a")
+    f:close()
+    return { type = "image", mimeType = mime, data = vim.base64.encode(bytes), uri = uri }
+end
+
 ---@param mention conduit.Mention
----@param embed boolean Whether the agent accepts embedded resources
+---@param caps table ACP PromptCapabilities
 ---@param ctx conduit.MentionCtx
+---@param warnings string[] Collects reasons images were sent as links
 ---@return table? ContentBlock
-local function block(mention, embed, ctx)
+local function block(mention, caps, ctx, warnings)
     if mention.special then
         local text = M.specials[mention.special].resolve(ctx)
         return text and { type = "text", text = ("<context name=%q>\n%s\n</context>"):format(mention.special, text) }
@@ -535,7 +585,26 @@ local function block(mention, embed, ctx)
     end
     local uri = vim.uri_from_fname(abs)
     local link = { type = "resource_link", uri = uri, name = rel }
-    if not embed then
+    local mime = not mention.dir and M.image_mime(abs)
+    if mime then
+        local stat = vim.uv.fs_stat(abs)
+        if caps.image ~= true then
+            table.insert(warnings, ("the agent doesn't accept images, sent @%s as a link"):format(rel))
+        elseif stat and stat.size > M.max_image_bytes then
+            table.insert(
+                warnings,
+                ("@%s is larger than %g MB, sent as a link"):format(rel, M.max_image_bytes / (1024 * 1024))
+            )
+        else
+            local img = image_block(abs, uri, mime)
+            if img then
+                return img
+            end
+        end
+        link.mimeType = mime
+        return link
+    end
+    if caps.embeddedContext ~= true then
         return link
     end
     if mention.dir then
@@ -555,22 +624,28 @@ local function block(mention, embed, ctx)
 end
 
 ---Turn prompt text into ACP content blocks: the text itself, then one block per mention.
+---Images become `image` blocks when the agent accepts them; otherwise they're
+---sent as links with a warning.
 ---@param text string
----@param agent? { info?: table } Only its capabilities are used, to check for embedded context support
+---@param agent? { info?: table } Only its prompt capabilities are used
 ---@param ctx? { root?: string, buf?: integer }
 ---@return table[]
 function M.blocks(text, agent, ctx)
     ctx = ctx or {}
     ---@type conduit.MentionCtx
     local full = { root = ctx.root or vim.fn.getcwd(), buf = ctx.buf or M.last_buf() }
-    local caps = agent and agent.info and agent.info.agentCapabilities or {}
-    local embed = (caps.promptCapabilities or {}).embeddedContext == true
+    local agent_caps = agent and agent.info and agent.info.agentCapabilities or {}
+    local caps = agent_caps.promptCapabilities or {}
     local blocks = { { type = "text", text = text } }
+    local warnings = {} ---@type string[]
     for _, mention in ipairs(M.parse(text, full.root)) do
-        local b = block(mention, embed, full)
+        local b = block(mention, caps, full, warnings)
         if b then
             table.insert(blocks, b)
         end
+    end
+    if #warnings > 0 then
+        vim.notify("[conduit] " .. table.concat(warnings, "\n"), vim.log.levels.WARN)
     end
     return blocks
 end

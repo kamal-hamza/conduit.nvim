@@ -250,6 +250,7 @@ Type `@` in the chat prompt or the inline prompt to attach context:
 
   @path/file      The file's contents (from its buffer if open)
   @dir/           A listing of the directory
+  @shot.png       The image, if the agent accepts images
   @buffer         The buffer you were last in
   @selection      Your last visual selection in that buffer
   @diagnostics    Diagnostics from all open buffers
@@ -258,6 +259,12 @@ Type `@` in the chat prompt or the inline prompt to attach context:
 
 Mentions that don't match anything are left as plain text. Agents without
 embedded-context support get resource links for files.
+
+PNG, JPEG, GIF and WebP images (recognised by their contents) are sent as ACP
+`image` blocks when the agent advertises `promptCapabilities.image`. Images
+over 5 MB, or mentioned to an agent without image support, are sent as links
+with a warning. |:checkhealth| conduit shows which running agents accept
+images.
 
 Completion uses blink.cmp when it is loaded (a `conduit` source is registered
 for the `conduit_input` filetype automatically), otherwise the native popup.
