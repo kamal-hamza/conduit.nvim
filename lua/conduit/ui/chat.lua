@@ -33,6 +33,7 @@ local plan_icons = {
 ---@field last_used? integer When it was last made current (see `conduit.threads`)
 ---@field unread? boolean Finished a turn while you weren't looking at it
 ---@field waiting? boolean A permission request is waiting for an answer
+---@field following table<conduit.ChatTool, conduit.Terminal> Terminals whose output tool calls show live
 local Chat = {}
 Chat.__index = Chat
 
@@ -46,8 +47,13 @@ Chat.__index = Chat
 ---@field locations? { path: string, line?: integer }[]
 ---@field block? { mark: integer, size: integer } First line and line count in the transcript
 ---@field expanded? boolean Shown without the preview limits
+---@field _meta? table May name a display terminal (`terminal_info`)
+---@field redraw_queued? boolean A redraw for new terminal output is pending
 
 local count = 0
+
+-- Redraw a tool call for new terminal output at most this often.
+local REDRAW_MS = 50
 
 local content_text = tool_ui.content_text
 
@@ -66,7 +72,7 @@ end
 function Chat.new(agent)
     require("conduit.ui.hl").setup()
     count = count + 1
-    local self = setmetatable({ agent = agent, busy = false, tools = {}, last_kind = nil }, Chat)
+    local self = setmetatable({ agent = agent, busy = false, tools = {}, following = {}, last_kind = nil }, Chat)
     self.transcript = scratch(("conduit://%s/%d"):format(agent.name, count), "conduit")
     self.input = scratch(("conduit://%s/%d/input"):format(agent.name, count), "conduit_input")
     vim.bo[self.transcript].modifiable = false
@@ -355,8 +361,44 @@ function Chat:_section(kind, header, message_id)
     return true
 end
 
+---Stop following terminal output.
+function Chat:_unfollow()
+    for tool, term in pairs(self.following) do
+        term:unsubscribe(tool)
+    end
+    self.following = {}
+end
+
+---Redraw a tool call as its terminals produce output (debounced).
+---@param tool conduit.ChatTool
+function Chat:_follow_terminals(tool)
+    for _, id in ipairs(tool_ui.terminal_ids(tool)) do
+        local term = self.agent:terminal(id)
+        if term and self.following[tool] ~= term then
+            local old = self.following[tool]
+            if old then
+                old:unsubscribe(tool)
+            end
+            self.following[tool] = term
+            term:subscribe(tool, function()
+                if tool.redraw_queued then
+                    return
+                end
+                tool.redraw_queued = true
+                vim.defer_fn(function()
+                    tool.redraw_queued = false
+                    if self.tools[tool.toolCallId] == tool and vim.api.nvim_buf_is_valid(self.transcript) then
+                        self:_render_tool(tool)
+                    end
+                end, REDRAW_MS)
+            end)
+        end
+    end
+end
+
 ---Empty the transcript (before replaying a session into it).
 function Chat:_clear()
+    self:_unfollow()
     self:_edit(function(buf)
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
         vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -378,6 +420,7 @@ function Chat:copy_transcript(other)
         local pos = block and vim.api.nvim_buf_get_extmark_by_id(other.transcript, ns, block.mark, {})
         if block and pos and #pos > 0 then
             local copy = vim.deepcopy(tool)
+            copy.redraw_queued = nil
             copy.block = {
                 mark = vim.api.nvim_buf_set_extmark(self.transcript, ns, pos[1], 0, { right_gravity = false }),
                 size = block.size,
@@ -397,6 +440,9 @@ function Chat:_tool_lines(tool)
         diff_lines = opts.diff_lines,
         output_lines = opts.output_lines,
         hide_output = opts.hide_output or {},
+        terminal = function(id)
+            return self.agent:terminal(id)
+        end,
     })
 end
 
@@ -620,6 +666,7 @@ function Chat:on_update(update)
         ---@cast tool conduit.ChatTool
         self.tools[update.toolCallId] = tool
         self:_render_tool(tool)
+        self:_follow_terminals(tool)
     elseif kind == "tool_call_update" then
         local tool = self.tools[update.toolCallId]
         if not tool then
@@ -627,11 +674,16 @@ function Chat:on_update(update)
         end
         -- Fields that are present replace the old ones, `content` and `locations` included.
         for k, v in pairs(update) do
-            if k ~= "sessionUpdate" then
+            if k == "_meta" and type(v) == "table" and type(tool._meta) == "table" then
+                -- Later updates carry only their own keys (terminal output, exit);
+                -- keep the earlier ones, such as `terminal_info`.
+                tool._meta = vim.tbl_extend("force", tool._meta, v)
+            elseif k ~= "sessionUpdate" then
                 tool[k] = v
             end
         end
         self:_render_tool(tool)
+        self:_follow_terminals(tool)
     elseif kind == "plan" then
         local lines = { "", "### Plan" }
         for _, entry in ipairs(update.entries or {}) do
@@ -965,6 +1017,7 @@ function Chat:add_context(lines)
 end
 
 function Chat:destroy()
+    self:_unfollow()
     self:cancel()
     self:close()
     if self.session_id then

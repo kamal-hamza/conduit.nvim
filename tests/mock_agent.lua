@@ -23,6 +23,13 @@
 --
 -- MCP: `--mcp=http,sse` advertises those transports. Every session method echoes
 -- the `mcpServers` it received in `_meta.mcpServers`.
+--
+-- Terminals: `term <json>` takes `{ create = <terminal/create params>, steps = {...} }`,
+-- creates the terminal, shows it in a tool call, then runs each step: "wait",
+-- "output", "kill", "release", or "sleep:<ms>". Each result (or error) is said on
+-- its own line as `<step> <json>`. `display` reports a command it "ran itself"
+-- through the `_meta` display-terminal extension. `caps` says the client's
+-- capabilities as JSON.
 io.stdout:setvbuf("no")
 
 local argv = _G.arg or {}
@@ -181,7 +188,10 @@ local function advertise(sid)
     end)
 end
 
-handlers.initialize = function()
+local client_caps = {}
+
+handlers.initialize = function(params)
+    client_caps = params.clientCapabilities or {}
     local session_caps = vim.empty_dict()
     for _, cap in ipairs({ "list", "resume", "close", "delete", "fork", "title" }) do
         if caps[cap] then
@@ -389,6 +399,72 @@ local function run_command(sid, argv)
     return { stopReason = "end_turn" }
 end
 
+---@param sid string
+---@param spec { create: table, steps?: string[] }
+local function run_terminal(sid, spec)
+    local create = spec.create
+    create.sessionId = sid
+    local created, err = request("terminal/create", create)
+    if err then
+        say(sid, "\ncreate " .. vim.json.encode(err))
+        return { stopReason = "end_turn" }
+    end
+    local tid = created.terminalId
+    say(sid, "\ncreate " .. vim.json.encode(created))
+    update(sid, {
+        sessionUpdate = "tool_call",
+        toolCallId = "term-call",
+        title = create.command,
+        kind = "execute",
+        status = "in_progress",
+        content = { { type = "terminal", terminalId = tid } },
+    })
+    for _, step in ipairs(spec.steps or {}) do
+        local ms = step:match("^sleep:(%d+)$")
+        if ms then
+            vim.uv.sleep(tonumber(ms) --[[@as integer]])
+        else
+            local result, rerr = request("terminal/" .. (step == "wait" and "wait_for_exit" or step), {
+                sessionId = sid,
+                terminalId = tid,
+            })
+            say(sid, ("\n%s %s"):format(step, vim.json.encode(rerr or result)))
+        end
+    end
+    update(sid, { sessionUpdate = "tool_call_update", toolCallId = "term-call", status = "completed" })
+    return { stopReason = "end_turn" }
+end
+
+---A command the agent ran itself, shown through `_meta` (Claude's extension).
+---@param sid string
+local function display_terminal(sid)
+    local info = { terminal_id = "disp-1" }
+    update(sid, {
+        sessionUpdate = "tool_call",
+        toolCallId = "disp-1",
+        title = "make test",
+        kind = "execute",
+        status = "in_progress",
+        -- Only `_meta` names the terminal; later updates carry just their own keys.
+        _meta = { terminal_info = info },
+    })
+    for _, data in ipairs({ "building\n", "\27[31mfailed\27[0m\n" }) do
+        update(sid, {
+            sessionUpdate = "tool_call_update",
+            toolCallId = "disp-1",
+            _meta = { terminal_output_delta = { terminal_id = "disp-1", data = data } },
+        })
+    end
+    update(sid, {
+        sessionUpdate = "tool_call_update",
+        toolCallId = "disp-1",
+        status = "failed",
+        _meta = { terminal_exit = { terminal_id = "disp-1", exit_code = 2 } },
+    })
+    say(sid, "ran it")
+    return { stopReason = "end_turn" }
+end
+
 handlers["session/prompt"] = function(params)
     local sid = params.sessionId
     local text = params.prompt[1].text
@@ -505,6 +581,18 @@ handlers["session/prompt"] = function(params)
     end
     if text:match("^follow:") then
         say(sid, "Follow-up answer to: " .. text)
+        return { stopReason = "end_turn" }
+    end
+
+    local term = text:match("^term (.+)$")
+    if term then
+        return run_terminal(sid, vim.json.decode(term))
+    end
+    if text == "display" then
+        return display_terminal(sid)
+    end
+    if text == "caps" then
+        say(sid, "\ncaps " .. vim.json.encode(client_caps))
         return { stopReason = "end_turn" }
     end
 

@@ -2249,3 +2249,163 @@ test("commands: :Conduit commands starts the prompt with the picked command", fu
     assert(vim.tbl_contains(vim.fn.getcompletion("Conduit commands ", "cmdline"), "review"))
     vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
 end)
+
+---Results the mock said for each terminal step (`<step> <json>` lines), in order.
+---@param chat conduit.Chat
+---@return { step: string, value: table }[]
+local function term_results(chat)
+    local out = {}
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)) do
+        local step, json = line:match("^(%a+) ({.*})$")
+        -- "term" is the prompt itself.
+        if step and step ~= "term" then
+            table.insert(out, { step = step, value = vim.json.decode(json, { luanil = { object = true } }) })
+        end
+    end
+    return out
+end
+
+---Run a `term` prompt in a new chat.
+---@param create table terminal/create params
+---@param steps string[]
+---@return conduit.Chat, table<string, table> results Last result per step
+local function run_term(create, steps)
+    local chat = assert(conduit.new())
+    send(chat, "term " .. vim.json.encode({ create = create, steps = steps }))
+    local by_step = {}
+    for _, r in ipairs(term_results(chat)) do
+        by_step[r.step] = r.value
+    end
+    return chat, by_step
+end
+
+test("terminal: the client advertises terminals and display terminals", function()
+    local chat = assert(conduit.new())
+    send(chat, "caps")
+    local caps = assert(term_results(chat)[1]).value
+    assert(caps.terminal == true, vim.inspect(caps))
+    assert(caps._meta.terminal_output == true and caps._meta.terminal_output_delta == true, vim.inspect(caps))
+end)
+
+test("terminal: runs a command, reports output and exit code", function()
+    local chat, r = run_term({ command = "sh", args = { "-c", "printf 'a\\nb\\n'; exit 3" } }, { "wait", "output" })
+    assert(r.create and r.create.terminalId, vim.inspect(r))
+    assert(r.wait.exitCode == 3 and r.wait.signal == nil, vim.inspect(r.wait))
+    assert(r.output.output == "a\nb\n" and r.output.truncated == false, vim.inspect(r.output))
+    assert(r.output.exitStatus.exitCode == 3, vim.inspect(r.output))
+    local text = transcript(chat)
+    assert(text:find("✓ sh\n```console\na\nb\n```\nexit code 3\n", 1, true), text)
+end)
+
+test("terminal: honours cwd and env", function()
+    local dir = vim.fn.resolve(vim.fn.tempname())
+    vim.fn.mkdir(dir, "p")
+    local _, r = run_term({
+        command = "sh",
+        args = { "-c", 'printf "%s %s" "$CONDUIT_TEST" "$(pwd -P)"' },
+        cwd = dir,
+        env = { { name = "CONDUIT_TEST", value = "hi" } },
+    }, { "wait", "output" })
+    assert(r.output.output == "hi " .. dir, vim.inspect(r.output))
+end)
+
+test("terminal: a whole command line without args runs in a shell", function()
+    local _, r = run_term({ command = "echo one && echo two" }, { "wait", "output" })
+    assert(r.wait.exitCode == 0, vim.inspect(r.wait))
+    assert(r.output.output == "one\ntwo\n", vim.inspect(r.output))
+end)
+
+test("terminal: output beyond the byte limit drops the oldest output", function()
+    -- "é" is two bytes: a cut at the limit lands mid-character and must skip it.
+    local _, r = run_term({ command = "printf", args = { "0123456789é" }, outputByteLimit = 3 }, { "wait", "output" })
+    assert(r.output.truncated == true, vim.inspect(r.output))
+    assert(r.output.output == "9é", vim.inspect(r.output))
+end)
+
+test("terminal: kill stops the command and keeps its output", function()
+    local chat, r = run_term(
+        { command = "sh", args = { "-c", "echo started; sleep 30" } },
+        { "sleep:300", "kill", "wait", "output" }
+    )
+    assert(r.wait.signal == "SIGTERM" and r.wait.exitCode == nil, vim.inspect(r.wait))
+    assert(r.output.output == "started\n", vim.inspect(r.output))
+    assert(transcript(chat):find("started\n```\nkilled by SIGTERM", 1, true), transcript(chat))
+end)
+
+test("terminal: released terminals reject requests but stay visible", function()
+    local chat, r = run_term({ command = "echo", args = { "kept" } }, { "wait", "release", "output" })
+    assert(r.output.code == -32602, vim.inspect(r.output))
+    assert(transcript(chat):find("```console\nkept\n```", 1, true), transcript(chat))
+end)
+
+test("terminal: missing executables are reported to the agent", function()
+    local _, r = run_term({ command = "conduit-no-such-cmd", args = { "x" } }, {})
+    assert(r.create.code == -32603 and r.create.message:find("conduit%-no%-such%-cmd"), vim.inspect(r.create))
+end)
+
+test("terminal: disabled terminals aren't advertised or run", function()
+    local config = require("conduit.config").options
+    config.terminal.enabled = false
+    local agent = thread_agent("noterm")
+    local chat = assert(conduit.new("noterm"))
+    send(chat, "caps")
+    local caps = assert(term_results(chat)[1]).value
+    send(chat, "term " .. vim.json.encode({ create = { command = "echo" } }))
+    config.terminal.enabled = true
+    assert(caps.terminal == false, vim.inspect(caps))
+    local create = assert(term_results(chat)[2]).value
+    assert(create.code == -32601, vim.inspect(create))
+    assert(agent)
+    drop_agent("noterm")
+end)
+
+test("terminal: running commands are killed when the agent exits", function()
+    local agent = thread_agent("termexit")
+    local chat = assert(conduit.new("termexit"))
+    send(chat, "term " .. vim.json.encode({ create = { command = "sleep", args = { "30" } } }))
+    local term = assert(agent.terminals["term-1"])
+    local pid = assert(assert(term.proc).pid)
+    agent:stop()
+    wait_for(function()
+        return term.exit ~= nil
+    end, "command to be killed")
+    assert(term.exit.signal == "SIGTERM", vim.inspect(term.exit))
+    assert(next(agent.terminals) == nil)
+    drop_agent("termexit")
+    assert(not vim.uv.kill(pid, 0) or vim.uv.kill(pid, 0) ~= 0, "process still running")
+end)
+
+test("terminal: display terminals from tool call _meta render live", function()
+    local chat = assert(conduit.new())
+    send(chat, "display")
+    wait_for(function()
+        return transcript(chat):find("exit code 2", 1, true)
+    end, "display terminal output")
+    local text = transcript(chat)
+    assert(text:find("✗ make test\n```console\nbuilding\nfailed\n```\nexit code 2\n", 1, true), text)
+end)
+
+test("terminal: long output shows the last lines and expands in place", function()
+    local config = require("conduit.config").options
+    config.tools.output_lines = 3
+    local chat = run_term({ command = "sh", args = { "-c", "for i in 1 2 3 4 5 6; do echo line$i; done" } }, { "wait" })
+    local text = transcript(chat)
+    assert(
+        text:find("✓ sh\n… 3 earlier lines (`<CR>` to expand)\n```console\nline4\nline5\nline6\n```\n", 1, true),
+        text
+    )
+    local lines = vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)
+    local row = assert(vim.fn.index(lines, "✓ sh"))
+    assert(chat:toggle_tool(row))
+    config.tools.output_lines = 8
+    text = transcript(chat)
+    assert(text:find("✓ sh\n```console\nline1\nline2\nline3\nline4\nline5\nline6\n```\n", 1, true), text)
+end)
+
+test("terminal: display lines strip escapes and resolve carriage returns", function()
+    local Terminal = require("conduit.terminal")
+    local lines = Terminal.display_lines("\27[32mok\27[0m\r\n10%\r50%\r100%\nend")
+    assert(vim.deep_equal(lines, { "ok", "100%", "end" }), vim.inspect(lines))
+    assert(Terminal.sanitize("a\255b") == "a\239\191\189b")
+    assert(Terminal.sanitize("é") == "é")
+end)

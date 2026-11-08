@@ -42,6 +42,8 @@ lua/conduit/
                         and agent→client requests (fs/*, request_permission)
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
+  terminal.lua          terminal/* commands (vim.system, own process group) and display
+                        terminals from tool call _meta; output kept for the chat
   mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks;
                         mentions.attach also wires up / commands
@@ -98,7 +100,9 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 - The mock takes flags: `--legacy` (modes/models instead of configOptions),
   `--threads=load,list,...` (session capabilities), `--seed` (past sessions
   to list and load), `--mcp=http,sse` (MCP transports) and `--no-image` (no
-  `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`). Session methods echo
+  `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`).
+  Prompts `term <json>` (terminal/create plus steps), `display` (the `_meta`
+  display-terminal extension) and `caps` exercise terminals. Session methods echo
   the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
@@ -144,6 +148,12 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 - **Tool calls are blocks redrawn in place** (extmark + line count, like the
   plan). The mark has left gravity so replacing the block keeps it on the
   header line. `content` and `locations` in an update replace the old lists.
+- **Claude doesn't use ACP terminals.** Claude Code runs Bash itself, so the
+  adapter ignores `clientCapabilities.terminal`. It reports output through the
+  `_meta` display-terminal extension instead (`terminal_info`,
+  `terminal_output[_delta]`, `terminal_exit`, opted into with
+  `clientCapabilities._meta.terminal_output[_delta]`). Codex does the same.
+  Both paths feed `conduit.Terminal`, so the chat renders them identically.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
   written with `nvim_buf_set_lines` must be split or trimmed first.
 

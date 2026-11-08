@@ -1,6 +1,8 @@
 --- Tool calls in the chat transcript: a status line, the files the call touched
 --- and a preview of its content (diffs and output), expandable in place.
 --- Pure formatting: turns ACP tool call state into lines; `conduit.Chat` owns the buffer.
+local Terminal = require("conduit.terminal")
+
 local M = {}
 
 ---@class conduit.ToolDiff ACP `ToolCallContent` of type "diff"
@@ -15,6 +17,7 @@ local M = {}
 ---@field diff_lines integer Most diff lines in a collapsed preview
 ---@field output_lines integer Most output lines in a collapsed preview
 ---@field hide_output table<string, boolean> Tool kinds whose output is hidden until expanded
+---@field terminal? fun(id: string): conduit.Terminal? Looks up terminals the call embeds
 
 local STATUS_ICONS = {
     pending = "○",
@@ -25,6 +28,8 @@ local STATUS_ICONS = {
 
 -- Locations listed in a collapsed block (search hits can be many).
 local MAX_LOCATIONS = 5
+-- Bytes of terminal output looked at for a collapsed preview.
+local TAIL_BYTES = 32 * 1024
 
 ---@param content? table ACP ContentBlock
 ---@param link_resources? boolean Show embedded resources as links (e.g. replayed @mentions)
@@ -196,6 +201,49 @@ local function fenced(out, body, lang)
     table.insert(out, fence)
 end
 
+---The terminals a tool call shows: `terminal` content, or the display terminal
+---named in its `_meta` (Claude's extension) when the content has none yet.
+---@param tool table
+---@return string[]
+function M.terminal_ids(tool)
+    local ids = {}
+    for _, entry in ipairs(type(tool.content) == "table" and tool.content or {}) do
+        if type(entry) == "table" and entry.type == "terminal" and type(entry.terminalId) == "string" then
+            table.insert(ids, entry.terminalId)
+        end
+    end
+    local info = #ids == 0 and type(tool._meta) == "table" and tool._meta.terminal_info
+    if type(info) == "table" and type(info.terminal_id) == "string" then
+        ids[1] = info.terminal_id
+    end
+    return ids
+end
+
+---The last `max` lines of a terminal's output (all of them when `max` is nil),
+---and how many lines came before them.
+---@param term conduit.Terminal
+---@param max? integer
+---@return string[] lines, integer earlier
+function M.terminal_tail(term, max)
+    local out = term:output()
+    local tail = out
+    if max and #out > TAIL_BYTES then
+        -- Only the end matters; start at a whole line.
+        tail = out:sub(#out - TAIL_BYTES + 1)
+        tail = tail:match("\n(.*)$") or tail
+    end
+    local lines = Terminal.display_lines(tail)
+    local total = #lines
+    if #tail < #out then
+        local _, newlines = out:sub(1, #out - #tail):gsub("\n", "")
+        total = total + newlines
+    end
+    if max and #lines > max then
+        lines = max > 0 and vim.list_slice(lines, #lines - max + 1) or {}
+    end
+    return lines, total - #lines
+end
+
 ---Take up to `budget` lines (all of them when `budget` is nil).
 ---@param lines string[]
 ---@param budget? integer
@@ -284,6 +332,32 @@ function M.lines(tool, opts)
                 if out_budget then
                     out_budget = out_budget - #shown
                 end
+            end
+        end
+    end
+    -- Terminals show their last lines: that's where a running command is.
+    for _, id in ipairs(opts.terminal and M.terminal_ids(tool) or {}) do
+        local term = opts.terminal and opts.terminal(id)
+        if term then
+            local shown, earlier = M.terminal_tail(term, out_budget)
+            if earlier > 0 then
+                if hide or opts.output_lines <= 0 then
+                    table.insert(out, hint(earlier, "line of output", "lines of output", "show"))
+                else
+                    table.insert(out, hint(earlier, "earlier line", "earlier lines", "expand"))
+                end
+            elseif term.truncated and #shown > 0 then
+                table.insert(out, "… (earlier output dropped)")
+            end
+            if #shown > 0 then
+                fenced(out, shown, "console")
+            end
+            if out_budget then
+                out_budget = math.max(0, out_budget - #shown)
+            end
+            local exit = term:exit_text()
+            if exit then
+                table.insert(out, exit)
             end
         end
     end

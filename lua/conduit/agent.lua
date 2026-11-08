@@ -1,6 +1,7 @@
 --- An ACP agent subprocess. Neovim acts as the ACP *client*.
 --- Spec: https://agentclientprotocol.com
 local Rpc = require("conduit.rpc")
+local Terminal = require("conduit.terminal")
 local log = require("conduit.log")
 local mcp = require("conduit.mcp")
 local options = require("conduit.options")
@@ -22,6 +23,7 @@ local NOT_FOUND = -32002
 ---@field on_update fun(self, update: table)
 ---@field request_permission fun(self, params: table, respond: fun(err: table?, result: any))
 ---@field on_agent_exit fun(self, code: integer)
+---@field cwd? string Working directory of the session (default for terminals)
 
 ---A slash command the agent advertises (`available_commands_update`).
 ---@class conduit.Command
@@ -39,6 +41,9 @@ local NOT_FOUND = -32002
 ---@field options table<string, conduit.Option[]> Session options by session id
 ---@field commands table<string, conduit.Command[]> Slash commands by session id
 ---@field last_commands conduit.Command[] Most recent command list from any session
+---@field terminals table<string, conduit.Terminal> Terminals by id: commands run for the agent and
+---display terminals it reports, kept (with their output) until their session closes
+---@field terminal_count integer
 local Agent = {}
 Agent.__index = Agent
 
@@ -65,6 +70,8 @@ function Agent.new(name, spec)
         commands = {},
         last_commands = {},
         waiting = {},
+        terminals = {},
+        terminal_count = 0,
     }, Agent)
 end
 
@@ -113,10 +120,12 @@ function Agent:start(cb)
     -- initial rpc request handshake
     rpc:request("initialize", {
         protocolVersion = PROTOCOL_VERSION,
-        -- no terminal capabilties, only fs
         clientCapabilities = {
             fs = { readTextFile = true, writeTextFile = true },
-            terminal = false,
+            terminal = require("conduit.config").options.terminal.enabled,
+            -- Display terminals: agents that run commands themselves (Claude,
+            -- Codex) report their output in tool call `_meta` instead.
+            _meta = { terminal_output = true, terminal_output_delta = true },
         },
         clientInfo = { name = "conduit.nvim", version = require("conduit").version },
     }, function(e, result)
@@ -295,6 +304,7 @@ function Agent:close_session(sid, cb)
     self.sessions[sid] = nil
     self.options[sid] = nil
     self.commands[sid] = nil
+    self:_release_terminals(sid)
     if not self.rpc or not self:supports("close") then
         return cb(nil)
     end
@@ -311,6 +321,7 @@ function Agent:delete_session(sid, cb)
         return cb(nil, false)
     end
     self.commands[sid] = nil
+    self:_release_terminals(sid)
     self:_request("session/delete", { sessionId = sid }, function(err)
         if err and err.code ~= NOT_FOUND then
             return cb(errmsg(err), false)
@@ -467,6 +478,8 @@ function Agent:_on_request(method, params, respond)
     elseif method == "fs/write_text_file" then
         local result, err = require("conduit.fs").write(params)
         respond(err, result)
+    elseif vim.startswith(method, "terminal/") then
+        self:_terminal_request(method, params, respond)
     elseif method == "session/request_permission" then
         local session = self.sessions[params.sessionId]
         if not session then
@@ -476,6 +489,95 @@ function Agent:_on_request(method, params, respond)
     else
         respond({ code = -32601, message = "Method not found: " .. method })
     end
+end
+
+---@param method string
+---@param params table
+---@param respond fun(err: table?, result: any)
+function Agent:_terminal_request(method, params, respond)
+    if not require("conduit.config").options.terminal.enabled then
+        return respond({ code = -32601, message = "Method not found: " .. method })
+    end
+    local sid = params.sessionId
+    if method == "terminal/create" then
+        local session = self.sessions[sid]
+        self.terminal_count = self.terminal_count + 1
+        local id = "term-" .. self.terminal_count
+        local term, err = Terminal.spawn(id, params, session and session.cwd or vim.fn.getcwd())
+        if not term then
+            return respond({ code = -32603, message = ("could not run %s: %s"):format(params.command, err) })
+        end
+        log.debug(("%s: terminal %s runs %s"):format(self.name, id, term.command))
+        self.terminals[id] = term
+        return respond(nil, { terminalId = id })
+    end
+    local term = self.terminals[params.terminalId]
+    if not term or not term.spawned or term.released or term.session_id ~= sid then
+        return respond({ code = -32602, message = "Unknown terminal: " .. tostring(params.terminalId) })
+    end
+    if method == "terminal/output" then
+        respond(nil, term:output_result())
+    elseif method == "terminal/wait_for_exit" then
+        term:wait(function(status)
+            respond(nil, { exitCode = status.exitCode, signal = status.signal })
+        end)
+    elseif method == "terminal/kill" then
+        term:kill()
+        respond(nil, vim.empty_dict())
+    elseif method == "terminal/release" then
+        term:release()
+        respond(nil, vim.empty_dict())
+    else
+        respond({ code = -32601, message = "Method not found: " .. method })
+    end
+end
+
+---Track a display terminal from a tool call's `_meta` (the `terminal_output`
+---extension), before the session handler renders the update.
+---@param sid string
+---@param meta table
+function Agent:_display_terminal(sid, meta)
+    local info = meta.terminal_info or meta.terminal_output or meta.terminal_output_delta or meta.terminal_exit
+    local id = type(info) == "table" and info.terminal_id
+    if type(id) ~= "string" then
+        return
+    end
+    local term = self.terminals[id]
+    if not term then
+        term = Terminal.new(id, { session_id = sid })
+        self.terminals[id] = term
+    end
+    if type(meta.terminal_output) == "table" and type(meta.terminal_output.data) == "string" then
+        term:set_output(meta.terminal_output.data)
+    end
+    if type(meta.terminal_output_delta) == "table" and type(meta.terminal_output_delta.data) == "string" then
+        term:append(meta.terminal_output_delta.data)
+    end
+    if type(meta.terminal_exit) == "table" then
+        local exit = meta.terminal_exit
+        term:exited({
+            exitCode = type(exit.exit_code) == "number" and exit.exit_code or nil,
+            signal = type(exit.signal) == "string" and exit.signal or nil,
+        })
+    end
+end
+
+---Kill and forget a session's terminals.
+---@param sid string
+function Agent:_release_terminals(sid)
+    for id, term in pairs(self.terminals) do
+        if term.session_id == sid then
+            term:release()
+            self.terminals[id] = nil
+        end
+    end
+end
+
+---Look up a terminal (live, released or display) to show in a tool call.
+---@param id string
+---@return conduit.Terminal?
+function Agent:terminal(id)
+    return self.terminals[id]
 end
 
 function Agent:_on_notification(method, params)
@@ -492,6 +594,9 @@ function Agent:_on_notification(method, params)
             if mode then
                 mode.current = update.currentModeId
             end
+        end
+        if type(update._meta) == "table" then
+            self:_display_terminal(sid, update._meta)
         end
         local session = self.sessions[sid] ---@type conduit.SessionHandler?
         if session then
@@ -511,6 +616,10 @@ function Agent:_on_exit(code)
     self.sessions = {}
     self.options = {}
     self.commands = {}
+    for _, term in pairs(self.terminals) do
+        term:release()
+    end
+    self.terminals = {}
     for _, session in pairs(sessions) do
         session:on_agent_exit(code)
     end
