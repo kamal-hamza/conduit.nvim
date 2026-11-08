@@ -26,6 +26,7 @@ local MAX_HEIGHT = 8
 ---@field agent? string Agent name shown first in the title
 ---@field mode? conduit.InlineMode Initial mode; omit for a prompt without modes
 ---@field anchor? conduit.PromptAnchor Range to open next to; defaults to the cursor
+---@field commands? fun(): conduit.Command[] Agent commands to complete after a leading `/`
 ---@field on_submit fun(text: string, mode?: conduit.InlineMode)
 
 ---Accept the open completion item, if any.
@@ -107,7 +108,7 @@ function M.open(opts)
     vim.bo[buf].filetype = "conduit_input"
     vim.diagnostic.enable(false, { bufnr = buf })
     pcall(vim.treesitter.start, buf, "markdown")
-    require("conduit.mentions").attach(buf)
+    require("conduit.mentions").attach(buf, { commands = opts.commands })
 
     local mode = opts.mode
 
@@ -115,6 +116,10 @@ function M.open(opts)
     ---@return conduit.InlineMode?
     local function effective_mode()
         local first = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+        if mode and opts.commands and require("conduit.commands").parse(first) then
+            -- Agent commands run as-is and answer in a float (see `inline.run`).
+            return "ask"
+        end
         return select(2, M.parse_prefix(first, mode))
     end
 
@@ -142,6 +147,11 @@ function M.open(opts)
     end
     vim.list_extend(help, {
         { "@", "attach a file, @buffer, @selection, @diagnostics, ..." },
+    })
+    if opts.commands then
+        table.insert(help, { "/", "at the start: run an agent command (/review, ...)" })
+    end
+    vim.list_extend(help, {
         { "<C-c>", "cancel (insert mode)" },
         { "q, <Esc>", "close (normal mode)" },
     })

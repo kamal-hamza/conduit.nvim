@@ -117,6 +117,7 @@ agent; `:Conduit option` lists what yours offers.
 | `:Conduit effort [value]` | Pick or set the reasoning effort |
 | `:Conduit mode [value]` | Pick or set the mode (e.g. plan, accept edits) |
 | `:Conduit option [id] [value]` | Pick or set any session option |
+| `:Conduit commands [name]` | Pick one of the agent's slash commands and start the prompt with it |
 | `:Conduit cancel` | Cancel running inline edits, or else the current turn |
 | `:Conduit stop` | Kill all agent processes |
 | `:Conduit log` | Open the log file |
@@ -195,6 +196,21 @@ or `"native"`.
 If an agent doesn't accept embedded context, mentions are sent as links for it
 to read itself. Files over 256 KB and binary files are always sent as links.
 
+### Slash commands
+
+Agents advertise their own commands (Claude Code has `/review`, `/compact`,
+`/init`, ...). Type `/` at the very start of the chat prompt or the inline
+prompt to complete them, with each command's description in the menu (blink's
+documentation window, or the native popup's info). Commands that take
+arguments show their input hint as ghost text after `/name ` until you type
+some. `:Conduit commands` lists them in `vim.ui.select` instead, and
+`:checkhealth conduit` shows what each running agent offers.
+
+A prompt that starts with `/name` is sent unchanged, and the agent runs the
+command. In the inline prompt, a command is sent as is (not wrapped in
+conduit's edit instructions), with the selected lines attached as context, and
+the reply opens in an answer float.
+
 ### Inline requests
 
 Select some lines and run `:'<,'>Conduit inline` (`<leader>ai` in the example
@@ -263,7 +279,8 @@ lua/conduit/
 ├── options.lua   -- session options (configOptions + legacy modes/models)
 ├── inline.lua    -- in-place edits of a buffer range
 ├── mentions.lua  -- @ mentions: items, ranking, special context, resource blocks
-├── blink.lua     -- blink.cmp source for @ mentions
+├── commands.lua  -- / agent commands: completion items, input hints
+├── blink.lua     -- blink.cmp source for @ mentions and / commands
 ├── ui/chat.lua   -- transcript + input buffers, session/update rendering
 ├── ui/prompt.lua  -- floating prompt for inline requests (modes, @ completion)
 ├── ui/answer.lua  -- floating answer window anchored under the selection

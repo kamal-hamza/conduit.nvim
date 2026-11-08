@@ -94,6 +94,10 @@ fetched; `hide_inline` leaves inline requests' sessions out of thread lists.
 :Conduit mode [value]   Pick or set the session mode.
 :Conduit option [id] [value]
                         Pick or set any session option.
+:Conduit commands [name]
+                        Pick one of the agent's slash commands (or use
+                        [name]) and start the chat prompt with it. See
+                        |conduit-slash-commands|.
 :Conduit cancel         Cancel running inline edits, or else the chat turn.
 :Conduit stop           Terminate all agent processes.
 :Conduit log            Open the log file.
@@ -162,6 +166,18 @@ embedded-context support get resource links for files.
 Completion uses blink.cmp when it is loaded (a `conduit` source is registered
 for the `conduit_input` filetype automatically), otherwise the native popup.
 Set `mentions = { completion = "blink" | "native" }` to force one.
+
+                                                     *conduit-slash-commands*
+Agents advertise their own commands (`available_commands_update`), such as
+`/review`, `/compact` and `/init` for Claude Code. Type `/` at the very start
+of the chat prompt or the inline prompt to complete them, with descriptions in
+the completion docs. Commands that take arguments show their input hint as
+ghost text after `/name ` until you type some. `:Conduit commands` lists them
+with |vim.ui.select()|, and |:checkhealth| conduit shows them per agent.
+
+A prompt starting with `/name` is sent unchanged and the agent runs the
+command. From the inline prompt, a command is sent as is with the selected
+lines attached as context, and the reply opens in an answer float.
 
                                                              *conduit-inline*
 Inline requests work on a range. Without a request on the command line, a
@@ -241,5 +257,7 @@ require("conduit").ask({l1}, {l2}, {q?})  Inline answer about lines.
 require("conduit").edit({l1}, {l2}, {i?}) Inline edit of lines.
 require("conduit").option({key?}, {value?})
                                          Pick or set a session option.
+require("conduit").commands({name?})     Pick a slash command (or use {name})
+                                         and start the chat prompt with it.
 
  vim:tw=78:ts=8:ft=help:norl:

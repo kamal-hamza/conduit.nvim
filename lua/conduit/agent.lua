@@ -22,6 +22,12 @@ local NOT_FOUND = -32002
 ---@field request_permission fun(self, params: table, respond: fun(err: table?, result: any))
 ---@field on_agent_exit fun(self, code: integer)
 
+---A slash command the agent advertises (`available_commands_update`).
+---@class conduit.Command
+---@field name string Without the leading `/`
+---@field description? string
+---@field input? { hint?: string } Present when the command takes arguments
+
 ---@class conduit.Agent
 ---@field name string
 ---@field spec conduit.AgentSpec
@@ -30,6 +36,8 @@ local NOT_FOUND = -32002
 ---@field state "idle"|"starting"|"ready"
 ---@field sessions table<string, conduit.SessionHandler>
 ---@field options table<string, conduit.Option[]> Session options by session id
+---@field commands table<string, conduit.Command[]> Slash commands by session id
+---@field last_commands conduit.Command[] Most recent command list from any session
 local Agent = {}
 Agent.__index = Agent
 
@@ -47,7 +55,16 @@ end
 ---@param name string
 ---@param spec conduit.AgentSpec
 function Agent.new(name, spec)
-    return setmetatable({ name = name, spec = spec, state = "idle", sessions = {}, options = {}, waiting = {} }, Agent)
+    return setmetatable({
+        name = name,
+        spec = spec,
+        state = "idle",
+        sessions = {},
+        options = {},
+        commands = {},
+        last_commands = {},
+        waiting = {},
+    }, Agent)
 end
 
 ---Spawn the agent and run the `initialize` handshake.
@@ -274,6 +291,7 @@ function Agent:close_session(sid, cb)
         end
     self.sessions[sid] = nil
     self.options[sid] = nil
+    self.commands[sid] = nil
     if not self.rpc or not self:supports("close") then
         return cb(nil)
     end
@@ -289,6 +307,7 @@ function Agent:delete_session(sid, cb)
     if not self:supports("delete") then
         return cb(nil, false)
     end
+    self.commands[sid] = nil
     self:_request("session/delete", { sessionId = sid }, function(err)
         if err and err.code ~= NOT_FOUND then
             return cb(errmsg(err), false)
@@ -341,6 +360,16 @@ function Agent:_apply_defaults(sid, defaults, cb)
         end)
     end
     step(1)
+end
+
+---Slash commands for a session. Without a known list for `sid` (or with no
+---`sid`, before a session exists) this falls back to the last list any session
+---received: agents advertise the same commands for every session, and they
+---often arrive just after `session/new` responds.
+---@param sid? string
+---@return conduit.Command[]
+function Agent:get_commands(sid)
+    return sid and self.commands[sid] or self.last_commands
 end
 
 ---@param sid string
@@ -451,6 +480,10 @@ function Agent:_on_notification(method, params)
         local sid, update = params.sessionId, params.update
         if update.sessionUpdate == "config_option_update" then
             self.options[sid] = options.from_config_options(update.configOptions or {})
+        elseif update.sessionUpdate == "available_commands_update" then
+            local list = type(update.availableCommands) == "table" and update.availableCommands or {}
+            self.commands[sid] = list
+            self.last_commands = list
         elseif update.sessionUpdate == "current_mode_update" then
             local mode = options.find(self:get_options(sid), "mode")
             if mode then
@@ -474,6 +507,7 @@ function Agent:_on_exit(code)
     local sessions = self.sessions
     self.sessions = {}
     self.options = {}
+    self.commands = {}
     for _, session in pairs(sessions) do
         session:on_agent_exit(code)
     end

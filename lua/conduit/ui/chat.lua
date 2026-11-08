@@ -34,7 +34,6 @@ local plan_icons = {
 ---@field message_id? string ACP `messageId` of the message being rendered
 ---@field last_kind? string
 ---@field plan? { mark: integer, size: integer }
----@field commands? table[]
 local Chat = {}
 Chat.__index = Chat
 
@@ -79,7 +78,11 @@ function Chat.new(agent)
     self.input = scratch(("conduit://%s/%d/input"):format(agent.name, count), "conduit_input")
     vim.bo[self.transcript].modifiable = false
     require("conduit.ui.render").attach(self.transcript)
-    require("conduit.mentions").attach(self.input)
+    require("conduit.mentions").attach(self.input, {
+        commands = function()
+            return self.agent:get_commands(self.session_id)
+        end,
+    })
     self:_keymaps()
     return self
 end
@@ -228,7 +231,10 @@ function Chat:_refresh_winbar()
         vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(escape(title), escape(table.concat(parts, " · ")))
     end
     if iwin then
-        vim.wo[iwin].winbar = " prompt %= <CR> send · @ file · <C-c> cancel · go options · gs threads · q close "
+        local cmds = #self.agent:get_commands(self.session_id) > 0 and "/ command · " or ""
+        vim.wo[iwin].winbar = (" prompt %%= <CR> send · @ file · %s<C-c> cancel · go options · gs threads · q close "):format(
+            cmds
+        )
     end
 end
 
@@ -406,7 +412,8 @@ function Chat:on_update(update)
             self.last_kind = "plan"
         end
     elseif kind == "available_commands_update" then
-        self.commands = update.availableCommands
+        -- The agent keeps the list (see `Agent:get_commands`); show the `/` hint.
+        self:_refresh_winbar()
     elseif kind == "session_info_update" then
         -- rpc decodes JSON null as nil, so a cleared title keeps the old one.
         if type(update.title) == "string" and update.title ~= "" and not self.custom_title then
@@ -665,6 +672,30 @@ function Chat:cancel()
     if self.busy and self.session_id then
         self.agent:cancel(self.session_id)
     end
+end
+
+---Start the prompt with `/name ` (replacing any command already there) and
+---focus the input, ready for the command's arguments.
+---@param name string
+function Chat:insert_command(name)
+    self:open()
+    local lines = vim.api.nvim_buf_get_lines(self.input, 0, -1, false)
+    local rest = (lines[1] or ""):gsub("^/[^%s/]*%s*", "")
+    lines[1] = ("/%s %s"):format(name, rest)
+    vim.api.nvim_buf_set_lines(self.input, 0, -1, false, lines)
+    local _, iwin = self:wins()
+    if iwin then
+        vim.api.nvim_set_current_win(iwin)
+        if rest == "" then
+            vim.api.nvim_win_set_cursor(iwin, { 1, #lines[1] })
+            vim.cmd.startinsert({ bang = true })
+        else
+            -- On the first character after `/name `; insert goes before it.
+            vim.api.nvim_win_set_cursor(iwin, { 1, #name + 2 })
+            vim.cmd.startinsert()
+        end
+    end
+    require("conduit.commands").update_hint(self.input)
 end
 
 ---Append text to the input buffer (e.g. a code selection as context).

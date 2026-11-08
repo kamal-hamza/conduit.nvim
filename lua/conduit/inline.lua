@@ -241,7 +241,8 @@ end
 ---Send `text` (with mention blocks resolved from `request`) as a turn.
 ---@param text string Full prompt text
 ---@param request string What the user typed, for mentions and history
-function Job:_send(text, request)
+---@param extra? table[] Content blocks to send after the mentions
+function Job:_send(text, request, extra)
     self.busy = true
     self.text = ""
     self.shown = 0
@@ -249,6 +250,7 @@ function Job:_send(text, request)
     table.insert(self.history, { role = "user", text = request })
     local blocks = require("conduit.mentions").blocks(request, self.agent, { buf = self.buf })
     blocks[1] = { type = "text", text = text }
+    vim.list_extend(blocks, extra or {})
     self.agent:prompt(assert(self.session_id), blocks, function(err, result)
         if not err and result and result.stopReason == "cancelled" then
             self.cancelled = true
@@ -361,7 +363,14 @@ function Job:follow_up(question)
         return send(question)
     end
     vim.api.nvim_set_current_win(answer.win)
-    require("conduit.ui.prompt").open({ title = "Follow up", agent = self.agent.name, on_submit = send })
+    require("conduit.ui.prompt").open({
+        title = "Follow up",
+        agent = self.agent.name,
+        commands = function()
+            return self.session_id and self.agent:get_commands(self.session_id) or {}
+        end,
+        on_submit = send,
+    })
 end
 
 ---Move the conversation into the chat window, keeping the session.
@@ -428,15 +437,31 @@ function M.run(opts)
     self:_status("starting…")
 
     local path = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":~:.")
-    local prompt = PROMPTS[self.mode]
-        .. CONTEXT:format(
-            opts.instruction,
-            line1,
-            line2,
-            path ~= "" and path or "[No Name]",
-            vim.bo[buf].filetype,
-            table.concat(lines, "\n")
-        )
+    path = path ~= "" and path or "[No Name]"
+    local ft = vim.bo[buf].filetype
+    local code = table.concat(lines, "\n")
+    local prompt, extra
+    if require("conduit.commands").parse(opts.instruction) then
+        -- An agent command only runs when the prompt starts with it, so send it
+        -- unwrapped with the selection attached, and show the result as an answer.
+        self.mode = "ask"
+        prompt = opts.instruction
+        extra = {
+            {
+                type = "text",
+                text = ("<context name=%q>\nLines %d-%d of `%s`:\n````%s\n%s\n````\n</context>"):format(
+                    "selection",
+                    line1,
+                    line2,
+                    path,
+                    ft,
+                    code
+                ),
+            },
+        }
+    else
+        prompt = PROMPTS[self.mode] .. CONTEXT:format(opts.instruction, line1, line2, path, ft, code)
+    end
 
     local function fail(err)
         self.busy = true
@@ -456,7 +481,7 @@ function M.run(opts)
                 return fail(serr)
             end
             self:_status("thinking…")
-            self:_send(prompt, opts.instruction)
+            self:_send(prompt, opts.instruction, extra)
         end, config.options.inline.options)
     end)
     return self

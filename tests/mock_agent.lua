@@ -4,7 +4,9 @@
 -- permission, then upper-case the file. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
 -- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
--- names the session with a `session_info_update`. Anything else is echoed back.
+-- names the session with a `session_info_update`. `/review <args>` runs the
+-- review command (see COMMANDS, advertised after every session/new, load,
+-- resume and fork). Anything else is echoed back.
 --
 -- Pass `--legacy` to advertise `modes`/`models` instead of `configOptions`.
 --
@@ -128,6 +130,30 @@ end
 
 local handlers = {}
 
+-- Slash commands, advertised just after a session is created or restored
+-- (like real agents, which send them once the response is out).
+local COMMANDS = {
+    { name = "review", description = "Review the current changes", input = { hint = "optional focus" } },
+    { name = "compact", description = "Summarize the conversation to save context" },
+}
+
+---Run after the current response is sent.
+---@type fun()[]
+local after = {}
+
+---@param sid string
+local function advertise(sid)
+    table.insert(after, function()
+        send({
+            method = "session/update",
+            params = {
+                sessionId = sid,
+                update = { sessionUpdate = "available_commands_update", availableCommands = COMMANDS },
+            },
+        })
+    end)
+end
+
 handlers.initialize = function()
     local session_caps = vim.empty_dict()
     for _, cap in ipairs({ "list", "resume", "close", "delete", "fork", "title" }) do
@@ -170,6 +196,7 @@ handlers["session/new"] = function(params)
     sessions = sessions + 1
     local sid = sessions == 1 and "mock-session" or ("mock-session-" .. sessions)
     store[sid] = { cwd = params.cwd, updated_at = now(), history = {} }
+    advertise(sid)
     if legacy then
         return {
             sessionId = sid,
@@ -243,6 +270,7 @@ handlers["session/load"] = function(params)
         send({ method = "session/update", params = { sessionId = params.sessionId, update = u } })
     end
     s.closed = nil
+    advertise(params.sessionId)
     return { configOptions = config_options() }
 end
 
@@ -254,6 +282,7 @@ handlers["session/resume"] = function(params)
     -- Sessions from an earlier process aren't in the store; resume them empty.
     store[params.sessionId] = store[params.sessionId] or { cwd = params.cwd, updated_at = now(), history = {} }
     store[params.sessionId].closed = nil
+    advertise(params.sessionId)
     return { configOptions = config_options() }
 end
 
@@ -292,6 +321,7 @@ handlers["session/fork"] = function(params)
     forks = forks + 1
     local sid = "fork-" .. forks
     store[sid] = { cwd = params.cwd, updated_at = now(), history = vim.deepcopy(s.history) }
+    advertise(sid)
     return { sessionId = sid, configOptions = config_options() }
 end
 
@@ -341,6 +371,17 @@ handlers["session/prompt"] = function(params)
         end
         update(sid, { sessionUpdate = "session_info_update", title = title })
         say(sid, "renamed")
+        return { stopReason = "end_turn" }
+    end
+    local review = text:match("^/review%s*(.*)$")
+    if review then
+        local context = 0
+        for i = 2, #params.prompt do
+            if params.prompt[i].type == "text" then
+                context = context + 1
+            end
+        end
+        say(sid, ("ran review: %s (%d context)"):format(review, context))
         return { stopReason = "end_turn" }
     end
     if text:match("^follow:") then
@@ -398,6 +439,11 @@ for line in io.lines() do
             send({ id = msg.id, error = err })
         else
             send({ id = msg.id, result = result == nil and vim.empty_dict() or result })
+        end
+        local queued = after
+        after = {}
+        for _, fn in ipairs(queued) do
+            fn()
         end
     elseif msg.id ~= nil and msg.method then
         send({ id = msg.id, error = { code = -32601, message = "Method not found" } })

@@ -190,6 +190,45 @@ function M.cancel()
     end
 end
 
+---Pick one of the agent's slash commands (`/review`, `/compact`, ...) and start
+---the current chat's prompt with it, ready for arguments. With `name`, skip the picker.
+---@param name? string Command name, with or without the leading `/`
+function M.commands(name)
+    local chat = threads.current or M.new()
+    if not chat then
+        return
+    end
+    if name then
+        return chat:insert_command((name:gsub("^/", "")))
+    end
+    chat:ensure_session(function(err)
+        if err then
+            return vim.notify("[conduit] " .. err, vim.log.levels.ERROR)
+        end
+        local list = chat.agent:get_commands(chat.session_id)
+        if #list == 0 then
+            return vim.notify(("[conduit] %s has no commands"):format(chat.agent.name), vim.log.levels.INFO)
+        end
+        local commands = require("conduit.commands")
+        vim.ui.select(list, {
+            prompt = "Command",
+            format_item = function(cmd)
+                local hint = commands.hint(cmd)
+                local desc = type(cmd.description) == "string" and cmd.description or ""
+                return ("/%s%s%s"):format(
+                    cmd.name,
+                    hint and (" " .. hint) or "",
+                    desc ~= "" and (" — " .. desc) or ""
+                )
+            end,
+        }, function(cmd)
+            if cmd then
+                chat:insert_command(cmd.name)
+            end
+        end)
+    end)
+end
+
 ---Pick or set a session option on the current chat, e.g. `M.option("model", "opus")`.
 ---@param key? string Option id or category (`model`, `effort`, `mode`, ...)
 ---@param value? string
@@ -229,9 +268,15 @@ function M.inline(line1, line2, instruction, mode)
     end
     local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":t")
     local lines = line1 == line2 and tostring(line1) or ("%d-%d"):format(line1, line2)
+    local agent_name = config.options.inline.agent or config.options.default_agent
     require("conduit.ui.prompt").open({
         title = name ~= "" and ("%s:%s"):format(name, lines) or ("lines " .. lines),
-        agent = config.options.inline.agent or config.options.default_agent,
+        agent = agent_name,
+        commands = function()
+            -- No session yet: the agent's last known list, if it has run.
+            local agent = M.agents[agent_name]
+            return agent and agent:get_commands() or {}
+        end,
         mode = mode or "auto",
         anchor = { win = win, first = line1 - 1, last = line2 - 1 },
         on_submit = run,
