@@ -93,6 +93,9 @@ local subcommands = {
     edit = function(args, cmd)
         require("conduit").edit(cmd.line1, cmd.line2, table.concat(args, " "))
     end,
+    commands = function(args)
+        require("conduit").commands(args[1])
+    end,
     option = function(args)
         require("conduit").option(args[1], args[2])
     end,
@@ -196,6 +199,13 @@ end, {
             candidates = session_options(takes_value[words[2]])
         elseif #words == 3 and words[2] == "thread" then
             candidates = vim.deepcopy(thread_actions)
+        elseif #words == 3 and words[2] == "commands" then
+            local chat = package.loaded["conduit"] and require("conduit").current
+            candidates = chat
+                    and vim.tbl_map(function(cmd)
+                        return cmd.name
+                    end, chat.agent:get_commands(chat.session_id))
+                or {}
         elseif #words == 3 and words[2] == "resume" then
             candidates = session_ids()
         elseif #words >= 4 and words[2] == "thread" and words[3] == "goto" then

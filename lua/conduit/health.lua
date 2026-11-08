@@ -75,11 +75,28 @@ function M.check()
     if not any then
         vim.health.info("Start an agent to see which thread features it supports")
     end
+
     local threads = options.threads
     vim.health.info(
         threads.persist and ("Thread index: " .. require("conduit.history").path) or "Thread index disabled"
     )
     vim.health.info("Log file: " .. require("conduit.log").path)
+
+    vim.health.start("conduit.nvim: commands")
+    any = false
+    for name, agent in vim.spairs(agents) do
+        local list = agent.last_commands or {}
+        if #list > 0 then
+            any = true
+            local names = vim.tbl_map(function(cmd)
+                return "/" .. cmd.name
+            end, list)
+            vim.health.ok(("%s: %d commands: %s"):format(name, #list, table.concat(names, ", ")))
+        end
+    end
+    if not any then
+        vim.health.info("No agent has advertised slash commands yet (start a chat to see them)")
+    end
 end
 
 return M
