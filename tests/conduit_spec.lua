@@ -66,13 +66,62 @@ test("chat: tool calls, permissions and fs read/write", function()
     send(chat, "edit " .. path)
     vim.ui.select = orig_select
 
-    assert(prompt == "mock wants to Edit " .. path, tostring(prompt))
+    -- Kind and location come from the earlier tool call: the request only has the id.
+    local shown = vim.fn.fnamemodify(path, ":~:.")
+    assert(prompt == ("mock wants to Edit %s\nkind: edit\n  %s:1"):format(path, shown), tostring(prompt))
     local text = transcript(chat)
     assert(text:find("✓ Edit " .. path, 1, true), text)
     assert(text:find("- [x] Read file", 1, true), text)
     assert(not text:find("[~]", 1, true), "plan should be replaced in place:\n" .. text)
     assert(text:find("first line was: hello", 1, true), text)
     assert(vim.deep_equal(vim.fn.readfile(path), { "HELLO", "WORLD" }))
+end)
+
+test("permission: prompts show the kind, the full command and paths", function()
+    local orig_select = vim.ui.select
+    local prompts = {} ---@type string[]
+    vim.ui.select = function(items, opts, cb)
+        table.insert(prompts, opts.prompt)
+        cb(items[2])
+    end
+    local chat = assert(conduit.new())
+    send(chat, "run")
+    send(chat, "run-argv")
+    vim.ui.select = orig_select
+
+    local expected = table.concat({
+        "mock wants to echo one",
+        "kind: execute",
+        "  /tmp/conduit-run",
+        "$ echo one",
+        "  echo two",
+        "  echo three",
+    }, "\n")
+    assert(prompts[1] == expected, tostring(prompts[1]))
+    assert(prompts[2] == expected, "argv commands show the shell script:\n" .. tostring(prompts[2]))
+    assert(transcript(chat):find("chose reject", 1, true), transcript(chat))
+end)
+
+test("permission: describe handles each rawInput shape and fallbacks", function()
+    local describe = require("conduit.ui.permission").describe
+    local info = describe({ kind = "execute", rawInput = { command = { "git", "status", "--short" } } })
+    assert(info.title == "run a command", info.title)
+    assert(vim.deep_equal(info.command, { "git status --short" }), vim.inspect(info.command))
+    assert(vim.deep_equal(describe({ rawInput = { command = { "zsh", "-c", "a\nb\n" } } }).command, { "a", "b" }))
+
+    info = describe({ title = "  Read\nmore", kind = "read", rawInput = { file_path = "/x" } })
+    assert(info.title == "Read" and info.command == nil, vim.inspect(info))
+    info = describe({ rawInput = vim.NIL, title = vim.NIL })
+    assert(info.title == "run a tool" and info.kind == nil and #info.paths == 0, vim.inspect(info))
+
+    local cwd_file = vim.fn.getcwd() .. "/lua/conduit/init.lua"
+    info = describe({
+        locations = { { path = cwd_file, line = 3 }, { path = cwd_file, line = 3 }, { path = "/abs/x" } },
+        content = { { type = "diff", path = "/ignored" } },
+    })
+    assert(vim.deep_equal(info.paths, { "lua/conduit/init.lua:3", "/abs/x" }), vim.inspect(info.paths))
+    info = describe({ kind = "edit", content = { { type = "content" }, { type = "diff", path = "/d.lua" } } })
+    assert(info.title == "edit a file" and vim.deep_equal(info.paths, { "/d.lua" }), vim.inspect(info))
 end)
 
 test("fs: reads prefer unsaved buffer contents", function()
@@ -503,6 +552,25 @@ test("inline: auto mode answers questions in a float under the selection", funct
     assert(not job.answer:is_open())
     assert(#vim.api.nvim_buf_get_extmarks(buf, -1, 0, -1, {}) == 0, "marks should be cleared")
     assert(job.agent.sessions[job.session_id] == nil, "session should be released")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: permission prompts include what the agent wants to run", function()
+    inline_buf()
+    local orig_select = vim.ui.select
+    local prompt
+    vim.ui.select = function(items, opts, cb)
+        prompt = opts.prompt
+        cb(items[1])
+    end
+    local job = assert(conduit.inline(2, 3, "run it"))
+    wait_turn(job)
+    vim.ui.select = orig_select
+    assert(prompt, "no permission prompt")
+    assert(prompt:find("^mock wants to echo one\nkind: execute\n"), prompt)
+    assert(prompt:find("$ echo one\n  echo two\n  echo three", 1, true), prompt)
+    assert(job.tools.r1 and job.tools.r1.status == "completed", vim.inspect(job.tools))
+    job:close()
     vim.cmd("bwipeout!")
 end)
 

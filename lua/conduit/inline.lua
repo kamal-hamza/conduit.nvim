@@ -19,6 +19,7 @@ local ns = vim.api.nvim_create_namespace("conduit.inline")
 ---@field text string The current turn's reply
 ---@field shown integer How much of `text` the answer float already shows
 ---@field history { role: "user"|"agent", text: string }[]
+---@field tools table<string, table> Tool calls seen this session, by id (for permission prompts)
 ---@field answer? conduit.Answer
 ---@field busy boolean
 ---@field cancelled boolean
@@ -226,13 +227,19 @@ function Job:on_update(update)
     elseif kind == "agent_thought_chunk" then
         self:_status("thinking…")
     elseif kind == "tool_call" then
+        self.tools[update.toolCallId] = vim.deepcopy(update)
         self:_status(update.title or "running a tool…")
+    elseif kind == "tool_call_update" then
+        -- Remember what we learn about tool calls: permission requests may only carry the id.
+        local tool = self.tools[update.toolCallId] or {}
+        self.tools[update.toolCallId] = vim.tbl_extend("force", tool, update)
     end
 end
 
 function Job:request_permission(params, respond)
-    local title = (params.toolCall or {}).title or "run a tool"
-    require("conduit.ui.permission").ask(self.agent.name, title, params, respond)
+    local permission = require("conduit.ui.permission")
+    local call = params.toolCall or {}
+    permission.ask(self.agent.name, permission.merge(self.tools[call.toolCallId], call), params, respond)
 end
 
 function Job:on_agent_exit(code)
@@ -413,6 +420,7 @@ function M.run(opts)
         text = "",
         shown = 0,
         history = {},
+        tools = {},
         busy = false,
         cancelled = false,
         writes = vim.b[buf].conduit_writes or 0,
