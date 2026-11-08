@@ -187,10 +187,12 @@ The chat is a markdown transcript with a prompt buffer below it.
   g<Tab>    (both)            The thread used before this one
   q         (both)            Close the chat window
 
-Tool permission requests are shown with |vim.ui.select()|. The buffers use the
-`conduit` and `conduit_input` filetypes with treesitter markdown highlighting,
-so markdown linters and LSPs don't attach to them. The prompt's winbar shows
-the agent, its state and the current model, effort and mode.
+Tool permission requests are shown with |vim.ui.select()|. The prompt shows
+the tool's kind (`edit`, `execute`, ...), the paths it touches and, for
+commands, every line of the command. The buffers use the `conduit` and
+`conduit_input` filetypes with treesitter markdown highlighting, so markdown
+linters and LSPs don't attach to them. The prompt's winbar shows the agent, its
+state and the current model, effort and mode.
 
                                                          *conduit-tool-calls*
 Each tool call shows its status and title, then the files it touched, the diff

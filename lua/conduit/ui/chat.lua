@@ -667,6 +667,7 @@ function Chat:on_update(update)
 end
 
 function Chat:request_permission(params, respond)
+    local permission = require("conduit.ui.permission")
     local call = params.toolCall or {}
     -- `toolCall` is a ToolCallUpdate; it can carry the proposed diff, so draw it
     -- before asking.
@@ -674,14 +675,13 @@ function Chat:request_permission(params, respond)
     if type(id) == "string" and (self.tools[id] or call.title) then
         self:on_update(vim.tbl_extend("force", call, { sessionUpdate = "tool_call_update" }))
     end
-    local known = self.tools[call.toolCallId] or {}
-    local title = call.title or known.title or "run a tool"
+    call = permission.merge(self.tools[call.toolCallId], call)
     self.waiting = true
     require("conduit.threads").changed(self)
     if not self:_visible() then
-        self:_alert("needs permission to " .. title)
+        self:_alert("needs permission to " .. permission.describe(call).title)
     end
-    require("conduit.ui.permission").ask(self.agent.name, title, params, function(err, result)
+    permission.ask(self.agent.name, call, params, function(err, result)
         self.waiting = false
         require("conduit.threads").changed(self)
         respond(err, result)

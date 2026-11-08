@@ -182,7 +182,9 @@ In the prompt buffer, `<CR>` (normal mode) or `<C-s>` (insert mode) sends the
 prompt and `<C-c>` cancels the turn. In both chat buffers, `go` picks a session
 option and `q` closes the chat. The chat's winbar shows the thread bar (see
 below), and the prompt's winbar shows the agent, its state and the current
-model, effort and mode. Permission requests open in `vim.ui.select`.
+model, effort and mode. Permission requests open in `vim.ui.select`, showing
+the tool's kind (`edit`, `execute`, ...), the paths it touches and the full
+command, every line of it.
 
 ### Tool calls
 
