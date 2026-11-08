@@ -113,6 +113,14 @@ function M.check()
     )
     vim.health.info("Log file: " .. require("conduit.log").path)
 
+    vim.health.start("conduit.nvim: terminals")
+    local tcfg = require("conduit.config").options.terminal
+    if tcfg.enabled then
+        vim.health.ok(("Agents can run commands (output limit %d bytes)"):format(tcfg.output_limit))
+    else
+        vim.health.info("Terminals are off (`terminal.enabled`); agents run commands themselves")
+    end
+
     vim.health.start("conduit.nvim: commands")
     any = false
     for name, agent in vim.spairs(agents) do

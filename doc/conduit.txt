@@ -54,6 +54,7 @@ See https://agentclientprotocol.com for the protocol.
       output_lines = 8,
       hide_output = { read = true, search = true, fetch = true },
     },
+    terminal = { enabled = true, output_limit = 1048576 },
     log_level = vim.log.levels.WARN,
   })
 <
@@ -207,6 +208,23 @@ an edit, the proposed diff is drawn before the prompt opens. In the transcript:
 
 Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
 bundle; |:checkhealth| conduit reports whether it's installed.
+
+                                                          *conduit-terminals*
+Agents can ask Neovim to run commands for them (ACP terminals). Each command
+runs as a process in the session's directory with the environment the agent
+asks for; the agent gets its combined stdout and stderr (at most
+`terminal.output_limit` bytes, oldest dropped first), and its exit code or
+signal. Commands are killed when the agent releases them, when their thread
+closes, when the agent exits, and when Neovim quits. A command sent as a whole
+shell line with no arguments runs through `sh -c`.
+
+A tool call that runs a command shows the last `tools.output_lines` lines of
+output, updated live, followed by the exit code or signal if it failed. <CR>
+expands it to the whole output. Agents that run commands themselves (Claude
+Code, Codex) report output the same way, through tool call `_meta`.
+
+`terminal.enabled = false` stops offering terminals to agents. Output from
+agents that run commands themselves is still shown.
 
                                                             *conduit-threads*
 Each chat is a thread: one ACP session with its own transcript. Starting a new

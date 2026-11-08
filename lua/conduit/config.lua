@@ -16,6 +16,10 @@ local M = {}
 ---@field hide_inline boolean Leave inline requests' sessions out of thread lists
 ---@field notify boolean Notify when a thread you're not looking at finishes or needs permission
 
+---@class conduit.TerminalConfig
+---@field enabled boolean Offer to run the agent's commands (ACP `terminal` capability)
+---@field output_limit integer Most bytes of output kept per command
+
 ---@class conduit.UiConfig
 ---@field width number
 ---@field input_height integer
@@ -39,6 +43,7 @@ local M = {}
 ---@field mentions { completion: "auto"|"blink"|"native" }
 ---@field threads conduit.ThreadsConfig
 ---@field tools conduit.ToolsConfig
+---@field terminal conduit.TerminalConfig
 ---@field log_level integer
 M.defaults = {
     default_agent = "claude",
@@ -105,6 +110,14 @@ M.defaults = {
         output_lines = 8,
         -- Kinds whose output (often a whole file) stays hidden until expanded.
         hide_output = { read = true, search = true, fetch = true },
+    },
+    terminal = {
+        -- Let agents run commands through Neovim (ACP terminals). Agents that run
+        -- commands themselves (Claude, Codex) still show their output in the chat.
+        enabled = true,
+        -- Most bytes of output kept per command; the oldest output is dropped first.
+        -- Agents can ask for less.
+        output_limit = 1024 * 1024,
     },
     log_level = vim.log.levels.WARN,
 }

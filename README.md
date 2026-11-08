@@ -10,8 +10,8 @@ into a chat buffer. It reads and writes files **through your buffers**, so it
 sees unsaved changes and its edits land in buffers you can undo.
 
 > Status: early. The core protocol (initialize, auth, sessions, prompts,
-> streaming updates, permissions, `fs/*`, session config options) works, along
-> with inline edits and answers. Terminals and session loading aren't implemented yet.
+> streaming updates, permissions, `fs/*`, terminals, session config options,
+> threads) works, along with inline edits and answers.
 
 ## Requirements
 
@@ -84,6 +84,10 @@ require("conduit").setup({
     diff_lines = 20,     -- diff lines previewed under a tool call, before <CR> expands it
     output_lines = 8,    -- output lines previewed under a tool call
     hide_output = { read = true, search = true, fetch = true }, -- kinds whose output starts hidden
+  },
+  terminal = {
+    enabled = true,          -- let agents run commands through Neovim (ACP terminals)
+    output_limit = 1048576,  -- most bytes of output kept per command (oldest dropped first)
   },
   log_level = vim.log.levels.WARN,
 })
@@ -203,6 +207,22 @@ drawn before the prompt opens. In the transcript:
 
 Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
 bundle (`:TSInstall diff`); `:checkhealth conduit` reports whether it's there.
+
+### Terminals
+
+Agents can ask Neovim to run commands for them (ACP terminals). conduit runs
+each one as a process in the session's directory with the environment the agent
+asks for, and sends back its combined stdout and stderr, how much was dropped,
+and how it exited. Commands are killed when the agent releases them, when their
+thread closes, when the agent exits, and when Neovim quits. A command that
+arrives as a whole shell line with no arguments runs through `sh -c`.
+
+A tool call that runs a command shows the last `tools.output_lines` lines of
+its output, updated live, then the exit code or signal if it failed. `<CR>`
+expands it to the whole output. Agents that run commands themselves, such as
+Claude Code and Codex, report their output the same way. Set
+`terminal.enabled = false` to stop offering terminals to agents; output from
+agents that run commands themselves is still shown.
 
 ### Threads
 
