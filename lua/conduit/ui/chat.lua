@@ -61,6 +61,13 @@ local function content_text(content, link_resources)
             return ("\n[%s](%s)"):format(uri:match("[^/]+/?$") or uri, uri)
         end
         return content.resource.text or ("<%s>"):format(uri)
+    elseif content.type == "image" then
+        local uri = content.uri
+        local text = "[image]"
+        if type(uri) == "string" and uri ~= "" then
+            text = ("[image: %s](%s)"):format(uri:match("[^/]+$") or uri, uri)
+        end
+        return link_resources and "\n" .. text or text
     end
     return ("<%s>"):format(content.type or "unknown")
 end

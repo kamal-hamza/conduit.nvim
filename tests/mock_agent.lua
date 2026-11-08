@@ -13,12 +13,16 @@
 -- replay it. `--seed` starts with past sessions (see `seed()`); session/list
 -- pages two at a time.
 --
+-- Images: `promptCapabilities.image` is advertised unless `--no-image` is
+-- passed. Image blocks are echoed back as `image <name> <mimeType> <bytes>`.
+--
 -- MCP: `--mcp=http,sse` advertises those transports. Every session method echoes
 -- the `mcpServers` it received in `_meta.mcpServers`.
 io.stdout:setvbuf("no")
 
 local argv = _G.arg or {}
 local legacy = vim.tbl_contains(argv, "--legacy")
+local images = not vim.tbl_contains(argv, "--no-image")
 local caps = {}
 local mcp_caps = vim.empty_dict()
 for _, a in ipairs(argv) do
@@ -119,7 +123,14 @@ local function seed()
         cwd = cwd,
         title = "Older work",
         updated_at = "2026-01-02T10:00:00Z",
-        history = { text_chunk("user_message_chunk", "u1", "older question") },
+        history = {
+            text_chunk("user_message_chunk", "u1", "older question"),
+            {
+                sessionUpdate = "user_message_chunk",
+                messageId = "u1",
+                content = { type = "image", mimeType = "image/png", data = "", uri = "file:///tmp/shot.png" },
+            },
+        },
     }
     store["past-3"] = { cwd = cwd, updated_at = "2026-01-01T10:00:00Z", history = {} }
     store["elsewhere"] = {
@@ -147,7 +158,7 @@ handlers.initialize = function()
         agentCapabilities = {
             loadSession = caps.load == true,
             sessionCapabilities = session_caps,
-            promptCapabilities = { embeddedContext = true },
+            promptCapabilities = { embeddedContext = true, image = images },
             mcpCapabilities = mcp_caps,
         },
         authMethods = {},
@@ -363,7 +374,12 @@ handlers["session/prompt"] = function(params)
         for i = 2, #params.prompt do
             local b = params.prompt[i]
             local uri = b.uri or b.resource.uri
-            say(sid, ("\n%s %s %d"):format(b.type, uri:match("[^/]+/?$"), b.resource and #b.resource.text or 0))
+            local name = uri:match("[^/]+/?$")
+            if b.type == "image" then
+                say(sid, ("\nimage %s %s %d"):format(name, b.mimeType, #vim.base64.decode(b.data)))
+            else
+                say(sid, ("\n%s %s %d"):format(b.type, name, b.resource and #b.resource.text or 0))
+            end
         end
         return { stopReason = "end_turn" }
     end

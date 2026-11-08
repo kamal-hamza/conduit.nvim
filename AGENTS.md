@@ -94,7 +94,8 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   synchronously; `request()` blocks until the matching response arrives.
 - The mock takes flags: `--legacy` (modes/models instead of configOptions),
   `--threads=load,list,...` (session capabilities), `--seed` (past sessions
-  to list and load) and `--mcp=http,sse` (MCP transports). Session methods echo
+  to list and load), `--mcp=http,sse` (MCP transports) and `--no-image` (no
+  `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`). Session methods echo
   the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore

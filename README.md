@@ -264,6 +264,7 @@ mentions, your open buffers and the top-level directories.
 | --- | --- |
 | `@path/to/file.lua` | The file's contents (from its buffer if open, so unsaved changes are included) |
 | `@src/` | A listing of the directory, two levels deep |
+| `@shot.png` | The image itself, if the agent accepts images (PNG, JPEG, GIF, WebP) |
 | `@buffer` | The buffer you were last in |
 | `@selection` | Your last visual selection in that buffer |
 | `@diagnostics` | Errors, warnings and hints from all open buffers |
@@ -284,6 +285,13 @@ or `"native"`.
 
 If an agent doesn't accept embedded context, mentions are sent as links for it
 to read itself. Files over 256 KB and binary files are always sent as links.
+
+**Images:** screenshots, mockups and diagrams are sent as ACP `image` blocks
+when the agent advertises image support (`promptCapabilities.image`). Images
+are recognised by their contents (PNG, JPEG, GIF or WebP), not their
+extension. Images over 5 MB, or mentioned to an agent without image support,
+are sent as links with a warning. `:checkhealth conduit` shows which running
+agents accept images.
 
 ### Inline requests
 
@@ -352,7 +360,7 @@ lua/conduit/
 ├── fs.lua        -- fs/read_text_file, fs/write_text_file (buffer-aware)
 ├── options.lua   -- session options (configOptions + legacy modes/models)
 ├── inline.lua    -- in-place edits of a buffer range
-├── mentions.lua  -- @ mentions: items, ranking, special context, resource blocks
+├── mentions.lua  -- @ mentions: items, ranking, special context, resource and image blocks
 ├── blink.lua     -- blink.cmp source for @ mentions
 ├── ui/chat.lua   -- transcript + input buffers, session/update rendering
 ├── ui/prompt.lua  -- floating prompt for inline requests (modes, @ completion)

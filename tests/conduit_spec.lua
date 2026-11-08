@@ -231,6 +231,104 @@ test("mentions: embeds content when supported, links otherwise", function()
     assert(link.uri == vim.uri_from_fname(root .. "/a.lua"))
 end)
 
+-- A valid 1x1 PNG.
+local PNG = vim.base64.decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+---@param path string
+---@param bytes string
+local function write_bytes(path, bytes)
+    local f = assert(io.open(path, "wb"))
+    f:write(bytes)
+    f:close()
+end
+
+---Image fixtures: shot.png, photo.jpg (JPEG signature only) and fake.png (text).
+local function image_fixture()
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    write_bytes(root .. "/shot.png", PNG)
+    write_bytes(root .. "/photo.jpg", "\255\216\255\224\0\16JFIF\0rest")
+    vim.fn.writefile({ "not really a png" }, root .. "/fake.png")
+    return root
+end
+
+---Run `fn` with vim.notify captured; returns the messages.
+---@param fn fun()
+---@return string[]
+local function capture_notify(fn)
+    local orig, msgs = vim.notify, {}
+    vim.notify = function(msg)
+        table.insert(msgs, msg)
+    end
+    local ok, err = pcall(fn)
+    vim.notify = orig
+    assert(ok, err)
+    return msgs
+end
+
+local function prompt_caps(caps)
+    return { info = { agentCapabilities = { promptCapabilities = caps } } }
+end
+
+test("mentions: images become image blocks when the agent accepts them", function()
+    local root = image_fixture()
+    local mentions = require("conduit.mentions")
+    local blocks
+    local msgs = capture_notify(function()
+        -- No embeddedContext: images don't depend on it.
+        blocks = mentions.blocks("look @shot.png and @photo.jpg", prompt_caps({ image = true }), { root = root })
+    end)
+    assert(#msgs == 0, vim.inspect(msgs))
+    assert(#blocks == 3, vim.inspect(blocks))
+    local png = assert(blocks[2])
+    assert(png.type == "image" and png.mimeType == "image/png", vim.inspect(png))
+    assert(vim.base64.decode(png.data) == PNG)
+    assert(png.uri == vim.uri_from_fname(root .. "/shot.png"))
+    assert(blocks[3].type == "image" and blocks[3].mimeType == "image/jpeg", vim.inspect(blocks[3]))
+end)
+
+test("mentions: images are links with a warning when not accepted or too large", function()
+    local root = image_fixture()
+    local mentions = require("conduit.mentions")
+    local blocks
+    local msgs = capture_notify(function()
+        blocks = mentions.blocks("@shot.png", prompt_caps({ embeddedContext = true }), { root = root })
+    end)
+    local link = assert(blocks[2])
+    assert(link.type == "resource_link" and link.name == "shot.png" and link.mimeType == "image/png")
+    assert(#msgs == 1 and msgs[1]:find("doesn't accept images", 1, true), vim.inspect(msgs))
+
+    local max = mentions.max_image_bytes
+    mentions.max_image_bytes = 10
+    msgs = capture_notify(function()
+        blocks = mentions.blocks("@shot.png", prompt_caps({ image = true }), { root = root })
+    end)
+    mentions.max_image_bytes = max
+    assert(blocks[2].type == "resource_link", vim.inspect(blocks[2]))
+    assert(#msgs == 1 and msgs[1]:find("larger than", 1, true), vim.inspect(msgs))
+end)
+
+test("mentions: images are detected by content, not extension", function()
+    local root = image_fixture()
+    local mentions = require("conduit.mentions")
+    local blocks = mentions.blocks("@fake.png", prompt_caps({ image = true, embeddedContext = true }), { root = root })
+    local b = assert(blocks[2])
+    assert(b.type == "resource" and b.resource.text == "not really a png\n", vim.inspect(b))
+    assert(mentions.image_mime(root .. "/fake.png") == nil)
+end)
+
+test("mentions: completion marks image files", function()
+    local root = image_fixture()
+    local mentions = require("conduit.mentions")
+    mentions.reset()
+    local items = mentions.items("shot", root)
+    mentions.reset()
+    local item = assert(items[1])
+    assert(item.word == "shot.png" and item.detail == "image", vim.inspect(item))
+end)
+
 test("mentions: fuzzy candidates include files and directories", function()
     local root = fixture()
     local mentions = require("conduit.mentions")
@@ -1642,7 +1740,7 @@ test("threads: alternate, goto and resume", function()
         chat = conduit.current
         return chat and chat.session_id == "past-2" and not chat.busy
     end, "past-2 to load")
-    assert(transcript(chat):find("older question", 1, true))
+    assert(transcript(chat):find("older question\n[image: shot.png](file:///tmp/shot.png)", 1, true), transcript(chat))
     drop_agent("jumper")
 end)
 
@@ -1781,4 +1879,33 @@ test("threads: lifecycle events fire as User autocmds", function()
     assert(vim.deep_equal(events[#events - 1], { "ConduitThreadClosed", "New thread" }), vim.inspect(events))
     assert(vim.deep_equal(events[#events], { "ConduitThreadSwitched", "evented" }), vim.inspect(events))
     reset_threads()
+end)
+
+test("chat: @ mentioned images reach the agent as image blocks", function()
+    reset_threads()
+    local root = image_fixture()
+    local chat = assert(conduit.new())
+    send(chat, "what is in @" .. root .. "/shot.png")
+    local text = transcript(chat)
+    assert(text:find(("image shot.png image/png %d"):format(#PNG), 1, true), text)
+    reset_threads()
+end)
+
+test("chat: agents without image support get a link and a warning", function()
+    reset_threads()
+    local root = image_fixture()
+    thread_agent("blind", "--no-image")
+    local chat = assert(conduit.new("blind"))
+    local msgs = capture_notify(function()
+        send(chat, "what is in @" .. root .. "/shot.png")
+    end)
+    local text = transcript(chat)
+    assert(text:find("resource_link shot.png 0", 1, true), text)
+    assert(
+        vim.iter(msgs):any(function(m)
+            return m:find("doesn't accept images", 1, true) ~= nil
+        end),
+        vim.inspect(msgs)
+    )
+    drop_agent("blind")
 end)
