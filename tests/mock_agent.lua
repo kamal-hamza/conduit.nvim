@@ -1,7 +1,9 @@
 -- A minimal ACP agent used by the test suite. Run with `nvim -l tests/mock_agent.lua`.
 --
 -- Prompts of the form `edit <path>` read the file's first line, ask for
--- permission, then upper-case the file. Inline requests get the selection back
+-- permission (the request carries only the tool call id), then upper-case the
+-- file. `run` and `run-argv` (also as inline requests starting "run") ask
+-- permission for a multi-line command. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
 -- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
 -- names the session with a `session_info_update`. `/review <args>` runs the
@@ -347,6 +349,28 @@ handlers["session/set_title"] = function(params)
     return { title = s.title }
 end
 
+---`run`: a multi-line command whose permission request carries the details
+---itself (`run-argv` sends the command as a `bash -lc` argv). Replies with the
+---chosen option.
+---@param sid string
+---@param argv boolean
+local function run_command(sid, argv)
+    local script = "echo one\necho two\necho three"
+    local raw = { command = argv and { "/bin/bash", "-lc", script } or script }
+    update(sid, { sessionUpdate = "tool_call", toolCallId = "r1", title = "echo one\necho two", kind = "execute" })
+    local perm = request("session/request_permission", {
+        sessionId = sid,
+        toolCall = { toolCallId = "r1", rawInput = raw, locations = { { path = "/tmp/conduit-run" } } },
+        options = {
+            { optionId = "allow", name = "Allow", kind = "allow_once" },
+            { optionId = "reject", name = "Reject", kind = "reject_once" },
+        },
+    })
+    update(sid, { sessionUpdate = "tool_call_update", toolCallId = "r1", status = "completed" })
+    say(sid, "chose " .. tostring(perm.outcome.optionId or perm.outcome.outcome))
+    return { stopReason = "end_turn" }
+end
+
 handlers["session/prompt"] = function(params)
     local sid = params.sessionId
     local text = params.prompt[1].text
@@ -361,6 +385,9 @@ handlers["session/prompt"] = function(params)
 
     local code = text:match("````[^\n]*\n(.-)\n````")
     local inline_request = text:match("Request: (.-)\n\nLines")
+    if inline_request and inline_request:match("^run") then
+        return run_command(sid, false)
+    end
     if inline_request and code then
         if text:find("You are answering", 1, true) or inline_request:match("^explain") then
             say(sid, "This code **adds** things.\n\n```lua\n")
@@ -397,6 +424,10 @@ handlers["session/prompt"] = function(params)
         return { stopReason = "end_turn" }
     end
 
+    if text == "run" or text == "run-argv" then
+        return run_command(sid, text == "run-argv")
+    end
+
     local path = text:match("^edit (.+)$")
     if not path then
         say(sid, "Hello ")
@@ -414,6 +445,7 @@ handlers["session/prompt"] = function(params)
         entries = { { content = "Read file", status = "in_progress", priority = "high" } },
     })
     update(sid, { sessionUpdate = "tool_call", toolCallId = "t1", title = "Edit " .. path, kind = "edit" })
+    update(sid, { sessionUpdate = "tool_call_update", toolCallId = "t1", locations = { { path = path, line = 1 } } })
     local read = request("fs/read_text_file", { sessionId = sid, path = path, line = 1, limit = 1 })
     local perm = request("session/request_permission", {
         sessionId = sid,
