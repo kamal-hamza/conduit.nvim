@@ -70,7 +70,7 @@ local function win_row(win, row)
     if pos.row == 0 then
         return nil
     end
-    return pos.row - vim.fn.win_screenpos(win)[1] + 1
+    return math.floor(pos.row - vim.fn.win_screenpos(win)[1] + 1)
 end
 
 ---Where to open: under the range, else over it, else at the cursor. Opening

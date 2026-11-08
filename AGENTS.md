@@ -42,12 +42,14 @@ lua/conduit/
                         and agent→client requests (fs/*, request_permission)
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
+  mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks;
                         mentions.attach also wires up / commands
   commands.lua          / agent commands: per-buffer sources, items, input-hint ghost text
   blink.lua             blink.cmp source for @ mentions and / commands
   inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
-  threads.lua           Threads: live registry, switching, picker, past threads, close/delete/fork
+  threads.lua           Threads: live registry, switching (MRU, goto, resume), picker, search,
+                        thread bar, events, past threads, close/delete/fork
   history.lua           Local thread index (ids, titles, cwd, timestamps; never transcripts)
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
@@ -57,6 +59,7 @@ lua/conduit/
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
   ui/spinner.lua        Animated progress indicator (uv timer)
   ui/permission.lua     Permission requests via vim.ui.select
+  ui/picker.lua         Picker specs shown with snacks/telescope/fzf-lua/mini.pick or vim.ui.select
   ui/render.lua         markview.nvim integration
 tests/
   run.lua               Minimal test runner (test(), wait_for())
@@ -92,8 +95,9 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 - The mock runs under `nvim -l`, so it can use `vim.json`. It reads stdin
   synchronously; `request()` blocks until the matching response arrives.
 - The mock takes flags: `--legacy` (modes/models instead of configOptions),
-  `--threads=load,list,...` (session capabilities) and `--seed` (past sessions
-  to list and load). Thread tests register extra mock agents with these.
+  `--threads=load,list,...` (session capabilities), `--seed` (past sessions
+  to list and load) and `--mcp=http,sse` (MCP transports). Session methods echo
+  the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
   stubs such as `vim.ui.select`, and reset config you change.

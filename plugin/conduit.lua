@@ -34,6 +34,9 @@ local subcommands = {
     continue = function(args)
         require("conduit").continue_thread(args[1])
     end,
+    resume = function(args)
+        require("conduit").resume(args[1])
+    end,
     thread = function(args)
         local conduit = require("conduit")
         local action = table.remove(args, 1)
@@ -51,11 +54,22 @@ local subcommands = {
             rename = function()
                 conduit.thread_rename(#args > 0 and table.concat(args, " ") or nil)
             end,
+            alt = conduit.thread_alternate,
+            ["goto"] = function()
+                conduit.thread_goto(table.concat(args, " "))
+            end,
+            search = function()
+                local qf = args[1] == "--qf"
+                if qf then
+                    table.remove(args, 1)
+                end
+                conduit.thread_search(table.concat(args, " "), { qf = qf })
+            end,
         }
         local fn = actions[action or ""]
         if not fn then
             return vim.notify(
-                "[conduit] usage: :Conduit thread new|next|prev|close|delete|fork|rename [title]",
+                "[conduit] usage: :Conduit thread new|next|prev|alt|goto|search|close|delete|fork|rename",
                 vim.log.levels.ERROR
             )
         end
@@ -101,7 +115,45 @@ local subcommands = {
 
 local takes_agent = { open = true, new = true, threads = true, continue = true }
 local takes_value = { model = "model", effort = "effort", mode = "mode" }
-local thread_actions = { "new", "next", "prev", "close", "delete", "fork", "rename" }
+local thread_actions = { "new", "next", "prev", "alt", "goto", "search", "close", "delete", "fork", "rename" }
+
+---Thread numbers and titles, for `:Conduit thread goto`.
+---@return string[]
+local function thread_targets()
+    if not package.loaded["conduit.threads"] then
+        return {}
+    end
+    local out = {}
+    for i, chat in ipairs(require("conduit.threads").list) do
+        table.insert(out, tostring(i))
+        table.insert(out, chat:display_title())
+    end
+    return out
+end
+
+---Session ids of live and remembered threads, for `:Conduit resume`.
+---@return string[]
+local function session_ids()
+    local seen, out = {}, {}
+    local function add(id)
+        if id and not seen[id] then
+            seen[id] = true
+            table.insert(out, id)
+        end
+    end
+    if package.loaded["conduit.threads"] then
+        for _, chat in ipairs(require("conduit.threads").list) do
+            add(chat.session_id or chat.resume_id)
+        end
+    end
+    local history = require("conduit.history")
+    for name in pairs(require("conduit.config").options.agents) do
+        for _, info in ipairs(history.list(name)) do
+            add(info.session_id)
+        end
+    end
+    return out
+end
 
 ---Option ids, or values of option `key`, from the current chat's session.
 ---@param key? string
@@ -154,6 +206,19 @@ end, {
                         return cmd.name
                     end, chat.agent:get_commands(chat.session_id))
                 or {}
+        elseif #words == 3 and words[2] == "resume" then
+            candidates = session_ids()
+        elseif #words >= 4 and words[2] == "thread" and words[3] == "goto" then
+            -- Titles can contain spaces: match against everything typed after "goto".
+            local typed = line:match("thread%s+goto%s+(.*)$") or ""
+            local prefix = typed:sub(1, #typed - #words[#words])
+            local out = {}
+            for _, target in ipairs(thread_targets()) do
+                if vim.startswith(target:lower(), typed:lower()) then
+                    table.insert(out, target:sub(#prefix + 1))
+                end
+            end
+            return out
         elseif #words == 3 and words[2] == "option" then
             candidates = session_options()
         elseif #words == 4 and words[2] == "option" then

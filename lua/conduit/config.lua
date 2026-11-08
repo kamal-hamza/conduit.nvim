@@ -6,25 +6,31 @@ local M = {}
 ---@field env? table<string, string> Extra environment variables
 ---@field options? table<string, string> Session options applied to every new session, keyed by
 ---option id or category, e.g. `{ model = "opus", effort = "high", mode = "acceptEdits" }`
+---@field mcp_servers? conduit.McpServers MCP servers for this agent, replacing global ones of the
+---same name; `false` leaves a global server out
 
 ---@class conduit.ThreadsConfig
 ---@field scope "cwd"|"all" Which past threads to list: this directory's, or all of them
 ---@field persist boolean Keep a local index of threads (ids and titles, not transcripts)
 ---@field max_listed integer Most past threads to fetch from the agent
 ---@field hide_inline boolean Leave inline requests' sessions out of thread lists
+---@field notify boolean Notify when a thread you're not looking at finishes or needs permission
 
 ---@class conduit.UiConfig
 ---@field width number
 ---@field input_height integer
 ---@field icons boolean
 ---@field spinner string[]
+---@field picker "auto"|"snacks"|"telescope"|"fzf_lua"|"mini_pick"|"select"|conduit.PickerProvider
+---@field thread_bar boolean
 ---@field inline { width: { min: integer, max: integer } }
 
 ---@class conduit.Config
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
 ---@field ui conduit.UiConfig
----@field inline { agent?: string, options: table<string, string> }
+---@field inline { agent?: string, options: table<string, string>, mcp_servers: boolean }
+---@field mcp_servers conduit.McpServers
 ---@field mentions { completion: "auto"|"blink"|"native" }
 ---@field threads conduit.ThreadsConfig
 ---@field log_level integer
@@ -43,6 +49,13 @@ M.defaults = {
         icons = false,
         -- Progress animation frames; a single frame disables the animation.
         spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+        -- Picker for threads and search: "auto" uses snacks.nvim, telescope.nvim, fzf-lua
+        -- or mini.pick when loaded (in that order), else vim.ui.select. Or name one, or
+        -- pass a function that takes a conduit.PickerSpec.
+        picker = "auto",
+        -- Show threads as tabs in the chat's winbar; state and options move to the
+        -- prompt's winbar.
+        thread_bar = true,
         inline = {
             -- Width of the inline prompt and answer floats, in columns.
             width = { min = 40, max = 84 },
@@ -53,7 +66,15 @@ M.defaults = {
         agent = nil,
         -- Session options for inline edits, layered over the agent's `options`.
         options = {},
+        -- Give inline sessions the MCP servers too. Each inline request opens a new
+        -- session, so the agent would start every server per request.
+        mcp_servers = false,
     },
+    -- MCP servers handed to the agent for every session, keyed by name, e.g.
+    -- `github = { command = "github-mcp", env = { TOKEN = function() return os.getenv("GH") end } }`
+    -- or `docs = { type = "http", url = "https://example.com/mcp", headers = {} }`.
+    -- conduit doesn't run them; the agent does.
+    mcp_servers = {},
     mentions = {
         -- `@` completion: "auto" uses blink.cmp when it's loaded, else the native popup.
         completion = "auto",
@@ -68,6 +89,8 @@ M.defaults = {
         max_listed = 200,
         -- Leave inline requests' sessions out of thread lists.
         hide_inline = true,
+        -- Notify when a thread you're not looking at finishes a turn or asks for permission.
+        notify = true,
     },
     log_level = vim.log.levels.WARN,
 }

@@ -473,7 +473,8 @@ function M.parse(text, root)
     for token in (" " .. text):gmatch("%s@(" .. PATH_CHARS .. "+)") do
         -- Allow trailing sentence punctuation: "look at @foo.lua."
         for _, name in ipairs({ token, (token:gsub("[%.,;:!?]+$", "")) }) do
-            if M.specials[name] then
+            local special = M.specials[name] ---@type conduit.Special?
+            if special then
                 if not seen[name] then
                     seen[name] = true
                     table.insert(out, { name = name, special = name })

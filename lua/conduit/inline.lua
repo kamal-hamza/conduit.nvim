@@ -105,7 +105,8 @@ function Job:_render_status()
         if not msg then
             return self.answer:footer(hl.keys(KEYS))
         end
-        local chunks = { ---@type conduit.Chunks
+        ---@type conduit.Chunks
+        local chunks = {
             { " " .. self.spinner:frame() .. " ", "ConduitSpinner" },
             { msg, "ConduitInlineStatus" },
         }
@@ -168,7 +169,8 @@ function Job:_open_answer()
         -- The buffer isn't visible any more; anchor to the current window.
         win, last = vim.api.nvim_get_current_win(), nil
     end
-    local request = (self.history[1].text:gsub("\n.*", ""))
+    local first = self.history[1]
+    local request = first and (first.text:gsub("\n.*", "")) or ""
     if vim.fn.strchars(request) > 50 then
         request = vim.fn.strcharpart(request, 0, 49) .. "…"
     end
@@ -482,7 +484,7 @@ function M.run(opts)
             end
             self:_status("thinking…")
             self:_send(prompt, opts.instruction, extra)
-        end, config.options.inline.options)
+        end, config.options.inline.options, { mcp = config.options.inline.mcp_servers })
     end)
     return self
 end

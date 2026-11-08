@@ -14,15 +14,22 @@
 -- session capabilities. Every session's history is recorded so session/load can
 -- replay it. `--seed` starts with past sessions (see `seed()`); session/list
 -- pages two at a time.
+--
+-- MCP: `--mcp=http,sse` advertises those transports. Every session method echoes
+-- the `mcpServers` it received in `_meta.mcpServers`.
 io.stdout:setvbuf("no")
 
 local argv = _G.arg or {}
 local legacy = vim.tbl_contains(argv, "--legacy")
 local caps = {}
+local mcp_caps = vim.empty_dict()
 for _, a in ipairs(argv) do
     local list = a:match("^%-%-threads=(.+)$")
     for cap in (list or ""):gmatch("[^,]+") do
         caps[cap] = true
+    end
+    for transport in (a:match("^%-%-mcp=(.+)$") or ""):gmatch("[^,]+") do
+        mcp_caps[transport] = true
     end
 end
 
@@ -167,6 +174,7 @@ handlers.initialize = function()
             loadSession = caps.load == true,
             sessionCapabilities = session_caps,
             promptCapabilities = { embeddedContext = true },
+            mcpCapabilities = mcp_caps,
         },
         authMethods = {},
     }
@@ -430,11 +438,21 @@ handlers["session/prompt"] = function(params)
     return { stopReason = "end_turn" }
 end
 
+local OPENS_SESSION = {
+    ["session/new"] = true,
+    ["session/load"] = true,
+    ["session/resume"] = true,
+    ["session/fork"] = true,
+}
+
 for line in io.lines() do
     local msg = vim.json.decode(line)
     local handler = msg.method and handlers[msg.method]
     if msg.id ~= nil and handler then
         local result, err = handler(msg.params or {})
+        if type(result) == "table" and OPENS_SESSION[msg.method] then
+            rawset(result, "_meta", { mcpServers = msg.params.mcpServers or vim.NIL })
+        end
         if err then
             send({ id = msg.id, error = err })
         else

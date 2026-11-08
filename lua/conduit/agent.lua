@@ -2,6 +2,7 @@
 --- Spec: https://agentclientprotocol.com
 local Rpc = require("conduit.rpc")
 local log = require("conduit.log")
+local mcp = require("conduit.mcp")
 local options = require("conduit.options")
 
 local PROTOCOL_VERSION = 1
@@ -217,9 +218,11 @@ end
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
 ---@param overrides? table<string, string>
-function Agent:new_session(cwd, handler, cb, overrides)
+---@param opts? { mcp?: boolean } `mcp = false` opens the session without MCP servers
+function Agent:new_session(cwd, handler, cb, overrides, opts)
     local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
-    self:_open_session("session/new", { cwd = cwd, mcpServers = {} }, handler, cb, defaults)
+    local servers = (opts and opts.mcp == false) and {} or mcp.servers(self)
+    self:_open_session("session/new", { cwd = cwd, mcpServers = servers }, handler, cb, defaults)
 end
 
 ---Load a past session (`loadSession`). The agent replays its history through
@@ -228,7 +231,7 @@ end
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
 function Agent:load_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
     self:_open_session("session/load", params, handler, cb)
 end
 
@@ -237,7 +240,7 @@ end
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
 function Agent:resume_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
     self:_open_session("session/resume", params, handler, cb)
 end
 
@@ -246,7 +249,7 @@ end
 ---@param handler conduit.SessionHandler Handler for the new session
 ---@param cb fun(err: string?, session_id: string?, result: table?)
 function Agent:fork_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = {} }
+    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
     self:_open_session("session/fork", params, handler, cb)
 end
 
@@ -490,7 +493,7 @@ function Agent:_on_notification(method, params)
                 mode.current = update.currentModeId
             end
         end
-        local session = self.sessions[sid]
+        local session = self.sessions[sid] ---@type conduit.SessionHandler?
         if session then
             session:on_update(params.update)
         end

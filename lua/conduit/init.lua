@@ -85,12 +85,24 @@ end
 
 ---Pick a thread: live ones, past ones (when the agent can load sessions), or a new one.
 ---@param name? string Agent whose past threads to list; defaults to the current thread's
-function M.threads(name)
+---@param opts? conduit.PickOpts
+function M.threads(name, opts)
     local agent = name and M.agent(name) or nil
     if name and not agent then
         return
     end
-    threads.pick(agent)
+    threads.pick(agent, opts)
+end
+
+---Reopen a thread by session id, or pick one of the agent's past threads.
+---@param id? string
+---@param name? string Agent; defaults to the current thread's, else the default agent
+function M.resume(id, name)
+    local agent = name and M.agent(name) or nil
+    if name and not agent then
+        return
+    end
+    threads.resume(id, agent)
 end
 
 ---Continue where you left off: the current or most recent thread with `name`
@@ -113,6 +125,33 @@ end
 ---@return conduit.Chat?
 function M.thread_prev()
     return threads.cycle(-1)
+end
+
+---Switch to the thread used before the current one.
+---@return conduit.Chat?
+function M.thread_alternate()
+    return threads.alternate()
+end
+
+---Go to a thread by number (as in the thread bar), session id or title.
+---@param target? string Opens the picker when omitted or ambiguous
+---@return conduit.Chat?
+function M.thread_goto(target)
+    return threads.jump(target)
+end
+
+---Search the transcripts of live threads for `pattern` (plain text, smartcase).
+---@param pattern? string Prompted for when omitted
+---@param opts? { qf?: boolean } Send matches to the quickfix list instead of the picker
+---@return conduit.SearchMatch[]?
+function M.thread_search(pattern, opts)
+    return threads.search(pattern, opts)
+end
+
+---Thread counts and the current thread, for statuslines.
+---@return conduit.Status
+function M.status()
+    return threads.status()
 end
 
 ---Close the current thread. It stays in the history (see `threads()`) when the
@@ -141,13 +180,7 @@ function M.thread_delete(opts)
     if opts and opts.force then
         return delete()
     end
-    vim.ui.select({ "Delete", "Cancel" }, {
-        prompt = ("Delete thread %q permanently?"):format(chat:display_title()),
-    }, function(choice)
-        if choice == "Delete" then
-            delete()
-        end
-    end)
+    threads.confirm_delete(chat:display_title(), delete)
 end
 
 ---Fork the current thread into a new one with the same context, if the agent supports it.

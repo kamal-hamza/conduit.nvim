@@ -58,6 +58,8 @@ require("conduit").setup({
     input_height = 6,
     icons = false,     -- Nerd Font glyphs in float titles
     spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }, -- one frame turns the animation off
+    picker = "auto",   -- "auto", "snacks", "telescope", "fzf_lua", "mini_pick", "select" or a function
+    thread_bar = true, -- threads as tabs in the chat winbar
     inline = {
       width = { min = 40, max = 84 }, -- inline prompt and answer float width
     },
@@ -65,7 +67,9 @@ require("conduit").setup({
   inline = {
     agent = nil,       -- agent for inline edits, defaults to default_agent
     options = {},      -- session options for inline edits, e.g. { model = "haiku", effort = "low" }
+    mcp_servers = false, -- give inline sessions the MCP servers too
   },
+  mcp_servers = {},    -- MCP servers handed to the agent, see below
   mentions = {
     completion = "auto", -- "auto" (blink.cmp if loaded), "blink" or "native"
   },
@@ -74,6 +78,7 @@ require("conduit").setup({
     persist = true,      -- remember thread ids and titles (not transcripts) on disk
     max_listed = 200,    -- most past threads to fetch from the agent
     hide_inline = true,  -- leave inline requests' sessions out of thread lists
+    notify = true,       -- notify when a thread you aren't looking at replies or needs permission
   },
   log_level = vim.log.levels.WARN,
 })
@@ -95,6 +100,48 @@ Keys are option ids or ACP categories (`model`, `mode`, `thought_level`), and
 `effort` is accepted as an alias for `thought_level`. The values depend on the
 agent; `:Conduit option` lists what yours offers.
 
+### MCP servers
+
+`mcp_servers` lists [MCP](https://modelcontextprotocol.io) servers that conduit
+passes to the agent when it opens a session (`mcpServers` in ACP). The agent
+starts them and can use their tools in that session. conduit never runs or talks
+to them itself.
+
+```lua
+require("conduit").setup({
+  mcp_servers = {
+    github = {
+      command = "github-mcp",  -- looked up in PATH and sent as an absolute path
+      args = {},
+      env = { GITHUB_TOKEN = function() return os.getenv("GH_TOKEN") end },
+    },
+    docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer ..." } },
+  },
+  agents = {
+    -- Per-agent servers replace global ones of the same name; false leaves one out.
+    gemini = { cmd = "gemini", args = { "--experimental-acp" }, mcp_servers = { docs = false } },
+  },
+})
+```
+
+- `type` is `"stdio"` (the default), `"http"` or `"sse"`. Stdio servers take
+  `command`, `args` and `env`. HTTP and SSE servers take `url` and `headers`.
+- Values in `env`, `headers` and `args` can be functions. They're called when
+  a session opens, so tokens don't have to live in your config.
+- `enabled = false` (or a function that returns false) turns a server off.
+- A list of servers with `name` fields works too.
+- Servers that can't be sent are skipped with a warning: the command isn't in
+  PATH, `url` is missing, or the agent doesn't support the transport. Agents
+  advertise HTTP and SSE support in `mcpCapabilities`; every agent supports stdio.
+- Inline requests open a new session each time, so they leave MCP servers out
+  unless you set `inline.mcp_servers = true`. An inline conversation moved into
+  the chat keeps its session, and with it no servers.
+- `:checkhealth conduit` shows what each agent would get.
+
+Claude Code already loads servers from its own config (`~/.claude.json`,
+`.mcp.json`). A server listed there and here starts twice, so use `mcp_servers`
+for servers you want with every agent.
+
 ## Usage
 
 | Command | Description |
@@ -104,7 +151,11 @@ agent; `:Conduit option` lists what yours offers.
 | `:Conduit new [agent]` | Start a new thread (fresh session); earlier threads stay alive |
 | `:Conduit threads [agent]` | Pick a live or past thread, or start a new one |
 | `:Conduit continue [agent]` | Go back to the latest thread, reopening a past one if none is live |
+| `:Conduit resume [session-id]` | Reopen a thread by session id, or pick one of the agent's past threads |
 | `:Conduit thread new\|next\|prev` | Start or cycle through threads |
+| `:Conduit thread alt` | Switch to the thread you used before this one |
+| `:Conduit thread goto {n\|title\|id}` | Go to a thread by its number in the thread bar, its title (or a unique part of it) or its session id |
+| `:Conduit thread search [--qf] [text]` | Search the transcripts of live threads; `--qf` sends matches to the quickfix list |
 | `:Conduit thread close` | Close the current thread (it stays in the history) |
 | `:Conduit thread delete` | Delete the current thread for good, after confirming |
 | `:Conduit thread fork` | Fork the current thread into a new one with the same context |
@@ -124,7 +175,8 @@ agent; `:Conduit option` lists what yours offers.
 
 In the prompt buffer, `<CR>` (normal mode) or `<C-s>` (insert mode) sends the
 prompt and `<C-c>` cancels the turn. In both chat buffers, `go` picks a session
-option and `q` closes the chat. The winbar shows the thread title, the current
+option and `q` closes the chat. The chat's winbar shows the thread bar (see
+below), and the prompt's winbar shows the agent, its state and the current
 model, effort and mode. Permission requests open in `vim.ui.select`.
 
 ### Threads
@@ -132,9 +184,18 @@ model, effort and mode. Permission requests open in `vim.ui.select`.
 Each chat is a thread: one ACP session with its own transcript. `:Conduit new`
 starts another thread without discarding the current one, and switching swaps
 the thread into the same chat windows. In the chat buffers, `gs` picks a thread,
-`]t` / `[t` cycle through them and `gn` starts a new one. Threads are titled by
-the agent (`session_info_update`), by you (`:Conduit thread rename`), or by your
-first prompt until then. Inline answers moved into the chat become threads too.
+`]t` / `[t` cycle through them, `g<Tab>` goes back to the previous one and `gn`
+starts a new one. Threads are titled by the agent (`session_info_update`), by
+you (`:Conduit thread rename`), or by your first prompt until then. Inline
+answers moved into the chat become threads too.
+
+The thread bar lists every live thread as a numbered tab (the numbers work with
+`:Conduit thread goto`) and marks the ones that are working (`◐`), waiting for a
+permission answer (`!`) or finished a turn you haven't seen yet (`●`). When the
+window is too narrow, titles shrink and `‹` / `›` mark tabs that don't fit. Set
+`ui.thread_bar = false` for a plain title instead. With `threads.notify` on,
+conduit also tells you when a thread you aren't looking at replies or asks for
+permission.
 
 What else you get depends on what the agent advertises, so it works with any ACP
 agent:
@@ -148,8 +209,37 @@ agent:
 | `sessionCapabilities.close` / `delete` | Closing frees the session; deleting removes it from the agent's history |
 | `sessionCapabilities.fork` / `title` | `:Conduit thread fork`; renames are stored by the agent |
 
-The picker lists live threads, then past threads for the current agent in this
-directory (`threads.scope`), then "New thread". If the agent process exits, the
+The picker lists live threads (most recently used first, the current one last),
+then past threads, then "New thread". Past threads come from the current agent
+and from any other agent that's already running, in this directory
+(`threads.scope`). It uses [snacks.nvim](https://github.com/folke/snacks.nvim),
+[telescope.nvim](https://github.com/nvim-telescope/telescope.nvim),
+[fzf-lua](https://github.com/ibhagwan/fzf-lua) or
+[mini.pick](https://github.com/echasnovski/mini.pick) when one is loaded
+(`ui.picker`), with a preview of each thread's transcript. Snacks, telescope and
+mini.pick open at once and add past threads as they arrive. In those pickers:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Open the thread |
+| `<C-d>` | Delete the thread (after confirming) |
+| `<C-r>` | Rename the thread (past threads are renamed locally) |
+| `<C-f>` | Fork the thread |
+| `<C-n>` | Start a new thread |
+| `<C-g>` | Switch between this directory's past threads and all of them |
+
+Without a picker plugin, `vim.ui.select` lists the same threads and opens the
+chosen one; the `:Conduit thread` commands cover the rest.
+
+`:Conduit thread search` looks through live transcripts only (past transcripts
+stay with the agent), matching case-insensitively unless the text has capitals.
+Statuslines can show `require("conduit").status()`, which returns the current
+thread and how many threads are live, busy, unread or waiting. conduit fires
+`User` autocmds as threads change: `ConduitThreadCreated`,
+`ConduitThreadSwitched`, `ConduitThreadUpdated` and `ConduitThreadClosed`, with
+`{ agent, session_id, title }` in `data`.
+
+If the agent process exits, the
 transcript stays and the next prompt restores the session (resume, else a silent
 reload, else a fresh session with a notice). `:checkhealth conduit` shows what
 each running agent supports. The local index lives at
