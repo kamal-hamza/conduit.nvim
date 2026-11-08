@@ -54,6 +54,7 @@ lua/conduit/
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
   ui/chat.lua           Chat transcript + prompt buffers, session/update rendering
+  ui/tool.lua           Tool call blocks: status line, locations, diff and output previews
   ui/prompt.lua         Floating prompt (modes, @ completion)
   ui/answer.lua         Floating answer window anchored to a buffer line
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
@@ -136,6 +137,13 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   sends `available_commands_update` a moment later), and the inline prompt
   opens before any session exists. Read commands lazily through the buffer's
   source function, and fall back to `agent.last_commands`.
+- **Tool call output is usually fenced already** (Claude sends ```` ```console ````).
+  Truncating it as-is can drop the closing fence and turn the rest of the
+  transcript into a code block, so `ui/tool.lua` strips a fence that wraps the
+  whole text and re-fences the cut body with a longer fence.
+- **Tool calls are blocks redrawn in place** (extmark + line count, like the
+  plan). The mark has left gravity so replacing the block keeps it on the
+  header line. `content` and `locations` in an update replace the old lists.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
   written with `nvim_buf_set_lines` must be split or trimmed first.
 

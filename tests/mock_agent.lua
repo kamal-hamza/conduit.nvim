@@ -1,9 +1,10 @@
 -- A minimal ACP agent used by the test suite. Run with `nvim -l tests/mock_agent.lua`.
 --
 -- Prompts of the form `edit <path>` read the file's first line, ask for
--- permission (the request carries only the tool call id), then upper-case the
--- file. `run` and `run-argv` (also as inline requests starting "run") ask
--- permission for a multi-line command. Inline requests get the selection back
+-- permission (the request carries the tool call id and the proposed diff), then
+-- upper-case the file. `run` and `run-argv` (also as inline requests starting
+-- "run") ask permission for a multi-line command. `run tools` sends tool calls
+-- with output, locations and diffs. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
 -- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
 -- names the session with a `session_info_update`. `/review <args>` runs the
@@ -117,7 +118,13 @@ local function seed()
             text_chunk("user_message_chunk", "u1", "hello past"),
             text_chunk("agent_message_chunk", "a1", "hi from the past"),
             { sessionUpdate = "tool_call", toolCallId = "old", title = "Read notes", status = "completed" },
-            { sessionUpdate = "tool_call", toolCallId = "sh", title = "Run make\nand make test", status = "failed" },
+            {
+                sessionUpdate = "tool_call",
+                toolCallId = "sh",
+                title = "Run make\nand make test",
+                status = "failed",
+                content = { { type = "content", content = { type = "text", text = "make: *** no rule" } } },
+            },
             text_chunk("user_message_chunk", "u2", "first part"),
             text_chunk("user_message_chunk", "u3", "second part"),
             text_chunk("agent_message_chunk", "a3", "both parts answered"),
@@ -430,6 +437,72 @@ handlers["session/prompt"] = function(params)
         say(sid, ("ran review: %s (%d context)"):format(review, context))
         return { stopReason = "end_turn" }
     end
+    if text == "run tools" then
+        local cwd = s and s.cwd or vim.fn.getcwd()
+        update(sid, {
+            sessionUpdate = "tool_call",
+            toolCallId = "run",
+            title = "Run make",
+            kind = "execute",
+            status = "in_progress",
+        })
+        local out = {}
+        for i = 1, 20 do
+            out[i] = "out " .. i
+        end
+        -- Already fenced, with a nested fence inside, the way agents send output.
+        out[2] = "````md"
+        out[3] = "```"
+        update(sid, {
+            sessionUpdate = "tool_call_update",
+            toolCallId = "run",
+            status = "completed",
+            content = {
+                {
+                    type = "content",
+                    content = { type = "text", text = "`````console\n" .. table.concat(out, "\n") .. "\n`````" },
+                },
+            },
+        })
+        update(sid, {
+            sessionUpdate = "tool_call",
+            toolCallId = "read",
+            title = "Read notes.md",
+            kind = "read",
+            status = "completed",
+            locations = { { path = cwd .. "/notes.md", line = 3 } },
+            content = { { type = "content", content = { type = "text", text = "secret body\nline two" } } },
+        })
+        update(sid, {
+            sessionUpdate = "tool_call",
+            toolCallId = "new",
+            title = "Write new.lua",
+            kind = "edit",
+            status = "completed",
+            content = { { type = "diff", path = cwd .. "/new.lua", newText = "print(1)\n" } },
+        })
+        local old, new = {}, {}
+        for i = 1, 30 do
+            old[i], new[i] = "a " .. i, "b " .. i
+        end
+        update(sid, {
+            sessionUpdate = "tool_call",
+            toolCallId = "big",
+            title = "Edit big.txt",
+            kind = "edit",
+            status = "completed",
+            content = {
+                {
+                    type = "diff",
+                    path = cwd .. "/big.txt",
+                    oldText = table.concat(old, "\n"),
+                    newText = table.concat(new, "\n"),
+                },
+            },
+        })
+        say(sid, "tools done")
+        return { stopReason = "end_turn" }
+    end
     if text:match("^follow:") then
         say(sid, "Follow-up answer to: " .. text)
         return { stopReason = "end_turn" }
@@ -463,9 +536,14 @@ handlers["session/prompt"] = function(params)
     update(sid, { sessionUpdate = "tool_call", toolCallId = "t1", title = "Edit " .. path, kind = "edit" })
     update(sid, { sessionUpdate = "tool_call_update", toolCallId = "t1", locations = { { path = path, line = 1 } } })
     local read = request("fs/read_text_file", { sessionId = sid, path = path, line = 1, limit = 1 })
+    local full = request("fs/read_text_file", { sessionId = sid, path = path })
+    -- The proposed edit travels with the permission request, as Claude's adapter does.
     local perm = request("session/request_permission", {
         sessionId = sid,
-        toolCall = { toolCallId = "t1" },
+        toolCall = {
+            toolCallId = "t1",
+            content = { { type = "diff", path = path, oldText = full.content, newText = full.content:upper() } },
+        },
         options = {
             { optionId = "allow", name = "Allow", kind = "allow_once" },
             { optionId = "reject", name = "Reject", kind = "reject_once" },
@@ -475,7 +553,6 @@ handlers["session/prompt"] = function(params)
         update(sid, { sessionUpdate = "tool_call_update", toolCallId = "t1", status = "failed" })
         return { stopReason = "end_turn" }
     end
-    local full = request("fs/read_text_file", { sessionId = sid, path = path })
     request("fs/write_text_file", { sessionId = sid, path = path, content = full.content:upper() })
     update(sid, { sessionUpdate = "tool_call_update", toolCallId = "t1", status = "completed" })
     update(sid, {

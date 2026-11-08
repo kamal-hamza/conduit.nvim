@@ -147,7 +147,8 @@ end
 ---@return table
 function M.merge(known, call)
     local merged = vim.tbl_extend("force", known or {}, call or {})
-    merged.mark = nil
+    -- Chat-only drawing state, not part of the tool call.
+    merged.block, merged.expanded = nil, nil
     return merged
 end
 

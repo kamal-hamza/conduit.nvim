@@ -57,24 +57,133 @@ test("chat: tool calls, permissions and fs read/write", function()
 
     local orig_select = vim.ui.select
     local prompt
+    local shown ---@type string?
+    local chat = assert(conduit.new())
     vim.ui.select = function(items, opts, cb)
-        prompt = opts.prompt
+        prompt, shown = opts.prompt, transcript(chat)
         cb(items[1])
     end
 
-    local chat = assert(conduit.new())
     send(chat, "edit " .. path)
     vim.ui.select = orig_select
 
-    -- Kind and location come from the earlier tool call: the request only has the id.
-    local shown = vim.fn.fnamemodify(path, ":~:.")
-    assert(prompt == ("mock wants to Edit %s\nkind: edit\n  %s:1"):format(path, shown), tostring(prompt))
+    -- Kind and location come from the earlier tool call: the request only adds the diff.
+    local rel = vim.fn.fnamemodify(path, ":~:.")
+    assert(prompt == ("mock wants to Edit %s\nkind: edit\n  %s:1"):format(path, rel), tostring(prompt))
+    -- The diff sent with the permission request is drawn before asking.
+    assert(shown and shown:find("○ Edit " .. path, 1, true), shown)
+    assert(shown:find("(+2 −2)\n```diff\n@@ -1,2 +1,2 @@\n-hello\n-world\n+HELLO\n+WORLD\n```", 1, true), shown)
     local text = transcript(chat)
-    assert(text:find("✓ Edit " .. path, 1, true), text)
+    -- The status-only update that completes the call keeps its diff.
+    assert(
+        text:find("✓ Edit " .. path .. "\n`" .. vim.fn.fnamemodify(path, ":~") .. "` (+2 −2)\n```diff", 1, true),
+        text
+    )
     assert(text:find("- [x] Read file", 1, true), text)
     assert(not text:find("[~]", 1, true), "plan should be replaced in place:\n" .. text)
     assert(text:find("first line was: hello", 1, true), text)
     assert(vim.deep_equal(vim.fn.readfile(path), { "HELLO", "WORLD" }))
+end)
+
+---Headings of a markdown text, as parsed by treesitter (so not ones inside code blocks).
+---@param text string
+---@return string[]
+local function headings(text)
+    local parser = vim.treesitter.get_string_parser(text, "markdown")
+    local root = assert(parser:parse())[1]:root()
+    local query = vim.treesitter.query.parse("markdown", "(atx_heading) @h")
+    local out = {}
+    for _, node in query:iter_captures(root, text) do
+        table.insert(out, (vim.treesitter.get_node_text(node, text):gsub("\n$", "")))
+    end
+    return out
+end
+
+---0-based row of the first transcript line starting with `prefix`.
+local function row_of(chat, prefix)
+    for i, line in ipairs(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)) do
+        if vim.startswith(line, prefix) then
+            return i - 1
+        end
+    end
+    error("no line starting with " .. prefix)
+end
+
+test("chat: tool calls show diffs, output and locations, and expand in place", function()
+    local chat = assert(conduit.new())
+    send(chat, "run tools")
+    local text = transcript(chat)
+
+    -- Output: the agent's own fence is replaced by one longer than anything inside,
+    -- and the preview is cut at `output_lines`.
+    assert(
+        text:find("✓ Run make\n`````console\nout 1\n````md\n```\nout 4\n", 1, true)
+            and text:find("out 8\n`````\n… 12 more lines (`<CR>` to expand)\n", 1, true),
+        text
+    )
+    assert(not text:find("out 9", 1, true), text)
+    -- Read output stays hidden; its location is listed relative to the cwd.
+    assert(text:find("✓ Read notes.md\n→ `notes.md:3`\n… 2 lines of output (`<CR>` to show)\n", 1, true), text)
+    assert(not text:find("secret body", 1, true), text)
+    -- New files and long diffs.
+    assert(text:find("`new.lua` (new file, +1)\n```diff\n@@ -0,0 +1 @@\n+print(1)\n```", 1, true), text)
+    assert(text:find("`big.txt` (+30 −30)\n```diff\n", 1, true), text)
+    assert(text:find("… 41 more diff lines (`<CR>` to expand)", 1, true), text)
+    -- Every fence is closed: the reply after the tools is still a heading.
+    local hs = headings(text)
+    assert(hs[#hs] == "## mock" and text:find("## mock\n\ntools done$"), vim.inspect(hs))
+
+    -- <CR> on any line of a block expands it, and again collapses it.
+    chat:open()
+    local twin = assert(chat:wins())
+    vim.api.nvim_set_current_win(twin)
+    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "→ `notes.md:3`") + 1, 0 })
+    vim.api.nvim_feedkeys(vim.keycode("<CR>"), "mx", false)
+    text = transcript(chat)
+    assert(text:find("→ `notes.md:3`\n```\nsecret body\nline two\n```\n", 1, true), text)
+    assert(chat:toggle_tool(row_of(chat, "✓ Run make")))
+    assert(transcript(chat):find("out 20\n`````\n\n✓ Read notes.md", 1, true), transcript(chat))
+    assert(chat:toggle_tool(row_of(chat, "✓ Read notes.md")))
+    assert(chat:toggle_tool(row_of(chat, "✓ Run make")))
+    assert(chat:toggle_tool(row_of(chat, "`big.txt`") + 3))
+    text = transcript(chat)
+    assert(not text:find("secret body", 1, true) and not text:find("out 9", 1, true), text)
+    assert(text:find("+b 30\n```\n\n## mock", 1, true), text)
+    assert(not chat:toggle_tool(row_of(chat, "tools done")), "not a tool call")
+
+    -- A copy (as in a fork) keeps the blocks expandable.
+    local copy = assert(conduit.new())
+    copy:copy_transcript(chat)
+    assert(copy:toggle_tool(row_of(copy, "✓ Read notes.md")))
+    assert(transcript(copy):find("secret body", 1, true) and not transcript(chat):find("secret body", 1, true))
+end)
+
+test("chat: gd shows a tool call's diff side by side, gf opens its file", function()
+    local chat = assert(conduit.new())
+    send(chat, "run tools")
+    chat:open()
+    local twin = assert(chat:wins())
+    vim.api.nvim_set_current_win(twin)
+    local tabs = #vim.api.nvim_list_tabpages()
+    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "`big.txt`") + 1, 0 })
+    vim.api.nvim_feedkeys("gd", "mx", false)
+    local wins = vim.api.nvim_tabpage_list_wins(0)
+    assert(#vim.api.nvim_list_tabpages() == tabs + 1 and #wins == 2, "diff tab")
+    local old = vim.api.nvim_win_get_buf(wins[1])
+    local new = vim.api.nvim_win_get_buf(wins[2])
+    assert(vim.wo[wins[1]].diff and vim.wo[wins[2]].diff)
+    assert(vim.api.nvim_buf_get_lines(old, 0, 1, false)[1] == "a 1")
+    assert(vim.api.nvim_buf_get_lines(new, 29, 30, false)[1] == "b 30")
+    assert(vim.wo[wins[2]].winbar == "after: big.txt", vim.wo[wins[2]].winbar)
+    vim.api.nvim_feedkeys("q", "mx", false)
+    assert(#vim.api.nvim_list_tabpages() == tabs and not vim.api.nvim_buf_is_valid(old))
+
+    vim.api.nvim_set_current_win(twin)
+    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "✓ Read notes.md") + 1, 0 })
+    vim.api.nvim_feedkeys("gf", "mx", false)
+    local win = vim.api.nvim_get_current_win()
+    assert(win ~= twin and vim.api.nvim_buf_get_name(0) == vim.fn.getcwd() .. "/notes.md", vim.api.nvim_buf_get_name(0))
+    vim.cmd("bwipeout!")
 end)
 
 test("permission: prompts show the kind, the full command and paths", function()
@@ -1018,7 +1127,7 @@ test("threads: past sessions are listed across pages and replayed when opened", 
     assert(assert(methods.last_params).cwd == vim.fn.getcwd())
     local text = transcript(chat)
     assert(text:find("## You\n\nhello past\n\n## past\n\nhi from the past", 1, true), text)
-    assert(text:find("✓ Read notes\n\n✗ Run make …", 1, true), text)
+    assert(text:find("✓ Read notes\n\n✗ Run make …\n```\nmake: *** no rule\n```", 1, true), text)
     assert(text:find("## You\n\nfirst part\n\n## You\n\nsecond part\n\n## past\n\nboth parts answered", 1, true), text)
     assert(chat.title == "Old work" and chat:display_title() == "Old work")
     assert(require("conduit.history").get("past", "past-1"), "recorded in the index")

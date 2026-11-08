@@ -49,6 +49,11 @@ See https://agentclientprotocol.com for the protocol.
       hide_inline = true,
       notify = true,
     },
+    tools = {
+      diff_lines = 20,
+      output_lines = 8,
+      hide_output = { read = true, search = true, fetch = true },
+    },
     log_level = vim.log.levels.WARN,
   })
 <
@@ -78,6 +83,10 @@ and titles (never transcripts); `max_listed` caps how many past threads are
 fetched; `hide_inline` leaves inline requests' sessions out of thread lists;
 `notify` tells you when a thread you aren't looking at finishes a turn or asks
 for permission.
+
+`tools` configures tool calls in the chat (|conduit-tool-calls|): `diff_lines`
+and `output_lines` cap the preview under each call, and `hide_output` lists
+tool kinds whose output stays hidden until the call is expanded.
 
                                                                 *conduit-mcp*
 `mcp_servers` lists MCP servers that conduit passes to the agent with every
@@ -184,6 +193,20 @@ commands, every line of the command. The buffers use the `conduit` and
 `conduit_input` filetypes with treesitter markdown highlighting, so markdown
 linters and LSPs don't attach to them. The prompt's winbar shows the agent, its
 state and the current model, effort and mode.
+
+                                                         *conduit-tool-calls*
+Each tool call shows its status and title, then the files it touched, the diff
+of any edit it made or proposes, and its output. Diffs and output are cut to
+`tools.diff_lines` and `tools.output_lines`; output from `read`, `search` and
+`fetch` calls stays hidden until expanded. When the agent asks permission for
+an edit, the proposed diff is drawn before the prompt opens. In the transcript:
+
+  <CR>      Expand or collapse the tool call under the cursor
+  gd        Open its diff side by side in a new tab (`q` closes it)
+  gf        Open the first file it touched, at the reported line
+
+Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
+bundle; |:checkhealth| conduit reports whether it's installed.
 
                                                             *conduit-threads*
 Each chat is a thread: one ACP session with its own transcript. Starting a new
