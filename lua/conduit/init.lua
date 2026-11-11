@@ -344,6 +344,53 @@ function M.adopt(agent, session_id, history)
     return chat
 end
 
+---List the agent's changes waiting for review in the quickfix list, or turn
+---review on or off (`action = "toggle"`, everywhere or for `source`).
+---@param action? "toggle"
+---@param source? "chat"|"inline"
+function M.review(action, source)
+    local review = require("conduit.review")
+    if action == "toggle" then
+        review.toggle(source)
+        return
+    end
+    local items = review.qflist()
+    if #items == 0 then
+        return vim.notify("[conduit] no agent changes to review", vim.log.levels.INFO)
+    end
+    vim.fn.setqflist({}, " ", { title = "conduit review", items = items })
+    vim.cmd("botright copen")
+end
+
+---@param action "accept"|"reject"
+---@param all? boolean
+local function review_files(action, all)
+    local review = require("conduit.review")
+    if all and action == "accept" then
+        return review.accept_all()
+    elseif all then
+        return review.reject_all()
+    end
+    local name = vim.api.nvim_buf_get_name(0)
+    local path = name ~= "" and require("conduit.fs").canonical(name)
+    if not path or not review.files[path] then
+        return vim.notify("[conduit] no agent changes to review in this buffer", vim.log.levels.INFO)
+    end
+    review[action](path)
+end
+
+---Accept the agent's changes to the current file, or to every file.
+---@param all? boolean
+function M.accept(all)
+    review_files("accept", all)
+end
+
+---Reject the agent's changes to the current file, or to every file.
+---@param all? boolean
+function M.reject(all)
+    review_files("reject", all)
+end
+
 ---Stop all agent processes.
 function M.stop()
     for _, agent in pairs(M.agents) do

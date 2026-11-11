@@ -42,6 +42,7 @@ lua/conduit/
                         and agent→client requests (fs/*, request_permission)
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
+  review.lua            Review of agent edits: per-file baselines, hunks, accept/reject
   terminal.lua          terminal/* commands (vim.system, own process group) and display
                         terminals from tool call _meta; output kept for the chat
   mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
@@ -59,6 +60,7 @@ lua/conduit/
   ui/tool.lua           Tool call blocks: status line, locations, diff and output previews
   ui/prompt.lua         Floating prompt (modes, @ completion)
   ui/answer.lua         Floating answer window anchored to a buffer line
+  ui/review.lua         Review overlay in file buffers (extmarks, virtual lines, keys)
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
   ui/spinner.lua        Animated progress indicator (uv timer)
   ui/permission.lua     Permission requests via vim.ui.select
@@ -102,7 +104,9 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   to list and load), `--mcp=http,sse` (MCP transports) and `--no-image` (no
   `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`).
   Prompts `term <json>` (terminal/create plus steps), `display` (the `_meta`
-  display-terminal extension) and `caps` exercise terminals. Session methods echo
+  display-terminal extension) and `caps` exercise terminals. `disk-edit`,
+  `disk-create`, `disk-delete` and `disk-edit-fast <path>` change files directly,
+  the way Claude does, reporting them through tool calls only. Session methods echo
   the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
@@ -154,6 +158,13 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   `terminal_output[_delta]`, `terminal_exit`, opted into with
   `clientCapabilities._meta.terminal_output[_delta]`). Codex does the same.
   Both paths feed `conduit.Terminal`, so the chat renders them identically.
+- **Agents write files themselves.** Claude's adapter never calls
+  `fs/write_text_file`; Claude Code edits the disk, and its Edit diffs are
+  snippets, not whole files. So `review.lua` snapshots a file when a running
+  `edit`/`delete`/`move` tool call (or a permission request, or an fs write)
+  first names it, and diffs against that when the call completes. In
+  `acceptEdits` mode the write can beat our snapshot; the completed call's diff
+  is then undone on the current text to rebuild the baseline.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
   written with `nvim_buf_set_lines` must be split or trimmed first.
 

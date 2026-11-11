@@ -55,6 +55,16 @@ See https://agentclientprotocol.com for the protocol.
       hide_output = { read = true, search = true, fetch = true },
     },
     terminal = { enabled = true, output_limit = 1048576 },
+    review = {
+      enabled = true,
+      chat = true,
+      inline = false,
+      keys = {
+        next = "]r", prev = "[r",
+        accept = "<localleader>a", reject = "<localleader>r",
+        accept_file = "<localleader>A", reject_file = "<localleader>R",
+      },
+    },
     log_level = vim.log.levels.WARN,
   })
 <
@@ -70,7 +80,8 @@ a rounded border. `ui.picker` picks threads and search results with
 "auto" uses the first of those plugins that's loaded. It can also be a
 function taking the picker spec (see `lua/conduit/ui/picker.lua`).
 `ui.thread_bar` shows threads as tabs in the chat's winbar
-(|conduit-threads|).
+(|conduit-threads|). `review` controls review of agent edits
+(|conduit-review|).
 
                                                             *conduit-options*
 `options` are session options applied to every new session, keyed by option id
@@ -169,6 +180,15 @@ Claude Code also loads servers from its own config (`~/.claude.json`,
                         Pick one of the agent's slash commands (or use
                         [name]) and start the chat prompt with it. See
                         |conduit-slash-commands|.
+:Conduit review         List the agent's changes waiting for review in the
+                        quickfix list. See |conduit-review|.
+:Conduit review toggle [chat|inline]
+                        Turn review of agent edits on or off, everywhere or
+                        for chat turns or inline requests only.
+:Conduit accept [all]   Accept the agent's changes to the current file, or
+                        to every file with `all`.
+:Conduit reject [all]   Reject the agent's changes to the current file, or
+                        to every file with `all`.
 :Conduit cancel         Cancel running inline edits, or else the chat turn.
 :Conduit stop           Terminate all agent processes.
 :Conduit log            Open the log file.
@@ -205,9 +225,47 @@ an edit, the proposed diff is drawn before the prompt opens. In the transcript:
   <CR>      Expand or collapse the tool call under the cursor
   gd        Open its diff side by side in a new tab (`q` closes it)
   gf        Open the first file it touched, at the reported line
+  <localleader>A  <localleader>R
+            Accept / reject the changes it made (|conduit-review|)
 
 Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
 bundle; |:checkhealth| conduit reports whether it's installed.
+
+                                                             *conduit-review*
+Agents like Claude Code and Codex write files themselves, so edits can't be
+held back for approval. Instead conduit keeps each file's content from before
+the agent first touched it and shows what changed since as hunks to accept or
+reject, whether the agent asked permission first or not.
+
+When an edit lands, the file's buffer reloads (if it's open without unsaved
+changes), the agent's lines are highlighted and the lines it removed show as
+virtual lines above them. The tool call's status line reads "review pending",
+then "accepted", "rejected" or "reviewed" (some of each), and the chat notes
+how many files are waiting at the end of a turn. In a file with changes:
+
+  ]r  [r            Next / previous change
+  <localleader>a    Accept the change under the cursor
+  <localleader>r    Reject it: the old lines come back and the file is saved
+  <localleader>A    Accept every change in the file
+  <localleader>R    Reject every change in the file
+
+The keys are `review.keys` (`false` disables one). Rejecting a file the agent
+created deletes it; rejecting one it deleted recreates it. Editing a reviewed
+buffer updates the hunks, and undoing a change by hand clears it. If the agent
+rewrites a file whose buffer has unsaved changes, the buffer is left alone and
+the file is listed as a conflict; rejecting it writes back what the buffer had
+when the agent started.
+
+`review.chat` (on) and `review.inline` (off) choose which edits are reviewed;
+`review.enabled = false` turns review off and edits apply as they come. Pair
+that with the agent's `mode = "acceptEdits"` option for no prompts at all.
+`:Conduit review toggle` flips them for the session. A `User`
+`ConduitReviewChanged` autocmd fires, with `{ path }` in `data`, when a file's
+review state changes.
+
+Edits are tracked through tool calls that report their files (`edit`,
+`delete` and `move` kinds, or any call with a diff), `fs/write_text_file` and
+inline replies. Files changed by shell commands aren't tracked.
 
                                                           *conduit-terminals*
 Agents can ask Neovim to run commands for them (ACP terminals). Each command
@@ -382,6 +440,11 @@ override them:
   ConduitThreadNew      Special         "New thread" in the picker
   ConduitThreadMeta     Comment         Agent, age and directory in the picker
   ConduitSearchMatch    Search          Matched text in search results
+  ConduitReviewAdd      DiffAdd         Lines the agent added
+  ConduitReviewChange   DiffChange      Lines the agent changed
+  ConduitReviewDelete   DiffDelete      Lines the agent removed (virtual)
+  ConduitReviewSign     DiagnosticInfo  Sign column mark on changes
+  ConduitReviewHint     Comment         Accept / reject key hint
 
 ==============================================================================
 5. LUA API                                                       *conduit-api*
@@ -424,5 +487,12 @@ require("conduit").option({key?}, {value?})
                                          Pick or set a session option.
 require("conduit").commands({name?})     Pick a slash command (or use {name})
                                          and start the chat prompt with it.
+require("conduit").review({action?}, {source?})
+                                         List changes to review in the
+                                         quickfix list; `"toggle"` turns review
+                                         on or off (for "chat" or "inline").
+require("conduit").accept({all?})        Accept the agent's changes to the
+                                         current file, or all of them.
+require("conduit").reject({all?})        Reject them.
 
  vim:tw=78:ts=8:ft=help:norl:

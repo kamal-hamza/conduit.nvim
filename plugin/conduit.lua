@@ -111,6 +111,18 @@ local subcommands = {
     log = function()
         vim.cmd.split(require("conduit.log").path)
     end,
+    review = function(args)
+        if args[1] and args[1] ~= "toggle" then
+            return vim.notify("[conduit] usage: :Conduit review [toggle [chat|inline]]", vim.log.levels.ERROR)
+        end
+        require("conduit").review(args[1], args[2])
+    end,
+    accept = function(args)
+        require("conduit").accept(args[1] == "all")
+    end,
+    reject = function(args)
+        require("conduit").reject(args[1] == "all")
+    end,
 }
 
 local takes_agent = { open = true, new = true, threads = true, continue = true }
@@ -219,6 +231,12 @@ end, {
                 end
             end
             return out
+        elseif #words == 3 and words[2] == "review" then
+            candidates = { "toggle" }
+        elseif #words == 4 and words[2] == "review" and words[3] == "toggle" then
+            candidates = { "chat", "inline" }
+        elseif #words == 3 and (words[2] == "accept" or words[2] == "reject") then
+            candidates = { "all" }
         elseif #words == 3 and words[2] == "option" then
             candidates = session_options()
         elseif #words == 4 and words[2] == "option" then

@@ -22,7 +22,13 @@ function Source.get_trigger_characters(_)
 end
 
 ---Agent commands for `/` at the start of the prompt.
----@param ctx table blink context
+---The parts of blink.cmp's completion context the source reads.
+---@class conduit.BlinkContext
+---@field cursor [integer, integer] 1-based line, 0-based byte column
+---@field line string
+---@field bufnr? integer
+
+---@param ctx conduit.BlinkContext
 ---@param start integer 1-based byte index of the `/`
 ---@param query string
 ---@return table[]
@@ -46,6 +52,8 @@ local function command_items(ctx, start, query)
     return items
 end
 
+---@param ctx conduit.BlinkContext
+---@param callback fun(response: table)
 function Source.get_completions(_, ctx, callback)
     local row, col = ctx.cursor[1] - 1, ctx.cursor[2]
     local cmd_start, cmd_query = commands.query(ctx.line:sub(1, col), row)

@@ -28,6 +28,11 @@ local GROUPS = {
     ConduitThreadNew = { link = "Special" },
     ConduitThreadMeta = { link = "Comment" },
     ConduitSearchMatch = { link = "Search" },
+    ConduitReviewAdd = { link = "DiffAdd" },
+    ConduitReviewChange = { link = "DiffChange" },
+    ConduitReviewDelete = { link = "DiffDelete" },
+    ConduitReviewSign = { link = "DiagnosticInfo" },
+    ConduitReviewHint = { link = "Comment" },
 }
 
 local function apply()

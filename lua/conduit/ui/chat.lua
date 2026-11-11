@@ -116,6 +116,17 @@ function Chat:_keymaps()
     tmap("gf", function()
         return self:open_tool_location()
     end, "gf", "Open the file the tool call touched")
+    local rkeys = config.options.review.keys or {}
+    if rkeys.accept_file then
+        tmap(rkeys.accept_file, function()
+            return self:review_tool("accept")
+        end, rkeys.accept_file, "Accept the tool call's changes")
+    end
+    if rkeys.reject_file then
+        tmap(rkeys.reject_file, function()
+            return self:review_tool("reject")
+        end, rkeys.reject_file, "Reject the tool call's changes")
+    end
     for _, buf in ipairs({ self.input, self.transcript }) do
         vim.keymap.set("n", "q", function()
             self:close()
@@ -375,7 +386,7 @@ function Chat:_follow_terminals(tool)
     for _, id in ipairs(tool_ui.terminal_ids(tool)) do
         local term = self.agent:terminal(id)
         if term and self.following[tool] ~= term then
-            local old = self.following[tool]
+            local old = self.following[tool] ---@type conduit.Terminal?
             if old then
                 old:unsubscribe(tool)
             end
@@ -443,7 +454,44 @@ function Chat:_tool_lines(tool)
         terminal = function(id)
             return self.agent:terminal(id)
         end,
+        review = require("conduit.review").tool_state(self, tool.toolCallId),
     })
+end
+
+---The review state of a tool call's files changed: redraw its status line.
+---@param id string
+function Chat:review_changed(id)
+    local tool = self.tools[id]
+    if tool and tool.block and vim.api.nvim_buf_is_valid(self.transcript) then
+        self:_render_tool(tool, true)
+    end
+end
+
+---Accept or reject every change in the files the tool call at the cursor touched.
+---@param action "accept"|"reject"
+---@return boolean found
+function Chat:review_tool(action)
+    local tool = self:_tool_at_cursor()
+    if not tool then
+        return false
+    end
+    local review = require("conduit.review")
+    local paths = {} ---@type string[]
+    for _, file in ipairs(review.list()) do
+        for _, src in pairs(file.sources) do
+            if src.handler == self and src.id == tool.toolCallId then
+                table.insert(paths, file.path)
+                break
+            end
+        end
+    end
+    if #paths == 0 then
+        vim.notify("[conduit] this tool call has no changes to review", vim.log.levels.INFO)
+    end
+    for _, path in ipairs(paths) do
+        review[action](path)
+    end
+    return true
 end
 
 ---Draw a tool call: append its block, or redraw it in place.
@@ -973,6 +1021,13 @@ function Chat:submit()
                 self:_notice("error: " .. perr)
             elseif result and result.stopReason ~= "end_turn" then
                 self:_notice("stopped: " .. tostring(result.stopReason))
+            end
+            local review = require("conduit.review")
+            local changed = review.wants(self) and review.pending_count(self) or 0
+            if changed > 0 then
+                self:_notice(
+                    ("%d %s waiting for review · :Conduit review"):format(changed, changed == 1 and "file" or "files")
+                )
             end
         end)
     end)

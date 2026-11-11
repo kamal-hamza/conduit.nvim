@@ -34,6 +34,12 @@ local M = {}
 ---@field output_lines integer Most output lines shown per tool call before it's expanded
 ---@field hide_output table<string, boolean> Tool kinds whose output stays hidden until expanded
 
+---@class conduit.ReviewConfig
+---@field enabled boolean Review agent edits at all; false applies them as they come
+---@field chat boolean Review edits made during chat turns
+---@field inline boolean Review edits from inline requests (their replies and any tool edits)
+---@field keys conduit.ReviewKeys Buffer-local keys in files with changes to review; false disables one
+
 ---@class conduit.Config
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
@@ -44,6 +50,7 @@ local M = {}
 ---@field threads conduit.ThreadsConfig
 ---@field tools conduit.ToolsConfig
 ---@field terminal conduit.TerminalConfig
+---@field review conduit.ReviewConfig
 ---@field log_level integer
 M.defaults = {
     default_agent = "claude",
@@ -118,6 +125,23 @@ M.defaults = {
         -- Most bytes of output kept per command; the oldest output is dropped first.
         -- Agents can ask for less.
         output_limit = 1024 * 1024,
+    },
+    -- Review of agent edits: files the agent changes keep their earlier content, and
+    -- the changes show in the file as hunks to accept or reject. Off, edits apply as
+    -- they come (combine with the agent's `mode = "acceptEdits"` option for no prompts at all).
+    review = {
+        enabled = true,
+        chat = true,
+        -- Inline requests stay fire-and-forget unless this is on.
+        inline = false,
+        keys = {
+            next = "]r",
+            prev = "[r",
+            accept = "<localleader>a",
+            reject = "<localleader>r",
+            accept_file = "<localleader>A",
+            reject_file = "<localleader>R",
+        },
     },
     log_level = vim.log.levels.WARN,
 }

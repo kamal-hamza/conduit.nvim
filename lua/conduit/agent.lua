@@ -5,6 +5,7 @@ local Terminal = require("conduit.terminal")
 local log = require("conduit.log")
 local mcp = require("conduit.mcp")
 local options = require("conduit.options")
+local review = require("conduit.review")
 
 local PROTOCOL_VERSION = 1
 local AUTH_REQUIRED = -32000
@@ -24,6 +25,10 @@ local NOT_FOUND = -32002
 ---@field request_permission fun(self, params: table, respond: fun(err: table?, result: any))
 ---@field on_agent_exit fun(self, code: integer)
 ---@field cwd? string Working directory of the session (default for terminals)
+---@field source? "chat"|"inline" Where the session's edits come from, for `review` (default "chat")
+---@field replaying? boolean History is being replayed (session/load); nothing is changing now
+---@field muted? boolean Replayed content is being ignored
+---@field review_changed? fun(self, tool_call_id: string) The review state of a tool call's files changed
 
 ---A slash command the agent advertises (`available_commands_update`).
 ---@class conduit.Command
@@ -454,6 +459,10 @@ end
 ---@param cb fun(err: string?, result: table?)
 function Agent:prompt(session_id, prompt, cb)
     self:_request("session/prompt", { sessionId = session_id, prompt = prompt }, function(err, result)
+        local handler = self.sessions[session_id] ---@type conduit.SessionHandler?
+        if handler then
+            review.turn_done(handler)
+        end
         cb(err and errmsg(err) or nil, result)
     end)
 end
@@ -476,7 +485,14 @@ function Agent:_on_request(method, params, respond)
         local result, err = require("conduit.fs").read(params)
         respond(err, result)
     elseif method == "fs/write_text_file" then
+        local session = self.sessions[params.sessionId] ---@type conduit.SessionHandler?
+        if session then
+            review.before_write(session, params.path)
+        end
         local result, err = require("conduit.fs").write(params)
+        if session and not err then
+            review.after_write(params.path)
+        end
         respond(err, result)
     elseif vim.startswith(method, "terminal/") then
         self:_terminal_request(method, params, respond)
@@ -485,6 +501,7 @@ function Agent:_on_request(method, params, respond)
         if not session then
             return respond(nil, { outcome = { outcome = "cancelled" } })
         end
+        review.on_permission(session, params.toolCall)
         session:request_permission(params, respond)
     else
         respond({ code = -32601, message = "Method not found: " .. method })
@@ -556,7 +573,7 @@ function Agent:_display_terminal(sid, meta)
     if type(meta.terminal_exit) == "table" then
         local exit = meta.terminal_exit
         term:exited({
-            exitCode = type(exit.exit_code) == "number" and exit.exit_code or nil,
+            exitCode = type(exit.exit_code) == "number" and math.floor(exit.exit_code) or nil,
             signal = type(exit.signal) == "string" and exit.signal or nil,
         })
     end
@@ -600,6 +617,8 @@ function Agent:_on_notification(method, params)
         end
         local session = self.sessions[sid] ---@type conduit.SessionHandler?
         if session then
+            -- Before the handler draws the update, so tool calls show their review state.
+            review.on_update(session, params.update)
             session:on_update(params.update)
         end
     else
