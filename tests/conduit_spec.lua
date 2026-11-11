@@ -76,13 +76,19 @@ test("chat: tool calls, permissions and fs read/write", function()
     local text = transcript(chat)
     -- The status-only update that completes the call keeps its diff.
     assert(
-        text:find("✓ Edit " .. path .. "\n`" .. vim.fn.fnamemodify(path, ":~") .. "` (+2 −2)\n```diff", 1, true),
+        text:find(
+            "✓ Edit " .. path .. " · review pending\n`" .. vim.fn.fnamemodify(path, ":~") .. "` (+2 −2)\n```diff",
+            1,
+            true
+        ),
         text
     )
+    assert(text:find("> 1 file waiting for review · :Conduit review", 1, true), text)
     assert(text:find("- [x] Read file", 1, true), text)
     assert(not text:find("[~]", 1, true), "plan should be replaced in place:\n" .. text)
     assert(text:find("first line was: hello", 1, true), text)
     assert(vim.deep_equal(vim.fn.readfile(path), { "HELLO", "WORLD" }))
+    require("conduit.review").reset()
 end)
 
 ---Headings of a markdown text, as parsed by treesitter (so not ones inside code blocks).
@@ -851,13 +857,14 @@ test("api: every :Conduit subcommand resolves", function()
     vim.list_extend(fns, { "threads", "continue_thread", "thread_next", "thread_prev", "thread_close" })
     vim.list_extend(fns, { "thread_delete", "thread_fork", "thread_rename", "thread_alternate", "thread_goto" })
     vim.list_extend(fns, { "thread_search", "resume", "status" })
+    vim.list_extend(fns, { "review", "accept", "reject" })
     for _, fn in ipairs(fns) do
         assert(type(conduit[fn]) == "function", "missing conduit." .. fn)
     end
     local complete = vim.fn.getcompletion("Conduit ", "cmdline")
     local subs =
         { "inline", "ask", "edit", "stop", "model", "effort", "mode", "threads", "thread", "continue", "resume" }
-    table.insert(subs, "commands")
+    vim.list_extend(subs, { "commands", "review", "accept", "reject" })
     for _, sub in ipairs(subs) do
         assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
     end
@@ -2408,4 +2415,329 @@ test("terminal: display lines strip escapes and resolve carriage returns", funct
     assert(vim.deep_equal(lines, { "ok", "100%", "end" }), vim.inspect(lines))
     assert(Terminal.sanitize("a\255b") == "a\239\191\189b")
     assert(Terminal.sanitize("é") == "é")
+end)
+
+-- Review of agent edits ---------------------------------------------------
+
+local review = require("conduit.review")
+local review_ui = require("conduit.ui.review")
+
+---A temp file with `lines`, its canonical path.
+---@param lines string[]
+---@return string
+local function review_file(lines)
+    local path = vim.fn.tempname()
+    vim.fn.writefile(lines, path)
+    return require("conduit.fs").canonical(path)
+end
+
+local function review_marks(buf)
+    return vim.api.nvim_buf_get_extmarks(buf, review_ui.ns, 0, -1, { details = true })
+end
+
+---@param buf integer
+---@param lhs string
+---@return boolean
+local function has_map(buf, lhs)
+    return vim.api.nvim_buf_call(buf, function()
+        return vim.fn.maparg(lhs, "n", false, true).buffer == 1
+    end)
+end
+
+local function review_cleanup()
+    review.reset()
+    reset_threads()
+    vim.cmd("silent! %bwipeout!")
+end
+
+test("review: edits made on disk show as hunks in the open buffer", function()
+    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+
+    -- The unmodified buffer was reloaded from disk.
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    assert(vim.deep_equal(lines, { "a", "new", "b", "c", "d", "new", "e" }), vim.inspect(lines))
+    local file = assert(review.files[path], "file should be tracked")
+    assert(vim.deep_equal(file.baseline, { "a", "old", "b", "c", "d", "old", "e" }), vim.inspect(file.baseline))
+    assert(#file.hunks == 2, vim.inspect(file.hunks))
+
+    -- Changed lines are highlighted, removed ones shown as virtual lines.
+    local marks = review_marks(buf)
+    local changed, virt = 0, {}
+    for _, m in ipairs(marks) do
+        local details = assert(m[4])
+        if details.line_hl_group == "ConduitReviewChange" then
+            changed = changed + 1
+        end
+        for _, vl in ipairs(details.virt_lines or {}) do
+            table.insert(virt, vim.trim(vl[1][1]))
+        end
+    end
+    assert(changed == 2, vim.inspect(marks))
+    assert(vim.deep_equal(virt, { "old", "old" }), vim.inspect(virt))
+    assert(has_map(buf, "]r") and has_map(buf, "<localleader>a"))
+
+    local text = transcript(chat)
+    assert(text:find("✓ Edit " .. path .. " · review pending", 1, true), text)
+    assert(text:find("> 1 file waiting for review · :Conduit review", 1, true), text)
+
+    -- ]r jumps between hunks.
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    review_ui.jump(1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
+    review_ui.jump(1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 6)
+    review_ui.jump(-1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
+    review_cleanup()
+end)
+
+test("review: hunks are accepted and rejected one at a time", function()
+    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    vim.api.nvim_set_current_buf(buf)
+
+    -- Reject the first hunk: its line comes back, in the buffer and on disk.
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    review_ui.act("reject")
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    assert(vim.deep_equal(lines, { "a", "old", "b", "c", "d", "new", "e" }), vim.inspect(lines))
+    assert(not vim.bo[buf].modified)
+    assert(vim.deep_equal(vim.fn.readfile(path), lines))
+    assert(#review.files[path].hunks == 1)
+
+    -- Accept the second: nothing is left to review and the overlay goes away.
+    vim.api.nvim_win_set_cursor(0, { 6, 0 })
+    review_ui.act("accept")
+    assert(review.files[path] == nil)
+    assert(#review_marks(buf) == 0)
+    assert(not has_map(buf, "]r") and not has_map(buf, "<localleader>a"))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b", "c", "d", "new", "e" }))
+    -- One hunk of each: the tool call reads as reviewed.
+    local text = transcript(chat)
+    assert(text:find("✓ Edit " .. path .. " · reviewed", 1, true), text)
+    review_cleanup()
+end)
+
+test("review: rejecting restores files that aren't open", function()
+    local path = review_file({ "old", "keep" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "new", "keep" }))
+    local items = review.qflist()
+    assert(#items == 1 and items[1].text == "+1 −1" and items[1].lnum == 1, vim.inspect(items))
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "keep" }))
+    assert(review.files[path] == nil)
+    assert(transcript(chat):find("· rejected", 1, true), transcript(chat))
+    review_cleanup()
+end)
+
+test("review: created and deleted files are restored by rejecting them", function()
+    local chat = assert(conduit.new())
+    local created = require("conduit.fs").canonical(vim.fn.tempname())
+    send(chat, "disk-create " .. created)
+    assert(vim.uv.fs_stat(created))
+    local items = review.qflist()
+    assert(#items == 1 and items[1].text == "created by the agent", vim.inspect(items))
+    review.reject(created)
+    assert(not vim.uv.fs_stat(created), "created file should be removed")
+
+    local deleted = review_file({ "precious", "lines" })
+    send(chat, "disk-delete " .. deleted)
+    assert(not vim.uv.fs_stat(deleted))
+    items = review.qflist()
+    assert(#items == 1 and items[1].text == "deleted by the agent", vim.inspect(items))
+    review.reject(deleted)
+    assert(vim.deep_equal(vim.fn.readfile(deleted), { "precious", "lines" }))
+    assert(#review.list() == 0)
+    review_cleanup()
+end)
+
+test("review: a write that lands before its tool call is rebuilt from the diff", function()
+    local path = review_file({ "a", "old", "b" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit-fast " .. path)
+    local file = assert(review.files[path], "file should be tracked")
+    assert(vim.deep_equal(file.baseline, { "a", "old", "b" }), vim.inspect(file.baseline))
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b" }))
+    review_cleanup()
+end)
+
+test("review: fs/write_text_file edits are reviewed in the buffer", function()
+    local path = review_file({ "hello", "world" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local orig_select = vim.ui.select
+    vim.ui.select = function(items, _, cb)
+        cb(items[1])
+    end
+    local chat = assert(conduit.new())
+    send(chat, "edit " .. path)
+    vim.ui.select = orig_select
+    assert(review.files[path] and #review.files[path].hunks == 1)
+    assert(#review_marks(buf) > 0)
+    review.reject(path)
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "hello", "world" }))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "hello", "world" }))
+    review_cleanup()
+end)
+
+test("review: unsaved changes in the buffer are left alone as a conflict", function()
+    local path = review_file({ "old", "b" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local orig_notify = vim.notify
+    local warned ---@type string?
+    vim.notify = function(msg)
+        warned = msg
+    end
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "mine" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    vim.notify = orig_notify
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "old", "mine" }))
+    local file = assert(review.files[path])
+    assert(file.conflict)
+    assert(warned and warned:find("unsaved changes", 1, true), tostring(warned))
+    assert(#review_marks(buf) == 0)
+    local item = assert(review.qflist()[1])
+    assert(item.text and item.text:find("conflict", 1, true), vim.inspect(item))
+    -- Rejecting puts back what the buffer had when the agent started.
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "mine" }))
+    review_cleanup()
+end)
+
+test("review: turned off, edits apply as before", function()
+    local config = require("conduit.config").options
+    config.review.enabled = false
+    local path = review_file({ "old" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    config.review.enabled = true
+    assert(next(review.files) == nil)
+    assert(#review_marks(buf) == 0 and not has_map(buf, "]r"))
+    local text = transcript(chat)
+    assert(text:find("✓ Edit " .. path .. "\n", 1, true), text)
+    assert(not text:find("review", 1, true), text)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "new" }))
+    review_cleanup()
+end)
+
+test("review: chat and inline edits follow their own switches", function()
+    local config = require("conduit.config").options
+    local inline = require("conduit.inline")
+    local function run_inline(path)
+        vim.cmd.edit(path)
+        conduit.inline(1, 1, "uppercase it")
+        wait_for(function()
+            return next(inline.jobs) == nil
+        end, "inline edit")
+        return vim.api.nvim_get_current_buf()
+    end
+
+    -- Off by default: inline replies apply untracked.
+    local path = review_file({ "local a = 1", "keep" })
+    local buf = run_inline(path)
+    assert(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "LOCAL A = 1")
+    assert(next(review.files) == nil)
+
+    -- On: the reply is a hunk; rejecting it leaves the buffer as it was (unsaved, like the reply).
+    config.review.inline = true
+    vim.cmd("silent! %bwipeout!")
+    path = review_file({ "local a = 1", "keep" })
+    buf = run_inline(path)
+    config.review.inline = false
+    local file = assert(review.files[path], "inline reply should be tracked")
+    assert(#file.hunks == 1 and #review_marks(buf) > 0)
+    review.reject(path)
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "local a = 1", "keep" }))
+
+    -- Chat off, inline on: chat edits aren't tracked.
+    config.review.chat = false
+    path = review_file({ "old" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    config.review.chat = true
+    assert(next(review.files) == nil)
+    review_cleanup()
+end)
+
+test("review: user edits recompute hunks; undoing the change by hand clears it", function()
+    local path = review_file({ "old", "b" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    assert(review.files[path])
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "old" })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+    wait_for(function()
+        return review.files[path] == nil
+    end, "the review to clear")
+    assert(#review_marks(buf) == 0)
+    review_cleanup()
+end)
+
+test("review: :Conduit review lists changes; toggle and accept all", function()
+    local a = review_file({ "old" })
+    local b = review_file({ "x", "old" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. a)
+    send(chat, "disk-edit " .. b)
+    assert(transcript(chat):find("> 2 files waiting for review", 1, true), transcript(chat))
+    vim.cmd("Conduit review")
+    local qf = vim.fn.getqflist({ title = true, items = true })
+    assert(qf.title == "conduit review" and #qf.items == 2, vim.inspect(qf))
+    vim.cmd("cclose")
+
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    vim.cmd("Conduit review toggle inline")
+    assert(require("conduit.config").options.review.inline == true)
+    vim.cmd("Conduit review toggle inline")
+    vim.notify = orig_notify
+    assert(require("conduit.config").options.review.inline == false)
+
+    vim.cmd("Conduit accept all")
+    assert(#review.list() == 0)
+    assert(vim.deep_equal(vim.fn.readfile(a), { "new" }) and vim.deep_equal(vim.fn.readfile(b), { "x", "new" }))
+    review_cleanup()
+end)
+
+test("review: the chat's file keys reject the tool call's changes", function()
+    local path = review_file({ "old" })
+    local chat = assert(conduit.new())
+    send(chat, "disk-edit " .. path)
+    local twin = assert(chat:wins())
+    vim.api.nvim_set_current_win(twin)
+    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "✓ Edit") + 1, 0 })
+    press(chat.transcript, "<localleader>R")
+    assert(vim.deep_equal(vim.fn.readfile(path), { "old" }))
+    assert(review.files[path] == nil)
+    review_cleanup()
+end)
+
+test("review: replayed tool calls aren't reviewed", function()
+    local handler = { replaying = true } --[[@as conduit.SessionHandler]]
+    local path = review_file({ "x" })
+    review.on_update(handler, {
+        sessionUpdate = "tool_call",
+        toolCallId = "old",
+        kind = "edit",
+        status = "pending",
+        locations = { { path = path } },
+    })
+    assert(next(review.files) == nil)
 end)

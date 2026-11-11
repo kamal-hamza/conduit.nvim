@@ -30,6 +30,7 @@ local ns = vim.api.nvim_create_namespace("conduit.inline")
 ---@field writes integer `b:conduit_writes` when the request started
 ---@field cleaned? boolean
 ---@field adopted? boolean The chat took over the session
+---@field source "inline"
 local Job = {}
 Job.__index = Job
 
@@ -307,7 +308,12 @@ function Job:_turn_done(err)
         return vim.notify("[conduit] inline request produced nothing to apply", vim.log.levels.WARN)
     end
     local lines = vim.split(M.extract(self.text), "\n", { plain = true })
+    local review = require("conduit.review")
+    local path = review.wants(self) and review.snapshot_buf(self, self.buf) or nil
     vim.api.nvim_buf_set_lines(self.buf, first, last + 1, false, lines)
+    if path then
+        review.refresh(path)
+    end
 end
 
 ---Drop the session and buffer decorations. Idempotent.
@@ -423,6 +429,7 @@ function M.run(opts)
         tools = {},
         busy = false,
         cancelled = false,
+        source = "inline",
         writes = vim.b[buf].conduit_writes or 0,
         indent = (" "):rep(vim.api.nvim_buf_call(buf, function()
             return vim.fn.indent(line1)

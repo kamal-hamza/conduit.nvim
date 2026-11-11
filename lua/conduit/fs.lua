@@ -3,17 +3,26 @@
 local M = {}
 
 ---Normalized path with symlinks resolved: Neovim names buffers by their real
----path, while agents may send one through a symlink (e.g. macOS's /var).
+---path, while agents may send one through a symlink (e.g. macOS's /var). A
+---file that doesn't exist yet resolves through its directory, so it keeps the
+---same name once it's created.
 ---@param path string
 ---@return string
-local function canonical(path)
+function M.canonical(path)
     path = vim.fs.normalize(path)
-    return vim.uv.fs_realpath(path) or path
+    local real = vim.uv.fs_realpath(path)
+    if real then
+        return real
+    end
+    local dir = vim.uv.fs_realpath(vim.fs.dirname(path))
+    return dir and vim.fs.joinpath(dir, vim.fs.basename(path)) or path
 end
+local canonical = M.canonical
 
+---The loaded buffer for `path`, if any.
 ---@param path string
 ---@return integer?
-local function find_buf(path)
+function M.find_buf(path)
     path = canonical(path)
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
         local name = vim.api.nvim_buf_get_name(buf)
@@ -27,7 +36,7 @@ end
 ---@return table?, table?
 function M.read(params)
     local content
-    local buf = find_buf(params.path)
+    local buf = M.find_buf(params.path)
     if buf then
         content = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
         if vim.bo[buf].eol then
@@ -54,7 +63,7 @@ end
 ---@param params { path: string, content: string }
 ---@return table?, table?
 function M.write(params)
-    local buf = find_buf(params.path)
+    local buf = M.find_buf(params.path)
     if buf then
         local lines = vim.split(params.content, "\n", { plain = true })
         if lines[#lines] == "" then

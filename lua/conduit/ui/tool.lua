@@ -18,6 +18,7 @@ local M = {}
 ---@field output_lines integer Most output lines in a collapsed preview
 ---@field hide_output table<string, boolean> Tool kinds whose output is hidden until expanded
 ---@field terminal? fun(id: string): conduit.Terminal? Looks up terminals the call embeds
+---@field review? string Review state of the files the call changed ("review pending", "accepted", ...)
 
 local STATUS_ICONS = {
     pending = "○",
@@ -270,6 +271,9 @@ end
 ---@return string[]
 function M.lines(tool, opts)
     local out = { M.header(tool) }
+    if opts.review then
+        out[1] = ("%s · %s"):format(out[1], opts.review)
+    end
     local expanded = opts.expanded
     local diffs = M.diffs(tool)
 

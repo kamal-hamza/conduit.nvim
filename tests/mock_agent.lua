@@ -11,6 +11,12 @@
 -- review command (see COMMANDS, advertised after every session/new, load,
 -- resume and fork). Anything else is echoed back.
 --
+-- Edits on disk, like Claude and Codex make them (no fs/write_text_file):
+-- `disk-edit <path>` replaces every line "old" with "new", `disk-create <path>`
+-- writes a new file, `disk-delete <path>` removes one. Each sends a running tool
+-- call, waits for a round trip, changes the file, then completes the call with its
+-- diff. `disk-edit-fast <path>` changes the file before sending the tool call.
+--
 -- Pass `--legacy` to advertise `modes`/`models` instead of `configOptions`.
 --
 -- Threads: `--threads=load,list,resume,close,delete,fork,title` advertises those
@@ -377,6 +383,77 @@ handlers["session/set_title"] = function(params)
     return { title = s.title }
 end
 
+---@param path string
+---@return string?
+local function read_file(path)
+    local f = io.open(path, "rb")
+    if not f then
+        return nil
+    end
+    local text = f:read("*a")
+    f:close()
+    return text
+end
+
+---@param path string
+---@param text string
+local function write_file(path, text)
+    local f = assert(io.open(path, "wb"))
+    f:write(text)
+    f:close()
+end
+
+---`disk-*` prompts: change a file directly, reporting it through tool calls only.
+---@param sid string
+---@param op string
+---@param path string
+local function disk_change(sid, op, path)
+    local before = read_file(path)
+    local changed ---@type string?
+    if op == "disk-edit" or op == "disk-edit-fast" then
+        local lines = vim.split(assert(before), "\n", { plain = true })
+        for i, line in ipairs(lines) do
+            if line == "old" then
+                lines[i] = "new"
+            end
+        end
+        changed = table.concat(lines, "\n")
+    elseif op == "disk-create" then
+        changed = "created\nby the agent\n"
+    end
+    local function change()
+        if changed then
+            write_file(path, changed)
+        else
+            os.remove(path)
+        end
+    end
+    local id = "disk-" .. turns
+    if op == "disk-edit-fast" then
+        change()
+    end
+    update(sid, {
+        sessionUpdate = "tool_call",
+        toolCallId = id,
+        title = (op == "disk-delete" and "Delete " or "Edit ") .. path,
+        kind = op == "disk-delete" and "delete" or "edit",
+        status = "pending",
+        locations = { { path = path } },
+    })
+    if op ~= "disk-edit-fast" then
+        -- The client has handled the tool call once it answers.
+        request("fs/read_text_file", { sessionId = sid, path = vim.fn.getcwd() .. "/Makefile", limit = 1 })
+        change()
+    end
+    local content = nil
+    if changed then
+        content = { { type = "diff", path = path, oldText = before or vim.NIL, newText = changed } }
+    end
+    update(sid, { sessionUpdate = "tool_call_update", toolCallId = id, status = "completed", content = content })
+    say(sid, "done " .. op)
+    return { stopReason = "end_turn" }
+end
+
 ---`run`: a multi-line command whose permission request carries the details
 ---itself (`run-argv` sends the command as a `bash -lc` argv). Replies with the
 ---chosen option.
@@ -598,6 +675,11 @@ handlers["session/prompt"] = function(params)
 
     if text == "run" or text == "run-argv" then
         return run_command(sid, text == "run-argv")
+    end
+
+    local op, target = text:match("^(disk%-[%w-]+) (.+)$")
+    if op then
+        return disk_change(sid, op, target)
     end
 
     local path = text:match("^edit (.+)$")
