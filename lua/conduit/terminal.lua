@@ -303,7 +303,7 @@ function Terminal.spawn(id, params, default_cwd)
     local term = Terminal.new(id, {
         session_id = params.sessionId,
         command = display_command(command, args),
-        limit = type(params.outputByteLimit) == "number" and params.outputByteLimit or nil,
+        limit = type(params.outputByteLimit) == "number" and math.floor(params.outputByteLimit) or nil,
     })
     local function on_output(_, data)
         if data then
@@ -357,7 +357,7 @@ function Terminal.display_lines(s)
         lines[#lines] = nil
     end
     for i, line in ipairs(lines) do
-        lines[i] = line:match("[^\r]*$"):gsub("[%z\1-\8\11-\31\127]", "")
+        lines[i] = (line:match("[^\r]*$") or line):gsub("[%z\1-\8\11-\31\127]", "")
     end
     return lines
 end

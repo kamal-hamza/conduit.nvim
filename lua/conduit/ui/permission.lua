@@ -96,7 +96,7 @@ end
 ---@return conduit.PermissionInfo
 function M.describe(call)
     local kind = type(call.kind) == "string" and call.kind or nil
-    local title = type(call.title) == "string" and vim.trim(call.title:match("^%s*([^\n]*)")) or ""
+    local title = type(call.title) == "string" and vim.trim(call.title:match("^%s*([^\n]*)") or "") or ""
     if title == "" then
         title = KIND_TITLES[kind] or "run a tool"
     end

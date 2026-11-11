@@ -224,19 +224,19 @@ test("permission: describe handles each rawInput shape and fallbacks", function(
     assert(vim.deep_equal(info.command, { "git status --short" }), vim.inspect(info.command))
     assert(vim.deep_equal(describe({ rawInput = { command = { "zsh", "-c", "a\nb\n" } } }).command, { "a", "b" }))
 
-    info = describe({ title = "  Read\nmore", kind = "read", rawInput = { file_path = "/x" } })
-    assert(info.title == "Read" and info.command == nil, vim.inspect(info))
-    info = describe({ rawInput = vim.NIL, title = vim.NIL })
-    assert(info.title == "run a tool" and info.kind == nil and #info.paths == 0, vim.inspect(info))
+    local read = describe({ title = "  Read\nmore", kind = "read", rawInput = { file_path = "/x" } })
+    assert(read.title == "Read" and read.command == nil, vim.inspect(read))
+    local empty = describe({ rawInput = vim.NIL, title = vim.NIL })
+    assert(empty.title == "run a tool" and empty.kind == nil and #empty.paths == 0, vim.inspect(empty))
 
     local cwd_file = vim.fn.getcwd() .. "/lua/conduit/init.lua"
-    info = describe({
+    local located = describe({
         locations = { { path = cwd_file, line = 3 }, { path = cwd_file, line = 3 }, { path = "/abs/x" } },
         content = { { type = "diff", path = "/ignored" } },
     })
-    assert(vim.deep_equal(info.paths, { "lua/conduit/init.lua:3", "/abs/x" }), vim.inspect(info.paths))
-    info = describe({ kind = "edit", content = { { type = "content" }, { type = "diff", path = "/d.lua" } } })
-    assert(info.title == "edit a file" and vim.deep_equal(info.paths, { "/d.lua" }), vim.inspect(info))
+    assert(vim.deep_equal(located.paths, { "lua/conduit/init.lua:3", "/abs/x" }), vim.inspect(located.paths))
+    local edit = describe({ kind = "edit", content = { { type = "content" }, { type = "diff", path = "/d.lua" } } })
+    assert(edit.title == "edit a file" and vim.deep_equal(edit.paths, { "/d.lua" }), vim.inspect(edit))
 end)
 
 test("fs: reads prefer unsaved buffer contents", function()
@@ -422,7 +422,8 @@ end
 ---@param fn fun()
 ---@return string[]
 local function capture_notify(fn)
-    local orig, msgs = vim.notify, {}
+    local orig = vim.notify
+    local msgs = {} ---@type string[]
     vim.notify = function(msg)
         table.insert(msgs, msg)
     end
@@ -439,14 +440,14 @@ end
 test("mentions: images become image blocks when the agent accepts them", function()
     local root = image_fixture()
     local mentions = require("conduit.mentions")
-    local blocks
+    local blocks = {} ---@type table[]
     local msgs = capture_notify(function()
         -- No embeddedContext: images don't depend on it.
         blocks = mentions.blocks("look @shot.png and @photo.jpg", prompt_caps({ image = true }), { root = root })
     end)
     assert(#msgs == 0, vim.inspect(msgs))
     assert(#blocks == 3, vim.inspect(blocks))
-    local png = assert(blocks[2])
+    local png = blocks[2]
     assert(png.type == "image" and png.mimeType == "image/png", vim.inspect(png))
     assert(vim.base64.decode(png.data) == PNG)
     assert(png.uri == vim.uri_from_fname(root .. "/shot.png"))
@@ -456,7 +457,7 @@ end)
 test("mentions: images are links with a warning when not accepted or too large", function()
     local root = image_fixture()
     local mentions = require("conduit.mentions")
-    local blocks
+    local blocks = {} ---@type table[]
     local msgs = capture_notify(function()
         blocks = mentions.blocks("@shot.png", prompt_caps({ embeddedContext = true }), { root = root })
     end)
@@ -470,7 +471,7 @@ test("mentions: images are links with a warning when not accepted or too large",
         blocks = mentions.blocks("@shot.png", prompt_caps({ image = true }), { root = root })
     end)
     mentions.max_image_bytes = max
-    assert(blocks[2].type == "resource_link", vim.inspect(blocks[2]))
+    assert(assert(blocks[2]).type == "resource_link", vim.inspect(blocks[2]))
     assert(#msgs == 1 and msgs[1]:find("larger than", 1, true), vim.inspect(msgs))
 end)
 
@@ -673,7 +674,7 @@ end)
 test("inline: permission prompts include what the agent wants to run", function()
     inline_buf()
     local orig_select = vim.ui.select
-    local prompt
+    local prompt ---@type string?
     vim.ui.select = function(items, opts, cb)
         prompt = opts.prompt
         cb(items[1])
@@ -2088,9 +2089,9 @@ test("chat: agents without image support get a link and a warning", function()
     local text = transcript(chat)
     assert(text:find("resource_link shot.png 0", 1, true), text)
     assert(
-        vim.iter(msgs):any(function(m)
+        vim.tbl_contains(msgs, function(m)
             return m:find("doesn't accept images", 1, true) ~= nil
-        end),
+        end, { predicate = true }),
         vim.inspect(msgs)
     )
     drop_agent("blind")
@@ -2117,7 +2118,7 @@ test("commands: the agent keeps each session's slash commands", function()
     local agent = require("conduit.agent").new("cmds", require("conduit.config").options.agents.mock)
     local noop = function() end
     local handler = { on_update = noop, request_permission = noop, on_agent_exit = noop }
-    local sid
+    local sid ---@type string?
     agent:start(function()
         agent:new_session(vim.fn.getcwd(), handler, function(_, s)
             sid = s
@@ -2129,8 +2130,9 @@ test("commands: the agent keeps each session's slash commands", function()
     assert(vim.deep_equal(names(agent:get_commands(sid)), { "review", "compact" }))
     -- Before a session exists, the last list stands in.
     assert(vim.deep_equal(names(agent:get_commands()), { "review", "compact" }))
-    agent:close_session(sid)
-    assert(agent.commands[sid] == nil, "closing forgets the session's commands")
+    local id = assert(sid)
+    agent:close_session(id)
+    assert(agent.commands[id] == nil, "closing forgets the session's commands")
     agent:stop()
 end)
 
@@ -2138,7 +2140,7 @@ test("commands: typing / at the start of the prompt completes agent commands", f
     local chat = chat_with_commands()
     vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
     local orig = vim.fn.complete
-    local calls = {}
+    local calls = {} ---@type { col: integer, list: table[] }[]
     vim.fn.complete = function(col, list)
         table.insert(calls, { col = col, list = list })
     end
@@ -2151,7 +2153,7 @@ test("commands: typing / at the start of the prompt completes agent commands", f
     vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
     vim.fn.complete = orig
     assert(#calls == 1, "only a leading / completes commands: " .. vim.inspect(calls))
-    local first = calls[1].list[1]
+    local first = assert(calls[1].list[1])
     assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
     assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
     assert(vim.api.nvim_get_current_win() == select(2, chat:wins()))
@@ -2166,7 +2168,9 @@ test("commands: the input hint shows after the command until arguments are typed
         vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { line })
         vim.api.nvim_exec_autocmds("TextChanged", { buffer = chat.input })
         local marks = vim.api.nvim_buf_get_extmarks(chat.input, ns, 0, -1, { details = true })
-        return marks[1] and marks[1][4].virt_text[1][1]
+        local details = marks[1] and marks[1][4]
+        local virt = details and details.virt_text
+        return virt and virt[1] and virt[1][1]
     end
     assert(hint("/review ") == "optional focus", tostring(hint("/review ")))
     assert(hint("/review") == " optional focus")
@@ -2186,7 +2190,7 @@ test("blink: / completes agent commands with their input hint", function()
         got = res
     end)
     got = assert(got)
-    local first = got.items[1]
+    local first = assert(got.items[1])
     assert(first.label == "/review" and first.labelDetails.description == "optional focus", vim.inspect(first))
     assert(first.textEdit.newText == "review ", "commands with input get a trailing space")
     local range = first.textEdit.range
@@ -2237,9 +2241,9 @@ end)
 test("commands: :Conduit commands starts the prompt with the picked command", function()
     local chat = chat_with_commands()
     local orig = vim.ui.select
-    local shown
+    local shown ---@type string[]?
     vim.ui.select = function(items, opts, cb)
-        shown = vim.tbl_map(opts.format_item, items)
+        shown = vim.tbl_map(assert(opts.format_item), items)
         cb(items[1])
     end
     vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "keep this" })
@@ -2251,8 +2255,8 @@ test("commands: :Conduit commands starts the prompt with the picked command", fu
     assert(lines[1] == "/review keep this", vim.inspect(lines))
     vim.cmd("Conduit commands /compact")
     vim.cmd.stopinsert()
-    lines = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
-    assert(lines[1] == "/compact keep this", vim.inspect(lines))
+    local compact = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
+    assert(compact[1] == "/compact keep this", vim.inspect(compact))
     assert(vim.tbl_contains(vim.fn.getcompletion("Conduit commands ", "cmdline"), "review"))
     vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
 end)
@@ -2265,7 +2269,7 @@ local function term_results(chat)
     for _, line in ipairs(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)) do
         local step, json = line:match("^(%a+) ({.*})$")
         -- "term" is the prompt itself.
-        if step and step ~= "term" then
+        if step and json and step ~= "term" then
             table.insert(out, { step = step, value = vim.json.decode(json, { luanil = { object = true } }) })
         end
     end
@@ -2353,7 +2357,7 @@ end)
 test("terminal: disabled terminals aren't advertised or run", function()
     local config = require("conduit.config").options
     config.terminal.enabled = false
-    local agent = thread_agent("noterm")
+    thread_agent("noterm")
     local chat = assert(conduit.new("noterm"))
     send(chat, "caps")
     local caps = assert(term_results(chat)[1]).value
@@ -2362,7 +2366,6 @@ test("terminal: disabled terminals aren't advertised or run", function()
     assert(caps.terminal == false, vim.inspect(caps))
     local create = assert(term_results(chat)[2]).value
     assert(create.code == -32601, vim.inspect(create))
-    assert(agent)
     drop_agent("noterm")
 end)
 
@@ -2370,13 +2373,13 @@ test("terminal: running commands are killed when the agent exits", function()
     local agent = thread_agent("termexit")
     local chat = assert(conduit.new("termexit"))
     send(chat, "term " .. vim.json.encode({ create = { command = "sleep", args = { "30" } } }))
-    local term = assert(agent.terminals["term-1"])
-    local pid = assert(assert(term.proc).pid)
+    local term = assert(agent:terminal("term-1"))
+    local pid = assert(term.proc).pid
     agent:stop()
     wait_for(function()
         return term.exit ~= nil
     end, "command to be killed")
-    assert(term.exit.signal == "SIGTERM", vim.inspect(term.exit))
+    assert(assert(term.exit).signal == "SIGTERM", vim.inspect(term.exit))
     assert(next(agent.terminals) == nil)
     drop_agent("termexit")
     assert(not vim.uv.kill(pid, 0) or vim.uv.kill(pid, 0) ~= 0, "process still running")
@@ -2402,7 +2405,8 @@ test("terminal: long output shows the last lines and expands in place", function
         text
     )
     local lines = vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)
-    local row = assert(vim.fn.index(lines, "✓ sh"))
+    local row = vim.fn.index(lines, "✓ sh")
+    assert(row >= 0, "no tool call line")
     assert(chat:toggle_tool(row))
     config.tools.output_lines = 8
     text = transcript(chat)
@@ -2429,6 +2433,14 @@ local function review_file(lines)
     local path = vim.fn.tempname()
     vim.fn.writefile(lines, path)
     return require("conduit.fs").canonical(path)
+end
+
+---The review entry for `path`, if it's tracked.
+---@param path string
+---@return conduit.ReviewFile?
+local function tracked(path)
+    local file = review.files[path] ---@type conduit.ReviewFile?
+    return file
 end
 
 local function review_marks(buf)
@@ -2460,7 +2472,7 @@ test("review: edits made on disk show as hunks in the open buffer", function()
     -- The unmodified buffer was reloaded from disk.
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     assert(vim.deep_equal(lines, { "a", "new", "b", "c", "d", "new", "e" }), vim.inspect(lines))
-    local file = assert(review.files[path], "file should be tracked")
+    local file = assert(tracked(path), "file should be tracked")
     assert(vim.deep_equal(file.baseline, { "a", "old", "b", "c", "d", "old", "e" }), vim.inspect(file.baseline))
     assert(#file.hunks == 2, vim.inspect(file.hunks))
 
@@ -2511,12 +2523,12 @@ test("review: hunks are accepted and rejected one at a time", function()
     assert(vim.deep_equal(lines, { "a", "old", "b", "c", "d", "new", "e" }), vim.inspect(lines))
     assert(not vim.bo[buf].modified)
     assert(vim.deep_equal(vim.fn.readfile(path), lines))
-    assert(#review.files[path].hunks == 1)
+    assert(#assert(tracked(path)).hunks == 1)
 
     -- Accept the second: nothing is left to review and the overlay goes away.
     vim.api.nvim_win_set_cursor(0, { 6, 0 })
     review_ui.act("accept")
-    assert(review.files[path] == nil)
+    assert(tracked(path) == nil)
     assert(#review_marks(buf) == 0)
     assert(not has_map(buf, "]r") and not has_map(buf, "<localleader>a"))
     assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b", "c", "d", "new", "e" }))
@@ -2535,7 +2547,7 @@ test("review: rejecting restores files that aren't open", function()
     assert(#items == 1 and items[1].text == "+1 −1" and items[1].lnum == 1, vim.inspect(items))
     review.reject(path)
     assert(vim.deep_equal(vim.fn.readfile(path), { "old", "keep" }))
-    assert(review.files[path] == nil)
+    assert(tracked(path) == nil)
     assert(transcript(chat):find("· rejected", 1, true), transcript(chat))
     review_cleanup()
 end)
@@ -2553,8 +2565,8 @@ test("review: created and deleted files are restored by rejecting them", functio
     local deleted = review_file({ "precious", "lines" })
     send(chat, "disk-delete " .. deleted)
     assert(not vim.uv.fs_stat(deleted))
-    items = review.qflist()
-    assert(#items == 1 and items[1].text == "deleted by the agent", vim.inspect(items))
+    local deleted_items = review.qflist()
+    assert(#deleted_items == 1 and deleted_items[1].text == "deleted by the agent", vim.inspect(deleted_items))
     review.reject(deleted)
     assert(vim.deep_equal(vim.fn.readfile(deleted), { "precious", "lines" }))
     assert(#review.list() == 0)
@@ -2565,7 +2577,7 @@ test("review: a write that lands before its tool call is rebuilt from the diff",
     local path = review_file({ "a", "old", "b" })
     local chat = assert(conduit.new())
     send(chat, "disk-edit-fast " .. path)
-    local file = assert(review.files[path], "file should be tracked")
+    local file = assert(tracked(path), "file should be tracked")
     assert(vim.deep_equal(file.baseline, { "a", "old", "b" }), vim.inspect(file.baseline))
     review.reject(path)
     assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b" }))
@@ -2583,7 +2595,7 @@ test("review: fs/write_text_file edits are reviewed in the buffer", function()
     local chat = assert(conduit.new())
     send(chat, "edit " .. path)
     vim.ui.select = orig_select
-    assert(review.files[path] and #review.files[path].hunks == 1)
+    assert(#assert(tracked(path)).hunks == 1)
     assert(#review_marks(buf) > 0)
     review.reject(path)
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "hello", "world" }))
@@ -2605,7 +2617,7 @@ test("review: unsaved changes in the buffer are left alone as a conflict", funct
     send(chat, "disk-edit " .. path)
     vim.notify = orig_notify
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "old", "mine" }))
-    local file = assert(review.files[path])
+    local file = assert(tracked(path))
     assert(file.conflict)
     assert(warned and warned:find("unsaved changes", 1, true), tostring(warned))
     assert(#review_marks(buf) == 0)
@@ -2659,7 +2671,7 @@ test("review: chat and inline edits follow their own switches", function()
     path = review_file({ "local a = 1", "keep" })
     buf = run_inline(path)
     config.review.inline = false
-    local file = assert(review.files[path], "inline reply should be tracked")
+    local file = assert(tracked(path), "inline reply should be tracked")
     assert(#file.hunks == 1 and #review_marks(buf) > 0)
     review.reject(path)
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "local a = 1", "keep" }))
@@ -2680,7 +2692,7 @@ test("review: user edits recompute hunks; undoing the change by hand clears it",
     local buf = vim.api.nvim_get_current_buf()
     local chat = assert(conduit.new())
     send(chat, "disk-edit " .. path)
-    assert(review.files[path])
+    assert(tracked(path))
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "old" })
     vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
     wait_for(function()
@@ -2725,12 +2737,13 @@ test("review: the chat's file keys reject the tool call's changes", function()
     vim.api.nvim_win_set_cursor(twin, { row_of(chat, "✓ Edit") + 1, 0 })
     press(chat.transcript, "<localleader>R")
     assert(vim.deep_equal(vim.fn.readfile(path), { "old" }))
-    assert(review.files[path] == nil)
+    assert(tracked(path) == nil)
     review_cleanup()
 end)
 
 test("review: replayed tool calls aren't reviewed", function()
-    local handler = { replaying = true } --[[@as conduit.SessionHandler]]
+    local noop = function() end
+    local handler = { replaying = true, on_update = noop, request_permission = noop, on_agent_exit = noop }
     local path = review_file({ "x" })
     review.on_update(handler, {
         sessionUpdate = "tool_call",

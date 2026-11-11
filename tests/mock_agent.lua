@@ -458,10 +458,10 @@ end
 ---itself (`run-argv` sends the command as a `bash -lc` argv). Replies with the
 ---chosen option.
 ---@param sid string
----@param argv boolean
-local function run_command(sid, argv)
+---@param as_argv boolean
+local function run_command(sid, as_argv)
     local script = "echo one\necho two\necho three"
-    local raw = { command = argv and { "/bin/bash", "-lc", script } or script }
+    local raw = { command = as_argv and { "/bin/bash", "-lc", script } or script }
     update(sid, { sessionUpdate = "tool_call", toolCallId = "r1", title = "echo one\necho two", kind = "execute" })
     local perm = request("session/request_permission", {
         sessionId = sid,

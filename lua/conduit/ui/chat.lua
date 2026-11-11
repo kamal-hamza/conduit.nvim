@@ -386,7 +386,7 @@ function Chat:_follow_terminals(tool)
     for _, id in ipairs(tool_ui.terminal_ids(tool)) do
         local term = self.agent:terminal(id)
         if term and self.following[tool] ~= term then
-            local old = self.following[tool]
+            local old = self.following[tool] ---@type conduit.Terminal?
             if old then
                 old:unsubscribe(tool)
             end

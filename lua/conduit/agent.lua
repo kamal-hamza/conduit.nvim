@@ -573,7 +573,7 @@ function Agent:_display_terminal(sid, meta)
     if type(meta.terminal_exit) == "table" then
         local exit = meta.terminal_exit
         term:exited({
-            exitCode = type(exit.exit_code) == "number" and exit.exit_code or nil,
+            exitCode = type(exit.exit_code) == "number" and math.floor(exit.exit_code) or nil,
             signal = type(exit.signal) == "string" and exit.signal or nil,
         })
     end
