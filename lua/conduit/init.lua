@@ -370,6 +370,57 @@ function M.edit(line1, line2, instruction)
     M.inline(line1, line2, instruction, "edit")
 end
 
+---Focus the inline answer nearest the cursor (or the most recent one on screen).
+---Answers never take focus on their own; this is how you get into one.
+---@return boolean focused
+function M.answer()
+    return require("conduit.inline").focus()
+end
+
+---List the inline answers still around (shown or collapsed) and go to one.
+function M.answers()
+    local inline = require("conduit.inline")
+    local jobs = inline.list()
+    if #jobs == 0 then
+        return vim.notify("[conduit] no inline answers", vim.log.levels.INFO)
+    end
+    require("conduit.ui.picker_float").open({
+        title = "Answers",
+        items = vim.tbl_map(function(job)
+            local first = job:_range() or 0
+            local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(job.buf), ":~:.")
+            local request = job.history[1] and job.history[1].text:gsub("\n.*", "") or ""
+            return {
+                value = job,
+                label = request,
+                description = ("%s:%d"):format(name ~= "" and name or "[No Name]", first + 1),
+            }
+        end, jobs),
+        on_pick = function(item)
+            inline.reveal(item.value)
+        end,
+    })
+end
+
+---Browse the inline history: every inline answer and edit, separate from chat
+---threads. Opens on the current buffer's entries (or the project's when it has none).
+---@param opts? { scope?: "buffer"|"project", qf?: boolean } `qf` sends the entries to the quickfix list
+function M.history(opts)
+    opts = opts or {}
+    if opts.qf then
+        local entries = require("conduit.inline_history").load()
+        if opts.scope ~= "project" then
+            local file = vim.api.nvim_buf_get_name(0)
+            local mine = vim.tbl_filter(function(e)
+                return e.file == file
+            end, entries)
+            entries = #mine > 0 and mine or entries
+        end
+        return require("conduit.inline_history").to_qf(entries)
+    end
+    require("conduit.ui.history_float").open({ scope = opts.scope })
+end
+
 ---Open a chat on an existing session (e.g. an inline conversation).
 ---@param agent conduit.Agent
 ---@param session_id string

@@ -18,6 +18,66 @@ vim.api.nvim_create_autocmd("BufEnter", {
     end,
 })
 
+-- <Plug> mappings for every action, so any key can be bound to them. Counts
+-- apply to the cycling ones (`2<Plug>(conduit-effort-next)`).
+local plugs = {
+    ["conduit-toggle"] = function()
+        require("conduit").toggle()
+    end,
+    ["conduit-new"] = function()
+        require("conduit").new()
+    end,
+    ["conduit-threads"] = function()
+        require("conduit").threads()
+    end,
+    ["conduit-model"] = function()
+        require("conduit").option("model")
+    end,
+    ["conduit-effort"] = function()
+        require("conduit").option("effort")
+    end,
+    ["conduit-effort-next"] = function()
+        require("conduit").cycle_option("effort", vim.v.count1)
+    end,
+    ["conduit-effort-prev"] = function()
+        require("conduit").cycle_option("effort", -vim.v.count1)
+    end,
+    ["conduit-mode-next"] = function()
+        require("conduit").cycle_option("mode", vim.v.count1)
+    end,
+    ["conduit-options"] = function()
+        require("conduit").option()
+    end,
+    ["conduit-answer"] = function()
+        require("conduit").answer()
+    end,
+    ["conduit-answers"] = function()
+        require("conduit").answers()
+    end,
+    ["conduit-history"] = function()
+        require("conduit").history()
+    end,
+    ["conduit-cancel"] = function()
+        require("conduit").cancel()
+    end,
+}
+for name, fn in pairs(plugs) do
+    vim.keymap.set("n", ("<Plug>(%s)"):format(name), fn, { desc = "conduit: " .. name:gsub("^conduit%-", "") })
+end
+-- Inline requests on a visual selection (or the current line in normal mode).
+for name, mode in pairs({ ["conduit-inline"] = "auto", ["conduit-ask"] = "ask", ["conduit-edit"] = "edit" }) do
+    vim.keymap.set({ "n", "x" }, ("<Plug>(%s)"):format(name), function()
+        local line1, line2 = vim.fn.line("v"), vim.fn.line(".")
+        if line1 > line2 then
+            line1, line2 = line2, line1
+        end
+        if vim.fn.mode():match("^[vV\22]") then
+            vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+        end
+        require("conduit").inline(line1, line2, nil, mode)
+    end, { desc = "conduit: " .. mode .. " inline" })
+end
+
 local subcommands = {
     open = function(args)
         require("conduit").open(args[1])
@@ -107,6 +167,15 @@ local subcommands = {
     end,
     mode = function(args)
         require("conduit").option("mode", args[1])
+    end,
+    answer = function()
+        require("conduit").answer()
+    end,
+    answers = function()
+        require("conduit").answers()
+    end,
+    history = function(args)
+        require("conduit").history({ qf = args[1] == "qf", scope = args[1] == "all" and "project" or nil })
     end,
     log = function()
         vim.cmd.split(require("conduit.log").path)
@@ -235,6 +304,8 @@ end, {
             candidates = { "toggle" }
         elseif #words == 4 and words[2] == "review" and words[3] == "toggle" then
             candidates = { "chat", "inline" }
+        elseif #words == 3 and words[2] == "history" then
+            candidates = { "qf", "all" }
         elseif #words == 3 and (words[2] == "accept" or words[2] == "reject") then
             candidates = { "all" }
         elseif #words == 3 and words[2] == "option" then

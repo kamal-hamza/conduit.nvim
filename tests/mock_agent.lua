@@ -6,7 +6,7 @@
 -- "run") ask permission for a multi-line command. `run tools` sends tool calls
 -- with output, locations and diffs. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
--- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
+-- mode; "short…" gets a one-line answer). Prompts starting "follow:" get a follow-up answer. `title <text>`
 -- names the session with a `session_info_update`. Echoed turns end with a
 -- `usage_update` (4200 of 10000 tokens, 0.50 USD). `/review <args>` runs the
 -- review command (see COMMANDS, advertised after every session/new, load,
@@ -561,7 +561,9 @@ handlers["session/prompt"] = function(params)
         return run_command(sid, false)
     end
     if inline_request and code then
-        if text:find("You are answering", 1, true) or inline_request:match("^explain") then
+        if inline_request:match("^short") then
+            say(sid, "It adds one.")
+        elseif text:find("You are answering", 1, true) or inline_request:match("^explain") then
             say(sid, "This code **adds** things.\n\n```lua\n")
             say(sid, "return 42\n```\n")
         else

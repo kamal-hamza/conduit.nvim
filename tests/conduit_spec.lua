@@ -5,8 +5,9 @@ conduit.setup({
     agents = { mock = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua" } } },
     log_level = vim.log.levels.OFF,
 })
--- Keep the thread index out of the user's data directory.
+-- Keep the thread index and the inline history out of the user's directories.
 require("conduit.history").path = vim.fn.tempname() .. "/threads.json"
+require("conduit.inline_history").dir = vim.fn.tempname() .. "/inline"
 
 local function transcript(chat)
     return table.concat(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false), "\n")
@@ -350,7 +351,17 @@ test("inline: rewrites the selected lines", function()
     end, "inline edit")
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     assert(vim.deep_equal(lines, { "keep", "LOCAL A = 1", "LOCAL B = 2", "keep" }), vim.inspect(lines))
-    assert(#vim.api.nvim_buf_get_extmarks(0, -1, 0, -1, {}) == 0, "marks should be cleared")
+    assert(#vim.api.nvim_buf_get_extmarks(0, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {}) == 0)
+    -- The new lines flash briefly, without a window.
+    local flash = vim.api.nvim_buf_get_extmarks(
+        0,
+        vim.api.nvim_create_namespace("conduit.inline.flash"),
+        0,
+        -1,
+        { details = true }
+    )
+    assert(#flash == 1 and flash[1][2] == 1 and flash[1][4].end_row == 2, vim.inspect(flash))
+    assert(flash[1][4].line_hl_group == "ConduitInlineAdded")
     vim.cmd("bwipeout!")
 end)
 
@@ -642,7 +653,8 @@ local function wait_turn(job)
     end, "inline turn")
 end
 
-test("inline: auto mode answers questions in a float under the selection", function()
+test("inline: with answer = float, answers open in a focused float under the selection", function()
+    require("conduit.config").options.inline.answer = "float"
     local buf = inline_buf()
     local job = assert(conduit.inline(2, 3, "explain this"))
     wait_turn(job)
@@ -667,8 +679,9 @@ test("inline: auto mode answers questions in a float under the selection", funct
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     assert(vim.deep_equal(lines, { "keep", "return 42", "keep" }), vim.inspect(lines))
     assert(not job.answer:is_open())
-    assert(#vim.api.nvim_buf_get_extmarks(buf, -1, 0, -1, {}) == 0, "marks should be cleared")
+    assert(#vim.api.nvim_buf_get_extmarks(buf, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {}) == 0)
     assert(job.agent.sessions[job.session_id] == nil, "session should be released")
+    require("conduit.config").options.inline.answer = "peek"
     vim.cmd("bwipeout!")
 end)
 
@@ -836,7 +849,8 @@ test("inline: shows a spinner status and marks the range while running", functio
         return c[1]
     end, status.virt_lines[1]))
     assert(vim.startswith(line, "    "), "status is indented like the range: " .. line)
-    assert(line:find("mock", 1, true) and line:find(":Conduit cancel", 1, true), line)
+    -- Minimal: the spinner and the agent, nothing else.
+    assert(vim.trim(line):match("^%S+ mock$"), line)
 
     wait_for(function()
         return job.cleaned
@@ -860,15 +874,19 @@ test("api: every :Conduit subcommand resolves", function()
     vim.list_extend(fns, { "thread_delete", "thread_fork", "thread_rename", "thread_alternate", "thread_goto" })
     vim.list_extend(fns, { "thread_search", "resume", "status" })
     vim.list_extend(fns, { "review", "accept", "reject" })
+    vim.list_extend(fns, { "answer", "answers", "history", "cycle_option", "statusline" })
     for _, fn in ipairs(fns) do
         assert(type(conduit[fn]) == "function", "missing conduit." .. fn)
     end
     local complete = vim.fn.getcompletion("Conduit ", "cmdline")
     local subs =
         { "inline", "ask", "edit", "stop", "model", "effort", "mode", "threads", "thread", "continue", "resume" }
-    vim.list_extend(subs, { "commands", "review", "accept", "reject" })
+    vim.list_extend(subs, { "commands", "review", "accept", "reject", "answer", "answers", "history" })
     for _, sub in ipairs(subs) do
         assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
+    end
+    for _, plug in ipairs({ "model", "effort-next", "effort-prev", "mode-next", "answer", "history", "ask" }) do
+        assert(vim.fn.maparg(("<Plug>(conduit-%s)"):format(plug), "n") ~= "", "missing <Plug>(conduit-" .. plug .. ")")
     end
     local actions = vim.fn.getcompletion("Conduit thread ", "cmdline")
     for _, action in ipairs({ "new", "next", "prev", "alt", "goto", "search", "close", "delete", "fork", "rename" }) do
@@ -2236,7 +2254,7 @@ test("commands: inline commands are sent unwrapped with the selection, as an ans
     local job = assert(conduit.inline(2, 3, "/review naming"))
     wait_turn(job)
     assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
-    local text = assert(job.answer):text()
+    local text = job:_display()
     assert(text:find("ran review: naming (1 context)", 1, true), text)
     job:close()
 
@@ -3020,5 +3038,189 @@ test("inline: request options reach the inline session", function()
     assert(option and option.current == "high", vim.inspect(option))
     job.agent:set_option(assert(job.session_id), "effort", "low")
     job:close()
+    vim.cmd("bwipeout!")
+end)
+
+-- Inline answers that stay out of the way -------------------------------------------
+
+---A buffer with the usual range on lines 2-3 and room to move away from it.
+---@return integer buf
+local function long_buf()
+    local buf = inline_buf()
+    local lines = { "keep", "local a = 1", "local b = 2", "keep" }
+    for i = 5, 30 do
+        lines[i] = "-- filler " .. i
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    return buf
+end
+
+---@param buf integer
+---@return table[] extmarks of the inline namespace with details
+local function inline_marks(buf)
+    return vim.api.nvim_buf_get_extmarks(
+        buf,
+        vim.api.nvim_create_namespace("conduit.inline"),
+        0,
+        -1,
+        { details = true }
+    )
+end
+
+test("inline: answers peek in a float that never takes focus", function()
+    local buf = long_buf()
+    local code_win = vim.api.nvim_get_current_win()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
+    local model, peek = assert(job.model), assert(job.peek)
+    assert(model.phase == "peek" and peek:is_open(), model.phase)
+    local cfg = vim.api.nvim_win_get_config(assert(peek.win))
+    assert(cfg.relative == "win" and cfg.focusable == false, vim.inspect(cfg))
+    assert(cfg.border == nil or cfg.border == "none" or vim.deep_equal(cfg.border, { "", "", "", "", "", "", "", "" }))
+    assert(peek:text():find("This code **adds** things.", 1, true), peek:text())
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "buffer must not change")
+
+    -- :Conduit answer focuses it; <Esc> goes back and leaves it shown.
+    assert(conduit.answer())
+    assert(vim.api.nvim_get_current_win() == peek.win and model.phase == "focused")
+    press_here("<Esc>")
+    assert(vim.api.nvim_get_current_win() == code_win and model.phase == "peek", model.phase)
+
+    -- `a` (here through the model) applies the last code block.
+    model:apply()
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "return 42")
+    assert(not peek:is_open() and next(require("conduit.inline").answers) == nil)
+    assert(job.agent.sessions[job.session_id] == nil, "session released")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: answers collapse when the cursor leaves and come back when it returns", function()
+    local buf = long_buf()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    local model, peek = assert(job.model), assert(job.peek)
+    vim.api.nvim_win_set_cursor(0, { 20, 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+    assert(model.phase == "collapsed" and not peek:is_open(), model.phase)
+    local marker ---@type table?
+    for _, m in ipairs(inline_marks(buf)) do
+        if m[4].virt_text_pos == "eol" then
+            marker = m
+        end
+    end
+    assert(marker and marker[2] == 1 and marker[4].virt_text[1][1]:find("◆", 1, true), vim.inspect(marker))
+
+    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+    assert(model.phase == "peek" and peek:is_open(), model.phase)
+
+    -- Entering insert mode far from the range collapses it too.
+    vim.api.nvim_win_set_cursor(0, { 25, 0 })
+    vim.api.nvim_exec_autocmds("InsertEnter", { buffer = buf })
+    assert(model.phase == "collapsed", model.phase)
+
+    -- :Conduit answers lists it; picking it goes back and shows it.
+    conduit.answers()
+    assert(vim.bo.filetype == "conduit_picker")
+    vim.api.nvim_feedkeys("1", "x", false)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2 and model.phase == "peek", model.phase)
+    job:close()
+    assert(#inline_marks(buf) == 0, "marks cleared")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: short answers are virtual lines under the range, without a window", function()
+    local buf = long_buf()
+    local job = assert(conduit.inline(2, 3, "short answer please"))
+    wait_turn(job)
+    local model = assert(job.model)
+    assert(model.phase == "short" and not assert(job.peek):is_open(), model.phase)
+    local virt ---@type table?
+    for _, m in ipairs(inline_marks(buf)) do
+        if m[4].virt_lines and not m[4].virt_lines_above then
+            virt = m
+        end
+    end
+    assert(virt and virt[2] == 2, vim.inspect(inline_marks(buf)))
+    local text = table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, virt[4].virt_lines[1]))
+    assert(text:find("│ It adds one.", 1, true), text)
+    -- Focusing a short answer opens it in the float.
+    assert(conduit.answer())
+    assert(vim.api.nvim_get_current_win() == job.peek.win)
+    job:close()
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: with answer = chat, answers stream into the chat without moving focus", function()
+    require("conduit.config").options.inline.answer = "chat"
+    long_buf()
+    local code_win = vim.api.nvim_get_current_win()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_for(function()
+        return job.cleaned
+    end, "answer in the chat")
+    require("conduit.config").options.inline.answer = "peek"
+    local chat = assert(conduit.current)
+    assert(chat == job.chat and chat.session_id == job.session_id)
+    local text = transcript(chat)
+    assert(text:find("## You\n\nexplain this", 1, true) and text:find("This code **adds** things.", 1, true), text)
+    assert(not chat.busy, "the chat isn't busy once the turn ends")
+    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
+    reset_threads()
+    vim.cmd("bwipeout!")
+end)
+
+test("history: inline answers and edits are kept per project, separate from threads", function()
+    local inline_history = require("conduit.inline_history")
+    vim.fn.delete(inline_history.dir, "rf")
+    local buf = long_buf()
+    local path = vim.fn.tempname() .. ".lua"
+    vim.api.nvim_buf_set_name(buf, path)
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    job:close()
+    local edit = assert(conduit.inline(2, 3, "uppercase it"))
+    wait_for(function()
+        return edit.cleaned
+    end, "inline edit")
+
+    local entries = inline_history.load()
+    assert(#entries == 2, vim.inspect(entries))
+    local e, a = entries[1], entries[2]
+    assert(e.kind == "edit" and e.outcome == "applied" and e.file == path and e.line1 == 2, vim.inspect(e))
+    assert(vim.deep_equal(e.old, { "local a = 1", "local b = 2" }) and e.new[1] == "LOCAL A = 1", vim.inspect(e))
+    assert(a.kind == "answer" and a.prompt == "explain this" and a.text:find("adds", 1, true), vim.inspect(a))
+    assert(a.model and a.effort, "entries remember the model and effort")
+
+    -- The list: newest first; `u` reverts the edit; `dd` deletes an entry.
+    local view = require("conduit.ui.history_float").open()
+    local rows = vim.api.nvim_buf_get_lines(view.buf, 0, -1, false)
+    assert(
+        #rows == 2 and rows[1]:find("uppercase it", 1, true) and rows[2]:find("explain this", 1, true),
+        vim.inspect(rows)
+    )
+    view.model:run("revert")
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "edit reverted")
+    assert(vim.api.nvim_buf_get_lines(view.buf, 0, 1, false)[1]:find("reverted", 1, true))
+    view.model:next()
+    view.model:run("delete")
+    assert(#inline_history.load() == 1 and inline_history.load()[1].outcome == "reverted")
+    press_here("q")
+    assert(not vim.api.nvim_win_is_valid(view.win))
+
+    -- Another file's history isn't listed under "buffer" scope.
+    local model = require("conduit.ui.headless.history").new({ entries = inline_history.load(), file = "/elsewhere" })
+    assert(model.scope == "project", "falls back to the project when the buffer has none")
+    model:toggle_scope()
+    assert(model.scope == "buffer" and #model.filtered == 0)
+
+    conduit.history({ qf = true })
+    local qf = vim.fn.getqflist()
+    assert(#qf == 1 and qf[1].lnum == 2 and qf[1].text:find("uppercase it", 1, true), vim.inspect(qf))
+    vim.cmd("cclose")
     vim.cmd("bwipeout!")
 end)
