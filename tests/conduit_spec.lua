@@ -299,10 +299,11 @@ test("options: config options, defaults and set_option", function()
     end, "set_option")
     assert(assert(options.find(chat.agent:get_options(sid), "model")).current == "smart")
     chat:_refresh_winbar()
-    -- With the thread bar on, state and options sit in the prompt's winbar.
+    -- Options show as chips in the prompt's winbar; "ready" needs no chip.
     local _, iwin = chat:wins()
     local winbar = winbar_text(assert(iwin))
-    assert(winbar:find("mock · ready · SMART · LOW", 1, true), winbar)
+    assert(winbar:find("◆ SMART   ◐ LOW", 1, true), winbar)
+    assert(not winbar:find("ready", 1, true), winbar)
 end)
 
 test("options: legacy modes and models", function()
@@ -987,10 +988,10 @@ test("threads: titles come from the first prompt, then the agent", function()
     local twin = assert(chat:wins())
     assert(winbar_text(twin) == " 1 Refactor the parser ", winbar_text(twin))
 
-    -- Without the thread bar, the title and state share the chat's winbar.
+    -- Without the thread bar, the transcript's winbar shows the title and agent.
     require("conduit.config").options.ui.thread_bar = false
     chat:_refresh_winbar()
-    assert(winbar_text(twin):find("^ mock · Refactor the parser .* ready"), winbar_text(twin))
+    assert(winbar_text(twin) == " Refactor the parser%=mock ", winbar_text(twin))
     require("conduit.config").options.ui.thread_bar = true
     reset_threads()
 end)
@@ -2157,7 +2158,18 @@ test("commands: typing / at the start of the prompt completes agent commands", f
     assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
     assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
     assert(vim.api.nvim_get_current_win() == select(2, chat:wins()))
-    assert(chat.input and vim.wo.winbar:find("/ command", 1, true), vim.wo.winbar)
+    -- The empty input's placeholder mentions commands once the agent has some.
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
+    chat.mounts.placeholder:update()
+    local marks = vim.api.nvim_buf_get_extmarks(
+        chat.input,
+        vim.api.nvim_create_namespace("conduit.placeholder"),
+        0,
+        -1,
+        { details = true }
+    )
+    local hint = marks[1] and marks[1][4].virt_text[1][1] or ""
+    assert(hint:find("/ commands", 1, true), hint)
     vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
 end)
 
@@ -2753,4 +2765,260 @@ test("review: replayed tool calls aren't reviewed", function()
         locations = { { path = path } },
     })
     assert(next(review.files) == nil)
+end)
+
+-- UI components, headless models and the status model ---------------------------------
+
+---Run a normal-mode mapping of the current buffer in the current window (unlike
+---`press`, focus changes the mapping makes stick).
+---@param lhs string
+local function press_here(lhs)
+    vim.fn.maparg(lhs, "n", false, true).callback()
+end
+
+test("components: render overrides and mounts that redraw only on change", function()
+    local component = require("conduit.ui.component")
+    local ui = require("conduit.config").options.ui
+    local chip = component.render("Chip", { icon = "◆", label = "opus" })
+    assert(component.text(chip) == "◆ opus", component.text(chip))
+
+    -- Overrides get the props and the built-in; a failing one falls back to it.
+    ui.components = {
+        Chip = function(props, builtin)
+            return vim.list_extend({ { "[" } }, builtin(props))
+        end,
+    }
+    assert(component.text(component.render("Chip", { label = "x" })) == "[x")
+    ui.components = {
+        Chip = function()
+            error("boom")
+        end,
+    }
+    assert(component.text(component.render("Chip", { label = "x" })) == "x")
+    ui.components = {}
+
+    local draws, label = 0, "a"
+    local mount = component.mount(
+        {
+            draw = function()
+                draws = draws + 1
+            end,
+        },
+        "Chip",
+        function()
+            return { label = label }
+        end
+    )
+    mount:update()
+    assert(draws == 1, "unchanged output isn't redrawn: " .. draws)
+    label = "b"
+    mount:update()
+    assert(draws == 2, draws)
+    mount:unmount()
+end)
+
+test("surface: statusline escapes text, keeps raw spans and adds clicks with ui.mouse", function()
+    local surface = require("conduit.ui.surface")
+    local ui = require("conduit.config").options.ui
+    local s = surface.statusline({ { "50%", "ConduitMuted" }, { "%=", raw = true }, { "x" } })
+    assert(s == "%#ConduitMuted#50%%%*%=x", s)
+    local fn = function() end
+    assert(not surface.statusline({ { "m", click = fn } }):find("@", 1, true), "no clicks without ui.mouse")
+    ui.mouse = true
+    local clickable = surface.statusline({ { "m", click = fn } })
+    ui.mouse = false
+    assert(clickable:find("@ConduitClick@m%X", 1, true), clickable)
+end)
+
+test("status: usage_update shows context use in the chips and the statusline", function()
+    local chat = assert(conduit.new())
+    send(chat, "hello")
+    local info = require("conduit.ui.status").of_chat(chat)
+    assert(info.context and info.context.percent == 42, vim.inspect(info.context))
+    assert(info.model and info.effort and info.state == "ready", vim.inspect(info))
+    wait_for(function()
+        local _, iwin = chat:wins()
+        return iwin and winbar_text(iwin):find("ctx 42%%", 1, true)
+    end, "context chip")
+    local line = conduit.statusline()
+    assert(line:find(info.model, 1, true) and line:find("ctx 42%%", 1, true), line)
+    assert(line:find("0.50 USD", 1, true), line)
+    assert(not conduit.statusline({ context = false }):find("ctx", 1, true))
+    reset_threads()
+end)
+
+test("headless: picker filters, moves with counts and picks by number", function()
+    local picked ---@type any
+    local cancelled = false
+    local model = require("conduit.ui.headless.picker").new({
+        items = { { value = 1, label = "low" }, { value = 2, label = "medium" }, { value = 3, label = "high" } },
+        current = 2,
+        on_pick = function(item)
+            picked = item.value
+        end,
+        on_cancel = function()
+            cancelled = true
+        end,
+    })
+    assert(model.cursor == 2, "cursor starts on the current item")
+    model:next(2)
+    assert(model.cursor == 1, "moves wrap: " .. model.cursor)
+    model:filter("i")
+    assert(#model.filtered == 2 and model.filtered[1].label == "medium", vim.inspect(model.filtered))
+    model:pick(2)
+    assert(picked == 3, tostring(picked))
+    model:cancel()
+    assert(not cancelled, "a finished picker can't be cancelled")
+end)
+
+test("headless: options step through values both ways", function()
+    local step = require("conduit.ui.headless.options").step
+    local option = {
+        id = "effort",
+        name = "effort",
+        current = "low",
+        choices = {
+            { value = "low", name = "low" },
+            { value = "mid", name = "mid" },
+            { value = "high", name = "high" },
+        },
+    }
+    assert(step(option, 1) == "mid" and step(option, 2) == "high" and step(option, -1) == "high")
+    option.current = "unknown"
+    assert(step(option, 1) == "low" and step(option, -1) == "high")
+end)
+
+test("chat: keys cycle effort and open a keyboard picker for the model", function()
+    local chat = assert(conduit.new())
+    send(chat, "hi")
+    -- The mock's option values outlive sessions; start from a known model.
+    local set = false
+    chat.agent:set_option(assert(chat.session_id), "model", "fast", function()
+        set = true
+    end)
+    wait_for(function()
+        return set
+    end, "model reset")
+    local options = require("conduit.options")
+    local function effort()
+        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "effort")).current
+    end
+    local before = effort()
+    press(chat.input, "<M-e>")
+    wait_for(function()
+        return effort() ~= before
+    end, "effort to change")
+    press(chat.input, "<M-E>")
+    wait_for(function()
+        return effort() == before
+    end, "effort to go back")
+
+    -- <M-m> opens the picker on the model; `2` picks the second choice.
+    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
+    press_here("<M-m>")
+    local win = vim.api.nvim_get_current_win()
+    assert(vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "conduit_picker", "picker should be focused")
+    local rows = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    assert(rows[1]:find("1 ● FAST", 1, true) and rows[2]:find("2   SMART", 1, true), vim.inspect(rows))
+    vim.api.nvim_feedkeys("2", "x", false)
+    wait_for(function()
+        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "model")).current == "smart"
+    end, "model to change")
+    assert(not vim.api.nvim_win_is_valid(win), "picker closes")
+    assert(vim.api.nvim_get_current_buf() == chat.input, "focus goes back to the input")
+    chat.agent:set_option(assert(chat.session_id), "model", "fast")
+    chat.agent:set_option(assert(chat.session_id), "effort", before)
+    reset_threads()
+end)
+
+test("help: g? lists the chat's keys in a filterable float", function()
+    local chat = assert(conduit.new())
+    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
+    press_here("g?")
+    local help = require("conduit.ui.help_float").current
+    assert(help and vim.api.nvim_get_current_win() == help.win, "help float is focused")
+    local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false), "\n")
+    assert(text:find("<M-e>", 1, true) and text:find("next effort level", 1, true), text)
+    help.model:filter("thread")
+    local filtered = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false)
+    for i = 2, #filtered do
+        assert(filtered[i]:find("thread", 1, true), vim.inspect(filtered))
+    end
+    help.model:close()
+    assert(not vim.api.nvim_win_is_valid(help.win))
+    reset_threads()
+end)
+
+test("prompt: title shows the request's model and effort; <C-o> changes them for it", function()
+    vim.cmd.enew()
+    local code_win = vim.api.nvim_get_current_win()
+    local submitted ---@type table?
+    local list = {
+        {
+            id = "model",
+            name = "model",
+            category = "model",
+            current = "fast",
+            choices = { { value = "fast", name = "FAST" }, { value = "smart", name = "SMART" } },
+        },
+        {
+            id = "effort",
+            name = "effort",
+            category = "thought_level",
+            current = "low",
+            choices = { { value = "low", name = "LOW" }, { value = "high", name = "HIGH" } },
+        },
+    }
+    local _, win = require("conduit.ui.prompt").open({
+        title = "init.lua:1",
+        agent = "mock",
+        mode = "auto",
+        anchor = { win = code_win, first = 0, last = 0 },
+        options = function()
+            return list
+        end,
+        on_submit = function(text, _, overrides)
+            submitted = { text = text, overrides = overrides }
+        end,
+    })
+    vim.cmd.stopinsert()
+    assert(chunks_text(win, "title"):find("FAST/LOW", 1, true), chunks_text(win, "title"))
+
+    -- <C-o>: pick "effort" (row 2), then "HIGH" (row 2).
+    press_here("<C-o>")
+    vim.api.nvim_feedkeys("2", "x", false)
+    wait_for(function()
+        return vim.bo.filetype == "conduit_picker"
+            and vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:find("LOW", 1, true)
+    end, "value picker")
+    vim.api.nvim_feedkeys("2", "x", false)
+    assert(vim.api.nvim_get_current_win() == win, "focus returns to the prompt")
+    assert(chunks_text(win, "title"):find("FAST/HIGH", 1, true), chunks_text(win, "title"))
+    assert(list[2].current == "low", "the agent's options are untouched")
+
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "explain" })
+    press_here("<CR>")
+    wait_for(function()
+        return submitted
+    end, "submit")
+    assert(submitted and submitted.overrides and submitted.overrides.effort == "high", vim.inspect(submitted))
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: request options reach the inline session", function()
+    local buf = inline_buf()
+    local job = require("conduit.inline").run({
+        agent = assert(conduit.agent()),
+        buf = buf,
+        line1 = 2,
+        line2 = 3,
+        instruction = "explain this",
+        options = { effort = "high" },
+    })
+    wait_turn(job)
+    local option = require("conduit.options").find(job.agent:get_options(assert(job.session_id)), "effort")
+    assert(option and option.current == "high", vim.inspect(option))
+    job.agent:set_option(assert(job.session_id), "effort", "low")
+    job:close()
+    vim.cmd("bwipeout!")
 end)

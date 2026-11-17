@@ -46,6 +46,8 @@ local NOT_FOUND = -32002
 ---@field options table<string, conduit.Option[]> Session options by session id
 ---@field commands table<string, conduit.Command[]> Slash commands by session id
 ---@field last_commands conduit.Command[] Most recent command list from any session
+---@field last_options conduit.Option[] Most recent options of any session (for prompts opened before a session)
+---@field usage table<string, conduit.Usage> Context use by session id (`usage_update`)
 ---@field terminals table<string, conduit.Terminal> Terminals by id: commands run for the agent and
 ---display terminals it reports, kept (with their output) until their session closes
 ---@field terminal_count integer
@@ -74,6 +76,8 @@ function Agent.new(name, spec)
         options = {},
         commands = {},
         last_commands = {},
+        last_options = {},
+        usage = {},
         waiting = {},
         terminals = {},
         terminal_count = 0,
@@ -214,7 +218,7 @@ function Agent:_open_session(method, params, handler, cb, defaults)
                 return cb(method .. " returned no session id")
             end
             self.sessions[sid] = handler
-            self.options[sid] = options.from_session(result)
+            self:_set_options(sid, options.from_session(result))
             if not defaults then
                 return cb(nil, sid, result)
             end
@@ -308,6 +312,7 @@ function Agent:close_session(sid, cb)
         end
     self.sessions[sid] = nil
     self.options[sid] = nil
+    self.usage[sid] = nil
     self.commands[sid] = nil
     self:_release_terminals(sid)
     if not self.rpc or not self:supports("close") then
@@ -392,6 +397,16 @@ function Agent:get_commands(sid)
 end
 
 ---@param sid string
+---@param opts conduit.Option[]
+function Agent:_set_options(sid, opts)
+    self.options[sid] = opts
+    if #opts > 0 then
+        self.last_options = opts
+    end
+    require("conduit.ui.status").emit()
+end
+
+---@param sid string
 ---@return conduit.Option[]
 function Agent:get_options(sid)
     return self.options[sid] or {}
@@ -424,9 +439,10 @@ function Agent:set_option(sid, id, value, cb)
             return cb(errmsg(err))
         end
         if result and result.configOptions then
-            self.options[sid] = options.from_config_options(result.configOptions)
+            self:_set_options(sid, options.from_config_options(result.configOptions))
         else
             option.current = value
+            require("conduit.ui.status").emit()
         end
         cb(nil)
     end)
@@ -601,7 +617,13 @@ function Agent:_on_notification(method, params)
     if method == "session/update" then
         local sid, update = params.sessionId, params.update
         if update.sessionUpdate == "config_option_update" then
-            self.options[sid] = options.from_config_options(update.configOptions or {})
+            self:_set_options(sid, options.from_config_options(update.configOptions or {}))
+        elseif update.sessionUpdate == "usage_update" then
+            local usage = require("conduit.ui.status").parse_usage(update)
+            if usage then
+                self.usage[sid] = usage
+                require("conduit.ui.status").emit()
+            end
         elseif update.sessionUpdate == "available_commands_update" then
             local list = type(update.availableCommands) == "table" and update.availableCommands or {}
             self.commands[sid] = list
@@ -610,6 +632,7 @@ function Agent:_on_notification(method, params)
             local mode = options.find(self:get_options(sid), "mode")
             if mode then
                 mode.current = update.currentModeId
+                require("conduit.ui.status").emit()
             end
         end
         if type(update._meta) == "table" then
@@ -634,6 +657,7 @@ function Agent:_on_exit(code)
     local sessions = self.sessions
     self.sessions = {}
     self.options = {}
+    self.usage = {}
     self.commands = {}
     for _, term in pairs(self.terminals) do
         term:release()

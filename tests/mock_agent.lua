@@ -7,7 +7,8 @@
 -- with output, locations and diffs. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
 -- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
--- names the session with a `session_info_update`. `/review <args>` runs the
+-- names the session with a `session_info_update`. Echoed turns end with a
+-- `usage_update` (4200 of 10000 tokens, 0.50 USD). `/review <args>` runs the
 -- review command (see COMMANDS, advertised after every session/new, load,
 -- resume and fork). Anything else is echoed back.
 --
@@ -696,6 +697,11 @@ handlers["session/prompt"] = function(params)
                 say(sid, ("\n%s %s %d"):format(b.type, name, b.resource and #b.resource.text or 0))
             end
         end
+        -- Context use after the turn (ACP usage_update): 42% of a 10k window.
+        update(
+            sid,
+            { sessionUpdate = "usage_update", used = 4200, size = 10000, cost = { amount = 0.5, currency = "USD" } }
+        )
         return { stopReason = "end_turn" }
     end
 

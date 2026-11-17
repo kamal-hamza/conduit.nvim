@@ -272,6 +272,40 @@ function M.option(key, value)
     end
 end
 
+---Move session option `key` of the current chat `count` steps through its
+---values (negative goes back), e.g. `M.cycle_option("effort", 1)`.
+---@param key string Option id or category (`effort`, `mode`, ...)
+---@param count? integer Defaults to 1
+function M.cycle_option(key, count)
+    local chat = threads.current or M.new()
+    if chat then
+        chat:cycle_option(key, count or 1)
+    end
+end
+
+---The current chat's status chips as a statusline string (model, effort, mode,
+---context use), for lualine and friends: `lualine_x = { require("conduit").statusline }`.
+---Refresh on the `User ConduitStatus` autocmd. Empty without a chat.
+---@param opts? { context?: boolean, agent?: boolean } Show context use (default true) and the agent name
+---@return string
+function M.statusline(opts)
+    opts = opts or {}
+    local chat = threads.current
+    if not chat then
+        return ""
+    end
+    local component = require("conduit.ui.component")
+    local info = require("conduit.ui.status").of_chat(chat)
+    if opts.context == false then
+        info.context = nil
+    end
+    local spans = vim.tbl_filter(function(span)
+        -- A statusline component shouldn't split the bar with `%=`.
+        return not span.raw
+    end, component.render("ChipBar", { status = info, agent = opts.agent }))
+    return vim.trim(require("conduit.ui.surface").statusline(spans))
+end
+
 ---Make an inline request about lines `line1`..`line2` of the current buffer:
 ---the agent rewrites them in place or answers in a float under them.
 ---@param line1 integer
@@ -281,7 +315,7 @@ end
 ---@return conduit.InlineJob? job When `instruction` is given
 function M.inline(line1, line2, instruction, mode)
     local buf, win = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
-    local function run(text, chosen)
+    local function run(text, chosen, overrides)
         local agent = M.agent(config.options.inline.agent)
         if agent then
             return require("conduit.inline").run({
@@ -292,6 +326,7 @@ function M.inline(line1, line2, instruction, mode)
                 line2 = line2,
                 instruction = text,
                 mode = chosen or mode,
+                options = overrides,
             })
         end
     end
@@ -309,6 +344,9 @@ function M.inline(line1, line2, instruction, mode)
             -- No session yet: the agent's last known list, if it has run.
             local agent = M.agents[agent_name]
             return agent and agent:get_commands() or {}
+        end,
+        options = function()
+            return require("conduit.inline").request_options(M.agents[agent_name])
         end,
         mode = mode or "auto",
         anchor = { win = win, first = line1 - 1, last = line2 - 1 },

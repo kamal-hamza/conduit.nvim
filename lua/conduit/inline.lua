@@ -403,6 +403,27 @@ function Job:to_chat()
     chat:open()
 end
 
+---The options an inline request on `agent` would start with: the agent's last
+---known options with its defaults and `inline.options` applied. Empty before the
+---agent has opened a session.
+---@param agent? conduit.Agent
+---@return conduit.Option[]
+function M.request_options(agent)
+    if not agent then
+        return {}
+    end
+    local options = require("conduit.options")
+    local list = vim.deepcopy(agent.last_options)
+    local defaults = vim.tbl_extend("force", agent.spec.options or {}, config.options.inline.options)
+    for key, value in pairs(defaults) do
+        local option = options.find(list, key)
+        if option then
+            option.current = value
+        end
+    end
+    return list
+end
+
 ---@class conduit.InlineOpts
 ---@field agent conduit.Agent
 ---@field buf integer
@@ -411,6 +432,7 @@ end
 ---@field line2 integer 1-based, inclusive
 ---@field instruction string
 ---@field mode? conduit.InlineMode Defaults to "auto"
+---@field options? table<string, string> Session options for this request, over `inline.options`
 
 ---@param opts conduit.InlineOpts
 ---@return conduit.InlineJob
@@ -488,18 +510,26 @@ function M.run(opts)
         if err or self.cancelled then
             return fail(err)
         end
-        self.agent:new_session(vim.fn.getcwd(), self, function(serr, sid)
-            self.session_id = sid
-            if sid and config.options.threads.hide_inline then
-                -- Agents list every session; keep inline requests out of thread lists.
-                require("conduit.history").hide(self.agent.name, sid)
-            end
-            if serr or self.cancelled then
-                return fail(serr)
-            end
-            self:_status("thinking…")
-            self:_send(prompt, opts.instruction, extra)
-        end, config.options.inline.options, { mcp = config.options.inline.mcp_servers })
+        self.agent:new_session(
+            vim.fn.getcwd(),
+            self,
+            function(serr, sid)
+                self.session_id = sid
+                if sid and config.options.threads.hide_inline then
+                    -- Agents list every session; keep inline requests out of thread lists.
+                    require("conduit.history").hide(self.agent.name, sid)
+                end
+                if serr or self.cancelled then
+                    return fail(serr)
+                end
+                self:_status("thinking…")
+                self:_send(prompt, opts.instruction, extra)
+            end,
+            vim.tbl_extend("force", config.options.inline.options, opts.options or {}),
+            {
+                mcp = config.options.inline.mcp_servers,
+            }
+        )
     end)
     return self
 end

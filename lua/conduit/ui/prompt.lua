@@ -27,7 +27,9 @@ local MAX_HEIGHT = 8
 ---@field mode? conduit.InlineMode Initial mode; omit for a prompt without modes
 ---@field anchor? conduit.PromptAnchor Range to open next to; defaults to the cursor
 ---@field commands? fun(): conduit.Command[] Agent commands to complete after a leading `/`
----@field on_submit fun(text: string, mode?: conduit.InlineMode)
+---@field options? fun(): conduit.Option[] Session options the request will use (shown in the
+---title; `<C-o>` changes them for this request)
+---@field on_submit fun(text: string, mode?: conduit.InlineMode, overrides?: table<string, string>)
 
 ---Accept the open completion item, if any.
 ---@return boolean accepted
@@ -123,18 +125,41 @@ function M.open(opts)
         return select(2, M.parse_prefix(first, mode))
     end
 
+    -- Option values picked with <C-o> for this request, by option id.
+    local overrides = {} ---@type table<string, string>
+
+    ---The request's options, with this prompt's overrides applied.
+    ---@return conduit.Option[]
+    local function request_options()
+        local out = {}
+        for _, o in ipairs(opts.options and opts.options() or {}) do
+            local copy = vim.deepcopy(o)
+            if overrides[o.id] then
+                copy.current = overrides[o.id]
+            end
+            table.insert(out, copy)
+        end
+        return out
+    end
+
     ---@return conduit.Chunks
     local function title()
-        local chunks = {} ---@type conduit.Chunks
-        if opts.agent then
-            table.insert(chunks, hl.agent(opts.agent))
+        local options = require("conduit.options")
+        local list = request_options()
+        local function value(key)
+            local option = options.find(list, key)
+            return option and option.current and options.current_name(option) or nil
         end
         local shown = effective_mode()
-        if shown then
-            table.insert(chunks, { (" %s "):format(mode_names[shown]), mode_hl[shown] })
-        end
-        table.insert(chunks, { (" %s "):format(opts.title), "ConduitContext" })
-        return chunks
+        local spans = require("conduit.ui.component").render("PromptTitle", {
+            agent = opts.agent,
+            mode = shown and mode_names[shown],
+            mode_hl = shown and mode_hl[shown],
+            model = value("model"),
+            effort = value("thought_level"),
+            range = opts.title,
+        })
+        return require("conduit.ui.surface").chunks(spans)
     end
 
     local help = { { "<CR>", "send (accepts a completion first)" }, { "<S-CR>", "new line" } }
@@ -144,6 +169,9 @@ function M.open(opts)
             { "?", "at the start: ask, answer in a float" },
             { "!", "at the start: edit, rewrite the lines" },
         })
+    end
+    if opts.options then
+        table.insert(help, { "<C-o>", "change model, effort, ... for this request" })
     end
     vim.list_extend(help, {
         { "@", "attach a file, @buffer, @selection, @diagnostics, ..." },
@@ -161,6 +189,9 @@ function M.open(opts)
         local hints = { { "<CR>", "send" } }
         if mode then
             table.insert(hints, { "<C-t>", "mode" })
+        end
+        if opts.options then
+            table.insert(hints, { "<C-o>", "options" })
         end
         if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
             table.insert(hints, { "<C-c>", "cancel" })
@@ -223,7 +254,7 @@ function M.open(opts)
         if final ~= "" then
             -- Leave the float before acting, so edits land in the original window.
             vim.schedule(function()
-                opts.on_submit(final, final_mode)
+                opts.on_submit(final, final_mode, next(overrides) and overrides or nil)
             end)
         end
     end
@@ -253,8 +284,32 @@ function M.open(opts)
     end
     map("n", "<Esc>", close, "close")
     map("n", "q", close, "close")
+    if opts.options then
+        map({ "i", "n" }, "<C-o>", function()
+            if #request_options() == 0 then
+                return vim.notify(
+                    "[conduit] the agent's options are known after its first session",
+                    vim.log.levels.INFO
+                )
+            end
+            local insert = vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
+            vim.cmd.stopinsert()
+            require("conduit.ui.headless.options")
+                .new(request_options, function(option, value)
+                    overrides[option.id] = value
+                    if vim.api.nvim_win_is_valid(win) then
+                        vim.api.nvim_win_set_config(win, { title = title(), title_pos = "left" })
+                        vim.api.nvim_set_current_win(win)
+                        if insert then
+                            vim.cmd.startinsert({ bang = true })
+                        end
+                    end
+                end)
+                :open_picker()
+        end, "request options")
+    end
     map("n", "g?", function()
-        hl.echo_keys("conduit prompt", help)
+        require("conduit.ui.help_float").open("conduit prompt", help)
     end, "show keys")
     map("i", "<C-c>", function()
         vim.cmd.stopinsert()
@@ -270,7 +325,19 @@ function M.open(opts)
             end
         end,
     })
-    vim.api.nvim_create_autocmd("WinLeave", { buffer = buf, once = true, callback = close })
+    vim.api.nvim_create_autocmd("WinLeave", {
+        buffer = buf,
+        callback = function()
+            -- Going to another window closes the prompt; its own floats (the
+            -- option picker, the key list) don't.
+            vim.schedule(function()
+                local cur = vim.api.nvim_get_current_win()
+                if cur ~= win and vim.api.nvim_win_get_config(cur).relative == "" then
+                    close()
+                end
+            end)
+        end,
+    })
 
     refresh()
     vim.cmd.startinsert()

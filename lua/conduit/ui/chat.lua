@@ -1,11 +1,12 @@
 --- A chat: one ACP session rendered as a markdown transcript plus an input buffer.
+local component = require("conduit.ui.component")
 local config = require("conduit.config")
-local options = require("conduit.options")
+local status = require("conduit.ui.status")
+local surface = require("conduit.ui.surface")
 local tool_ui = require("conduit.ui.tool")
 
 local ns = vim.api.nvim_create_namespace("conduit")
-
-local KEYS_HINT = "<CR> send · @ file · <C-c> cancel · go options · gs threads · g<Tab> alternate · q close"
+local placeholder_ns = vim.api.nvim_create_namespace("conduit.placeholder")
 
 local plan_icons = {
     pending = "[ ]",
@@ -34,6 +35,10 @@ local plan_icons = {
 ---@field unread? boolean Finished a turn while you weren't looking at it
 ---@field waiting? boolean A permission request is waiting for an answer
 ---@field following table<conduit.ChatTool, conduit.Terminal> Terminals whose output tool calls show live
+---@field spinner conduit.Spinner Animates the state chip while busy
+---@field opts_model conduit.OptionsModel Headless session options (model, effort, mode)
+---@field actions table<string, fun()> Chip click handlers (with `ui.mouse`)
+---@field mounts { chips: conduit.Mount, placeholder: conduit.Mount }
 local Chat = {}
 Chat.__index = Chat
 
@@ -82,8 +87,117 @@ function Chat.new(agent)
             return self.agent:get_commands(self.session_id)
         end,
     })
+    self.opts_model = require("conduit.ui.headless.options").new(function()
+        return self.session_id and self.agent:get_options(self.session_id) or {}
+    end, function(option, value)
+        self:_apply_option(option, value)
+    end)
+    self.actions = {
+        model = function()
+            self:pick_option("model")
+        end,
+        effort = function()
+            self:pick_option("effort")
+        end,
+        mode = function()
+            self:pick_option("mode")
+        end,
+    }
+    self.spinner = require("conduit.ui.spinner").new(function()
+        self.mounts.chips:update()
+    end)
+    self.mounts = {
+        chips = component.mount(
+            surface.winbar(function()
+                return select(2, self:wins())
+            end),
+            "ChipBar",
+            function()
+                return { status = status.of_chat(self), actions = self.actions }
+            end
+        ),
+        placeholder = component.mount(
+            surface.extmark(self.input, placeholder_ns, function()
+                return 0, 0
+            end, { virt_text_pos = "overlay" }),
+            "Placeholder",
+            function()
+                local lines = vim.api.nvim_buf_get_lines(self.input, 0, -1, false)
+                if #lines > 1 or (lines[1] or "") ~= "" then
+                    return nil
+                end
+                return { hints = self:_hints() }
+            end
+        ),
+    }
+    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
+        buffer = self.input,
+        callback = function()
+            self.mounts.placeholder:update()
+        end,
+    })
     self:_keymaps()
     return self
+end
+
+---Hints for the empty input.
+---@return string[]
+function Chat:_hints()
+    local hints = { "Ask anything", "@ context" }
+    if #self.agent:get_commands(self.session_id) > 0 then
+        table.insert(hints, "/ commands")
+    end
+    local help = config.options.ui.keys.help
+    if help then
+        table.insert(hints, help .. " keys")
+    end
+    return hints
+end
+
+---Keys of the chat, for `g?`.
+---@return [string, string][]
+function Chat:_help()
+    local k = config.options.ui.keys
+    local rk = config.options.review.keys or {}
+    local out = {
+        { "<CR>", "send (normal mode)" },
+        { "<C-s>", "send (insert mode)" },
+        { "<C-c>", "cancel the turn" },
+        { "@", "attach a file, @buffer, @selection, @diagnostics, ..." },
+        { "/", "at the start: run an agent command" },
+    }
+    local optional = {
+        { k.model, "pick the model" },
+        { k.effort_next, "next effort level (takes a count)" },
+        { k.effort_prev, "previous effort level (takes a count)" },
+        { k.mode_next, "next mode (takes a count)" },
+        { k.options, "pick any session option" },
+    }
+    for _, o in ipairs(optional) do
+        if o[1] then
+            table.insert(out, o)
+        end
+    end
+    vim.list_extend(out, {
+        { "gs", "pick a thread" },
+        { "gn", "new thread" },
+        { "]t, [t", "next / previous thread" },
+        { "g<Tab>", "alternate thread" },
+        { "<CR>", "transcript: expand or collapse a tool call or thinking" },
+        { "gd", "transcript: the tool call's diff" },
+        { "gf", "transcript: the file the tool call touched" },
+    })
+    if rk.accept_file then
+        table.insert(out, { rk.accept_file, "transcript: accept the tool call's changes" })
+    end
+    if rk.reject_file then
+        table.insert(out, { rk.reject_file, "transcript: reject the tool call's changes" })
+    end
+    table.insert(out, { "q", "close the chat" })
+    if k.help then
+        table.insert(out, { k.help, "this list (/ filters)" })
+    end
+    return out
 end
 
 function Chat:_keymaps()
@@ -131,9 +245,6 @@ function Chat:_keymaps()
         vim.keymap.set("n", "q", function()
             self:close()
         end, { buffer = buf, desc = "Close chat" })
-        vim.keymap.set("n", "go", function()
-            self:pick_option()
-        end, { buffer = buf, desc = "Session options (model, effort, mode)" })
         vim.keymap.set("n", "gs", function()
             require("conduit.threads").pick()
         end, { buffer = buf, desc = "Pick a thread" })
@@ -149,6 +260,70 @@ function Chat:_keymaps()
         vim.keymap.set("n", "g<Tab>", function()
             require("conduit.threads").alternate()
         end, { buffer = buf, desc = "Alternate thread" })
+    end
+    self:_option_keymaps()
+end
+
+---Keys for options and help (`ui.keys`), in both buffers.
+function Chat:_option_keymaps()
+    local k = config.options.ui.keys
+    ---@type [string|false, string|string[], fun(), string][]
+    local maps = {
+        {
+            k.model,
+            { "n", "i" },
+            function()
+                self:pick_option("model")
+            end,
+            "Pick the model",
+        },
+        {
+            k.effort_next,
+            { "n", "i" },
+            function()
+                self:cycle_option("effort", vim.v.count1)
+            end,
+            "Next effort level",
+        },
+        {
+            k.effort_prev,
+            { "n", "i" },
+            function()
+                self:cycle_option("effort", -vim.v.count1)
+            end,
+            "Previous effort level",
+        },
+        {
+            k.mode_next,
+            "n",
+            function()
+                self:cycle_option("mode", vim.v.count1)
+            end,
+            "Next mode",
+        },
+        {
+            k.options,
+            "n",
+            function()
+                self:pick_option()
+            end,
+            "Session options (model, effort, mode)",
+        },
+        {
+            k.help,
+            "n",
+            function()
+                require("conduit.ui.help_float").open("conduit chat", self:_help())
+            end,
+            "Show keys",
+        },
+    }
+    for _, m in ipairs(maps) do
+        if m[1] then
+            for _, buf in ipairs({ self.input, self.transcript }) do
+                vim.keymap.set(m[2], m[1], m[3], { buffer = buf, desc = m[4] })
+            end
+        end
     end
 end
 
@@ -234,52 +409,34 @@ function Chat:toggle()
 end
 
 function Chat:_refresh_winbar()
-    local twin, iwin = self:wins()
-    local state = self.loading and "loading…"
-        or self.busy and "working…"
-        or self.session_id and "ready"
-        or self.resume_id and "disconnected"
-        or "not started"
-    local parts = { state }
-    local opts = self.session_id and self.agent:get_options(self.session_id) or {}
-    for _, key in ipairs({ "model", "thought_level", "mode" }) do
-        local option = options.find(opts, key)
-        if option then
-            table.insert(parts, options.current_name(option))
-        end
-    end
-    local function escape(s)
-        return (s:gsub("%%", "%%%%"))
-    end
+    local twin = self:wins()
     local threads = require("conduit.threads")
-    local status = escape(table.concat(parts, " · "))
-    -- The thread bar takes the whole transcript winbar, so state and options move
-    -- to the prompt's.
-    local bar = config.options.ui.thread_bar and threads.index(self) ~= nil
+    -- The thread bar takes the transcript's winbar; status chips are always in
+    -- the input's.
     if twin then
-        if bar then
+        if config.options.ui.thread_bar and threads.index(self) ~= nil then
             vim.wo[twin].winbar = threads.bar(self, vim.api.nvim_win_get_width(twin) - 1)
         else
-            local title = ("%s · %s"):format(self.agent.name, self:display_title())
-            local i, n = threads.index(self), #threads.list
-            if i and n > 1 then
-                title = ("%s (%d/%d)"):format(title, i, n)
-            end
-            vim.wo[twin].winbar = ("%%#Title# %s %%*%%= %s "):format(escape(title), status)
+            vim.wo[twin].winbar = surface.statusline(component.render("TitleBar", {
+                agent = self.agent.name,
+                title = self:display_title(),
+                index = threads.index(self),
+                count = #threads.list,
+            }))
         end
     end
-    if iwin then
-        local left = bar and escape(self.agent.name) .. " · " .. status or "prompt"
-        local keys = KEYS_HINT
-        if #self.agent:get_commands(self.session_id) > 0 then
-            keys = keys:gsub("@ file · ", "@ file · / command · ", 1)
-        end
-        vim.wo[iwin].winbar = (" %s %%= %s "):format(left, keys)
-    end
+    self.mounts.chips:update(true)
+    self.mounts.placeholder:update()
 end
 
 function Chat:_set_busy(busy)
     self.busy = busy
+    if busy then
+        self.spinner:start()
+    else
+        self.spinner:stop()
+    end
+    status.emit()
     require("conduit.threads").changed(self)
 end
 
@@ -962,6 +1119,30 @@ function Chat:adopt(session_id, history)
     self:_refresh_winbar()
 end
 
+---Set an option on this chat's session, then redraw. With `ui.remember_options`
+---the value also becomes the default for new threads.
+---@param option conduit.Option
+---@param value string
+function Chat:_apply_option(option, value)
+    local sid = self.session_id
+    if not sid then
+        return
+    end
+    self.agent:set_option(sid, option.id, value, function(err)
+        if err then
+            return vim.notify("[conduit] " .. err, vim.log.levels.ERROR)
+        end
+        if config.options.ui.remember_options then
+            local spec = config.options.agents[self.agent.name]
+            if spec then
+                spec.options = spec.options or {}
+                spec.options[option.category or option.id] = value
+            end
+        end
+        self:_refresh_winbar()
+    end)
+end
+
 ---Pick a session option (model, effort, mode, ...) and apply it.
 ---@param key? string Option id or category; prompts for one when omitted
 ---@param value? string Value to set; prompts for one when omitted
@@ -970,21 +1151,25 @@ function Chat:pick_option(key, value)
         if err then
             return self:_notice("error: " .. err)
         end
-        local sid = assert(self.session_id)
-        local function apply(option, v)
-            self.agent:set_option(sid, option.id, v, function(serr)
-                if serr then
-                    return vim.notify("[conduit] " .. serr, vim.log.levels.ERROR)
-                end
-                self:_refresh_winbar()
-            end)
+        if key and value then
+            if not self.opts_model:set(key, value) then
+                vim.notify(("[conduit] the agent has no %s option"):format(key), vim.log.levels.WARN)
+            end
+            return
         end
-        local opts = self.agent:get_options(sid)
-        local option = key and options.find(opts, key)
-        if option and value then
-            return apply(option, value)
+        self.opts_model:open_picker(key)
+    end)
+end
+
+---Move option `key` `count` steps through its values (negative goes back).
+---@param key string Option id or category, e.g. "effort" or "mode"
+---@param count? integer
+function Chat:cycle_option(key, count)
+    self:ensure_session(function(err)
+        if err then
+            return self:_notice("error: " .. err)
         end
-        options.pick(opts, key, apply)
+        self.opts_model:cycle(key, count or 1)
     end)
 end
 
@@ -1072,6 +1257,9 @@ function Chat:add_context(lines)
 end
 
 function Chat:destroy()
+    self.spinner:stop()
+    self.mounts.chips:unmount()
+    self.mounts.placeholder:unmount()
     self:_unfollow()
     self:cancel()
     self:close()
