@@ -33,13 +33,27 @@ See https://agentclientprotocol.com for the protocol.
     ui = {
       width = 0.4,
       input_height = 6,
-      icons = false,
+      icons = true,
       spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
-      inline = { width = { min = 40, max = 84 } },
+      inline = { width = { min = 40, max = 84 }, max_height = 10 },
       picker = "auto",
       thread_bar = true,
+      keys = {
+        model = "<M-m>", effort_next = "<M-e>", effort_prev = "<M-E>",
+        mode_next = "<S-Tab>", options = "go", help = "g?",
+      },
+      mouse = false,
+      border = nil,
+      components = {},
+      remember_options = false,
     },
-    inline = { agent = nil, options = {}, mcp_servers = false },
+    inline = {
+      agent = nil,
+      options = {},
+      mcp_servers = false,
+      answer = "peek",
+      history = { enabled = true, max_entries = 500 },
+    },
     mcp_servers = {},
     mentions = { completion = "auto" },
     threads = {
@@ -72,10 +86,18 @@ Each agent takes `cmd`, plus optional `args`, `env`, `options` and
 `mcp_servers` (see |conduit-mcp|). Calling
 setup() is optional if you're happy with the defaults.
 
-`ui.icons` adds Nerd Font glyphs to float titles. `ui.spinner` is the progress
-animation; a single frame turns it off. `ui.inline.width` bounds the inline
-prompt and answer floats. Floats use 'winborder' when it has a top edge, else
-a rounded border. `ui.picker` picks threads and search results with
+`ui.icons` picks the glyph set: true (Unicode: ◆ ◐ ⏵ ✓), false (ASCII only)
+or "nerd" (Nerd Font glyphs where there are some). `ui.spinner` is the
+progress animation; a single frame turns it off. `ui.inline.width` bounds the
+inline prompt and answer floats, and `ui.inline.max_height` how tall an
+unfocused answer gets. `ui.keys` are the chat's option and help keys
+(|conduit-status|); false disables one. `ui.mouse` makes the status chips
+clickable. `ui.border` is the border of conduit floats; when nil, answers have
+none and prompts and pickers use 'winborder' when it has a top edge, else a
+rounded border. `ui.components` replaces or adds UI components
+(|conduit-components|). `ui.remember_options` makes options picked in a chat
+the defaults for new threads, for the rest of the session. `ui.picker` picks
+threads and search results with
 "snacks", "telescope", "fzf_lua", "mini_pick" or "select" (|vim.ui.select()|);
 "auto" uses the first of those plugins that's loaded. It can also be a
 function taking the picker spec (see `lua/conduit/ui/picker.lua`).
@@ -88,6 +110,11 @@ function taking the picker spec (see `lua/conduit/ui/picker.lua`).
 or ACP category, e.g. `{ model = "opus", effort = "high" }`. `effort` is an
 alias for the `thought_level` category. `inline.options` are layered over
 them for inline edits. Values depend on the agent; see |:Conduit| `option`.
+
+`inline.answer` is where inline answers go: "peek" (beside the code, never
+focused), "chat" (the chat panel) or "float" (a focused float under the
+range, the old behaviour). `inline.history` keeps every inline answer and
+edit (|conduit-inline-history|); `max_entries` caps it per project.
 
 `threads` configures |conduit-threads|: `scope` is "cwd" (past threads started
 in the current directory) or "all"; `persist` keeps a local index of thread ids
@@ -164,13 +191,19 @@ Claude Code also loads servers from its own config (`~/.claude.json`,
                         it; `rename [title]` it.
 :[range]Conduit add     Add [range] to the prompt as a fenced code block.
 :[range]Conduit inline [request]
-                        Edit [range] in place or answer a question about it
-                        in a float, as the agent decides. Prompts for the
-                        request when omitted. See |conduit-inline|.
+                        Edit [range] in place or answer a question about it,
+                        as the agent decides. Prompts for the request when
+                        omitted. See |conduit-inline|.
 :[range]Conduit ask [question]
-                        Like `inline`, always answering in a float.
+                        Like `inline`, always answering.
 :[range]Conduit edit [instruction]
                         Like `inline`, always rewriting [range].
+:Conduit answer         Focus the inline answer nearest the cursor.
+:Conduit answers        List the inline answers in open buffers; go to one.
+:Conduit history [qf|all]
+                        Browse the inline history of this buffer (or `all`
+                        of the project). `qf` fills the quickfix list.
+                        See |conduit-inline-history|.
 :Conduit model [value]  Pick or set the session model.
 :Conduit effort [value] Pick or set the reasoning effort.
 :Conduit mode [value]   Pick or set the session mode.
@@ -201,7 +234,12 @@ The chat is a markdown transcript with a prompt buffer below it.
   <CR>      (prompt, normal)  Send the prompt
   <C-s>     (prompt, insert)  Send the prompt
   <C-c>     (prompt, normal)  Cancel the running turn
-  go        (both)            Pick a session option (model, effort, mode)
+  <M-m>     (both)            Pick the model
+  <M-e>     (both)            Next effort level (takes a count)
+  <M-E>     (both)            Previous effort level (takes a count)
+  <S-Tab>   (both, normal)    Next mode (takes a count)
+  go        (both)            Pick any session option
+  g?        (both)            List the keys (`/` filters)
   gs        (both)            Pick a thread
   gn        (both)            Start a new thread with the same agent
   ]t  [t    (both)            Next / previous thread
@@ -212,8 +250,60 @@ Tool permission requests are shown with |vim.ui.select()|. The prompt shows
 the tool's kind (`edit`, `execute`, ...), the paths it touches and, for
 commands, every line of the command. The buffers use the `conduit` and
 `conduit_input` filetypes with treesitter markdown highlighting, so markdown
-linters and LSPs don't attach to them. The prompt's winbar shows the agent, its
-state and the current model, effort and mode.
+linters and LSPs don't attach to them.
+
+The transcript stays plain markdown but is drawn quietly: `## You` and the
+agent's header become thin labelled rules, your turns are shaded, headers that
+only continue the agent's turn are hidden, and thinking folds to one line
+("thought for N lines") that <CR> opens. The window uses 'conceallevel' 2.
+
+                                                             *conduit-status*
+The prompt's winbar shows the session's options as chips (model, effort,
+mode), and how full the context window is ("ctx 42%", plus the cost when the
+agent reports one) from ACP `usage_update`. While the agent works a spinner
+takes the first chip. The keys in |conduit-chat| change them; pickers are
+small keyboard floats: `j` `k` move, `1`-`9` pick a row, `/` filters, <CR>
+picks, <Esc> cancels. With `ui.mouse` the chips are clickable too.
+
+Every action is a <Plug> mapping: `<Plug>(conduit-toggle)`, `-new`,
+`-threads`, `-model`, `-effort`, `-effort-next`, `-effort-prev`, `-mode-next`,
+`-options`, `-answer`, `-answers`, `-history`, `-cancel`, and `-inline`,
+`-ask`, `-edit` (normal and visual mode).
+
+For statuslines, |conduit.statusline()| returns the chips as a statusline
+string; refresh on the `User ConduitStatus` autocmd.
+
+                                                         *conduit-components*
+The UI is built from components: pure functions from props to spans
+(`{ text, highlight_group }`), drawn into winbars, extmarks and floats.
+Interactive parts (pickers, answers, folds, help, the history list) are
+headless models that own state and keys, with thin views on top. Replace or
+wrap any component in `ui.components`; each gets its props and the built-in:
+>lua
+  ui = { components = {
+    Chip = function(props, builtin)
+      return vim.list_extend({ { "[" } }, vim.list_extend(builtin(props), { { "]" } }))
+    end,
+  } }
+<
+An override that errors falls back to the built-in. Components and props:
+
+  Chip          icon?, label, hl?, key?, on_click?
+  ChipBar       status (model, effort, mode, state, context), chips?, agent?,
+                actions?
+  Spinner       frame
+  TitleBar      agent, title, index?, count?   (chat winbar without threads)
+  Placeholder   hints                          (empty prompt)
+  HelpFloat     title, entries, query?         (returns lines)
+  Picker        model                          (returns lines)
+  PromptTitle   agent?, mode?, mode_hl?, model?, effort?, range
+  RoleRule      label, role, width
+  ToolCallLine  status?, title
+  ThinkingFold  lines, open
+  AnswerMarker  (none)
+  AnswerPeek    text, indent                   (returns lines)
+  VirtLines     text, indent                   (returns lines)
+  HistoryLine   entry, now, cursor?
 
                                                          *conduit-tool-calls*
 Each tool call shows its status and title, then the files it touched, the diff
@@ -397,20 +487,55 @@ with `@` completion. Its title shows the agent, the mode and the lines:
 
 A leading `?` forces Ask and `!` forces Edit; the title updates as you type.
 
+`<C-o>` changes the model, effort or any other option for this request only;
+the title shows the model and effort the request will use.
+
 In Auto mode the agent decides: changes replace the range as one undoable
-change, and answers stream into a float under the range. In the float:
+change (the new lines flash briefly), and questions get an answer.
+
+Answers never take focus (`inline.answer = "peek"`). While the agent works, a
+spinner and the agent's name sit above the range. Answers of two lines or
+fewer appear as virtual lines under the range; longer ones stream into a
+borderless float beside the code (under the range when there's no room), up
+to `ui.inline.max_height` lines. When the cursor leaves the range, or you
+start typing elsewhere, the answer collapses to a marker at the end of the
+range's first line; it comes back when the cursor returns to the range.
+|:Conduit| `answer` (or `<Plug>(conduit-answer)`) focuses the nearest answer,
+and `answers` lists them. In a focused answer:
 
   a         Apply the answer's last code block to the range
   f         Ask a follow-up in the same session
   c         Move the conversation into the chat, keeping the session
   <C-c>     Cancel the answer
-  q <Esc>   Close
+  <Esc>     Back to the code; the answer stays
+  q         Close the answer
   g?        List the keys
 
-While a request runs or its answer is open, the range is highlighted
-(`ConduitInlinePending`) and marked in the sign column (`ConduitInlineSign`),
-and a spinner above it shows progress (`ConduitInlineStatus`). Each request
-runs in its own session; see `inline.options` in |conduit-setup|.
+With `inline.answer = "chat"` answers stream into the chat panel and focus
+stays put; "float" opens a focused float under the range, with the same keys
+(`q` and <Esc> close it).
+
+While a request runs, the range is highlighted (`ConduitInlinePending`) and
+marked in the sign column (`ConduitInlineSign`). Each request runs in its own
+session; see `inline.options` in |conduit-setup|.
+
+                                                     *conduit-inline-history*
+Every inline answer and edit is kept, separate from chat threads: the time,
+file and lines, prompt, model and effort, the answer or the diff, and the
+outcome (applied, reverted, ...). One JSONL file per project lives under
+stdpath("state")/conduit/inline/. |:Conduit| `history` lists the current
+buffer's entries (the project's when it has none):
+
+  j k       Move
+  /         Filter by prompt, file or answer
+  <Tab>     This buffer / the whole project
+  <CR>      Jump to the range
+  p         Preview the answer or diff
+  r         Re-run the request on the range
+  c         Send the entry to a new chat
+  u         Revert an applied edit, if its lines are unchanged
+  dd        Delete the entry
+  q <Esc>   Close
 
                                                          *conduit-highlights*
 Highlight groups, all defined with `default` links so colorschemes can
@@ -430,7 +555,27 @@ override them:
   ConduitSpinner        DiagnosticInfo  Progress spinner
   ConduitInlinePending  CursorLine      Range while a request runs
   ConduitInlineSign     DiagnosticInfo  Sign column mark on the range
-  ConduitInlineStatus   Comment         Progress text
+  ConduitInlineStatus   Comment         Agent name in the running status
+  ConduitInlineAdded    DiffAdd         Lines an inline edit just wrote
+  ConduitAnswer         NormalFloat     Answer float background
+  ConduitAnswerVirt     Comment         Short answers as virtual lines
+  ConduitAnswerMarker   DiagnosticInfo  Marker of a collapsed answer
+  ConduitChip           Normal          Status chips
+  ConduitChipIcon       Special         Status chip glyphs
+  ConduitMuted          Comment         Quiet text
+  ConduitAccent         Special         Accents
+  ConduitTitleText      Title           Titles
+  ConduitContextHigh    DiagnosticWarn  Context use at 80% or more
+  ConduitRule           WinSeparator    Transcript role rules
+  ConduitRoleUser       Title           "You" in the rule
+  ConduitRoleAgent      Special         The agent in the rule
+  ConduitUserTurn       CursorLine      Your turns in the transcript
+  ConduitThinking       Comment         Folded thinking
+  ConduitPickerCursor   CursorLine      Picker row under the cursor
+  ConduitPickerCurrent  Special         Current value in a picker
+  ConduitPickerIndex    Comment         Row numbers in a picker
+  ConduitHistoryAnswer  DiagnosticInfo  Answer glyph in the history list
+  ConduitHistoryEdit    DiagnosticWarn  Edit glyph in the history list
   ConduitThreadActive   Title           Current thread's tab and marker
   ConduitThreadInactive Comment         Other threads' tabs
   ConduitThreadSeparator WinSeparator   Between tabs
@@ -485,6 +630,19 @@ require("conduit").ask({l1}, {l2}, {q?})  Inline answer about lines.
 require("conduit").edit({l1}, {l2}, {i?}) Inline edit of lines.
 require("conduit").option({key?}, {value?})
                                          Pick or set a session option.
+require("conduit").cycle_option({key}, {count?})
+                                         Step an option (`"effort"`, `"mode"`)
+                                         through its values; negative goes back.
+                                                        *conduit.statusline()*
+require("conduit").statusline({opts?})   The status chips as a statusline
+                                         string. `{ context = false }` drops
+                                         context use, `{ agent = true }` adds
+                                         the agent name.
+require("conduit").answer()              Focus the nearest inline answer.
+require("conduit").answers()             List inline answers and go to one.
+require("conduit").history({opts?})      Browse the inline history.
+                                         `{ scope = "project" }` lists all of
+                                         it, `{ qf = true }` fills quickfix.
 require("conduit").commands({name?})     Pick a slash command (or use {name})
                                          and start the chat prompt with it.
 require("conduit").review({action?}, {source?})

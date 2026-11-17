@@ -50,16 +50,25 @@ lua/conduit/
                         mentions.attach also wires up / commands
   commands.lua          / agent commands: per-buffer sources, items, input-hint ghost text
   blink.lua             blink.cmp source for @ mentions and / commands
-  inline.lua            Inline requests: auto/edit/ask, answer float, follow-ups
+  inline.lua            Inline requests: auto/edit/ask, peek answers (collapse, focus), follow-ups
+  inline_history.lua    Inline answers and edits per project (JSONL), separate from threads
   threads.lua           Threads: live registry, switching (MRU, goto, resume), picker, search,
                         thread bar, events, past threads, close/delete/fork
   history.lua           Local thread index (ids, titles, cwd, timestamps; never transcripts)
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
-  ui/chat.lua           Chat transcript + prompt buffers, session/update rendering
+  ui/component.lua      Component core: define/render (ui.components overrides), mount
+  ui/components.lua     Built-in components (Chip, ChipBar, RoleRule, AnswerPeek, ...)
+  ui/surface.lua        Surfaces: spans → statusline strings, extmarks, float titles, buffers
+  ui/status.lua         Status model (model, effort, mode, state, context) + change events
+  ui/headless/          Headless models: picker, options, answer, fold, help, history
+  ui/picker_float.lua   Keyboard picker view (j/k, 1-9, /) over the headless picker
+  ui/help_float.lua     g? key list view
+  ui/history_float.lua  :Conduit history list view
+  ui/chat.lua           Chat transcript + prompt buffers, session/update rendering, decorations
   ui/tool.lua           Tool call blocks: status line, locations, diff and output previews
   ui/prompt.lua         Floating prompt (modes, @ completion)
-  ui/answer.lua         Floating answer window anchored to a buffer line
+  ui/answer.lua         Answer windows: unfocused peek float, legacy focused float
   ui/review.lua         Review overlay in file buffers (extmarks, virtual lines, keys)
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
   ui/spinner.lua        Animated progress indicator (uv timer)
@@ -89,6 +98,11 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   `agent.sessions[sid]` at a new `Chat`. The ACP session itself is reused.
 - Prompts are lists of ACP content blocks. `mentions.blocks()` turns typed
   text into a text block plus one block per `@` mention.
+- UI is components + headless models. Components are pure `render(props)` →
+  spans; surfaces draw them; `component.mount` redraws on status changes only
+  when the output differs. Interactive state (pickers, answer phases, folds,
+  history) lives in `ui/headless/*`; keys call model actions, views subscribe.
+  Test the models directly; test views through their spans or buffer lines.
 - Inline auto mode relies on a reply protocol: edits come back as
   `<replace>` + fenced block + `</replace>`; anything else is an answer.
   `Job:_route()` decides from the first few streamed characters.
@@ -103,6 +117,8 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   `--threads=load,list,...` (session capabilities), `--seed` (past sessions
   to list and load), `--mcp=http,sse` (MCP transports) and `--no-image` (no
   `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`).
+  Echoed turns end with a `usage_update` (42% of 10k, 0.50 USD); inline requests
+  starting "short" get a one-line answer (virtual lines, not the float).
   Prompts `term <json>` (terminal/create plus steps), `display` (the `_meta`
   display-terminal extension) and `caps` exercise terminals. `disk-edit`,
   `disk-create`, `disk-delete` and `disk-edit-fast <path>` change files directly,
@@ -167,6 +183,19 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   is then undone on the current text to rebuild the baseline.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
   written with `nvim_buf_set_lines` must be split or trimmed first.
+- **Inline answers must never take focus on their own.** Peek floats open with
+  `enter = false` and `focusable = false`; only `:Conduit answer` focuses one.
+  Focus changes inside `nvim_buf_call` are undone when it returns, so tests that
+  check focus run mappings in the current window (`press_here`), not `press`.
+- **`conceal_lines` concealing needs 'conceallevel' > 0**, and a ranged mark's
+  `end_row` is inclusive. The transcript window sets conceallevel 2. Section
+  headers are tracked with marks (`conduit.sections`), never by matching
+  `## ` lines, since agents write markdown headings too.
+- **Statusline click handlers must be named functions**, so `ui.mouse` defines
+  a global `ConduitClick`. Its handler tables are weak, so whoever renders
+  clickable spans (the chat's `actions`) must keep the callbacks alive.
+- **Inline history writes to stdpath("state")**; the suite points
+  `inline_history.dir` at a temp dir, like `history.path`.
 
 ## Making changes
 
