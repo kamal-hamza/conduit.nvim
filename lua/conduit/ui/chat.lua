@@ -7,6 +7,11 @@ local tool_ui = require("conduit.ui.tool")
 
 local ns = vim.api.nvim_create_namespace("conduit")
 local placeholder_ns = vim.api.nvim_create_namespace("conduit.placeholder")
+-- One mark per section header (`## You`, `## agent`, `### Thinking`), so headers
+-- are told apart from markdown headings inside messages.
+local sections_ns = vim.api.nvim_create_namespace("conduit.sections")
+-- Decorations redrawn from the section marks: role rules, user-turn shading, folds.
+local decor_ns = vim.api.nvim_create_namespace("conduit.decor")
 
 local plan_icons = {
     pending = "[ ]",
@@ -39,7 +44,14 @@ local plan_icons = {
 ---@field opts_model conduit.OptionsModel Headless session options (model, effort, mode)
 ---@field actions table<string, fun()> Chip click handlers (with `ui.mouse`)
 ---@field mounts { chips: conduit.Mount, placeholder: conduit.Mount }
+---@field sections table<integer, conduit.ChatSection> Section headers by mark id
+---@field decorate_queued? boolean
 local Chat = {}
+
+---@class conduit.ChatSection
+---@field kind "user"|"agent"|"thought"
+---@field label string
+---@field fold? conduit.FoldModel Thinking sections fold, closed by default
 Chat.__index = Chat
 
 ---Accumulated `tool_call` + `tool_call_update` fields, plus where the call is drawn.
@@ -77,7 +89,8 @@ end
 function Chat.new(agent)
     require("conduit.ui.hl").setup()
     count = count + 1
-    local self = setmetatable({ agent = agent, busy = false, tools = {}, following = {}, last_kind = nil }, Chat)
+    local self =
+        setmetatable({ agent = agent, busy = false, tools = {}, following = {}, sections = {}, last_kind = nil }, Chat)
     self.transcript = scratch(("conduit://%s/%d"):format(agent.name, count), "conduit")
     self.input = scratch(("conduit://%s/%d/input"):format(agent.name, count), "conduit_input")
     vim.bo[self.transcript].modifiable = false
@@ -222,8 +235,8 @@ function Chat:_keymaps()
         end, { buffer = self.transcript, desc = desc })
     end
     tmap("<CR>", function()
-        return self:toggle_tool()
-    end, vim.keycode("<CR>"), "Expand or collapse the tool call")
+        return self:toggle_tool() or self:toggle_fold()
+    end, vim.keycode("<CR>"), "Expand or collapse the tool call or thinking")
     tmap("gd", function()
         return self:open_tool_diff()
     end, "gd", "Show the tool call's diff")
@@ -367,6 +380,8 @@ function Chat:show(twin, iwin)
         vim.wo[win].relativenumber = false
         vim.wo[win].signcolumn = "no"
         vim.wo[win].winfixwidth = true
+        -- Hides markdown markup and folded thinking (`conceal_lines` needs it).
+        vim.wo[win].conceallevel = 2
     end
     vim.wo[iwin].winfixheight = true
     self.unread = false
@@ -427,6 +442,7 @@ function Chat:_refresh_winbar()
     end
     self.mounts.chips:update(true)
     self.mounts.placeholder:update()
+    self:_queue_decorate()
 end
 
 function Chat:_set_busy(busy)
@@ -476,6 +492,7 @@ function Chat:_edit(fn, keep_view)
         end
         require("conduit.ui.render").refresh(buf)
     end
+    self:_queue_decorate()
     if not ok then
         error(err)
     end
@@ -525,8 +542,137 @@ function Chat:_section(kind, header, message_id)
     end
     self.last_kind = kind
     -- The trailing empty line is where streamed text continues.
-    self:_append_lines({ "", header, "", "" })
+    local row = self:_append_lines({ "", header, "", "" })
+    self:_mark_section(row + 1, kind)
     return true
+end
+
+---Remember a section header at `row`.
+---@param row integer 0-based
+---@param kind string
+function Chat:_mark_section(row, kind)
+    if kind ~= "user" and kind ~= "agent" and kind ~= "thought" then
+        return
+    end
+    local id = vim.api.nvim_buf_set_extmark(self.transcript, sections_ns, row, 0, {})
+    self.sections[id] = {
+        kind = kind,
+        label = kind == "user" and "You" or self.agent.name,
+        fold = kind == "thought" and require("conduit.ui.headless.fold").new(false) or nil,
+    }
+end
+
+---Redraw decorations once this tick's edits are done.
+function Chat:_queue_decorate()
+    if self.decorate_queued then
+        return
+    end
+    self.decorate_queued = true
+    vim.schedule(function()
+        self.decorate_queued = false
+        self:_decorate()
+    end)
+end
+
+---Draw the transcript's decorations from its section marks. The buffer itself
+---stays plain markdown (for yank, search and copies); headers are drawn over:
+---`## You` and the turn's first `## agent` become labelled rules, later agent
+---headers in the same turn are hidden, user turns are shaded, and thinking
+---sections fold to one line.
+function Chat:_decorate()
+    local buf = self.transcript
+    if not vim.api.nvim_buf_is_valid(buf) then
+        return
+    end
+    vim.api.nvim_buf_clear_namespace(buf, decor_ns, 0, -1)
+    local component = require("conduit.ui.component")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, sections_ns, 0, -1, {})
+    local count = vim.api.nvim_buf_line_count(buf)
+    local twin = self:wins()
+    local width = 80
+    if twin then
+        width = vim.api.nvim_win_get_width(twin) - vim.fn.getwininfo(twin)[1].textoff
+    end
+    local function decor(row, opts)
+        opts.priority = 200
+        pcall(vim.api.nvim_buf_set_extmark, buf, decor_ns, row, 0, opts)
+    end
+    local prev ---@type conduit.ChatSection?
+    for i, m in ipairs(marks) do
+        local row, sec = m[2], self.sections[m[1]]
+        if sec then
+            -- The section runs to the blank line before the next header.
+            local stop = marks[i + 1] and marks[i + 1][2] - 2 or count - 1
+            local lines = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)
+            local pad = (" "):rep(math.max(0, vim.fn.strdisplaywidth(lines[1] or "") - width))
+            if sec.kind == "thought" then
+                local fold = assert(sec.fold)
+                local n = 0
+                for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, row + 1, stop + 1, false)) do
+                    n = n + (vim.trim(line) ~= "" and 1 or 0)
+                end
+                local spans = component.render("ThinkingFold", { lines = n, open = fold.open })
+                local text = component.text(spans)
+                spans[#spans + 1] = { (" "):rep(math.max(0, width - vim.fn.strdisplaywidth(text))) .. pad }
+                decor(row, { virt_text = require("conduit.ui.surface").chunks(spans), virt_text_pos = "overlay" })
+                if not fold.open and stop > row then
+                    -- One ranged mark (end_row is inclusive) however long the thinking.
+                    decor(row + 1, { end_row = stop, conceal_lines = "" })
+                end
+            elseif sec.kind == "agent" and prev and prev.kind ~= "user" then
+                -- The agent picking up after a tool call or thinking: no new rule.
+                decor(row, { end_row = math.min(row + 1, math.max(row, stop)), conceal_lines = "" })
+            else
+                local spans = component.render("RoleRule", { label = sec.label, role = sec.kind, width = width })
+                decor(row, { virt_text = require("conduit.ui.surface").chunks(spans), virt_text_pos = "overlay" })
+                if sec.kind == "user" and stop >= row + 2 then
+                    decor(row + 2, { end_row = stop, line_hl_group = "ConduitUserTurn" })
+                end
+            end
+            prev = sec
+        end
+    end
+end
+
+---Open or close the thinking section under the cursor (or at `row`).
+---@param row? integer 0-based
+---@return boolean toggled
+function Chat:toggle_fold(row)
+    local twin = self:wins()
+    if not row then
+        if not twin then
+            return false
+        end
+        row = vim.api.nvim_win_get_cursor(twin)[1] - 1
+    end
+    local marks = vim.api.nvim_buf_get_extmarks(self.transcript, sections_ns, { row, 0 }, 0, { limit = 1 })
+    local m = marks[1]
+    local sec = m and self.sections[m[1]]
+    if not sec or not sec.fold then
+        return false
+    end
+    -- Only from the header, or from inside an open section.
+    if m[2] ~= row and not sec.fold.open then
+        return false
+    end
+    sec.fold:toggle()
+    self:_decorate()
+    if twin and not sec.fold.open then
+        vim.api.nvim_win_set_cursor(twin, { m[2] + 1, 0 })
+    end
+    return true
+end
+
+---Recreate section marks from header lines (for transcripts copied as text).
+function Chat:_rescan_sections()
+    local headers = { ["## You"] = "user", ["## " .. self.agent.name] = "agent", ["### Thinking"] = "thought" }
+    local lines = vim.api.nvim_buf_get_lines(self.transcript, 0, -1, false)
+    for i, line in ipairs(lines) do
+        local kind = headers[line]
+        if kind and (i == 1 or lines[i - 1] == "") then
+            self:_mark_section(i - 1, kind)
+        end
+    end
 end
 
 ---Stop following terminal output.
@@ -570,8 +716,10 @@ function Chat:_clear()
     self:_edit(function(buf)
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
         vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+        vim.api.nvim_buf_clear_namespace(buf, sections_ns, 0, -1)
     end)
     self.tools, self.plan, self.last_kind, self.message_id = {}, nil, nil, nil
+    self.sections = {}
 end
 
 ---Replace the transcript with a copy of `other`'s (e.g. for a fork).
@@ -582,6 +730,7 @@ function Chat:copy_transcript(other)
     self:_edit(function(buf)
         vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
+    self:_rescan_sections()
     -- Keep the tool blocks expandable in the copy.
     for id, tool in pairs(other.tools) do
         local block = tool.block

@@ -214,7 +214,8 @@ define({
 define({
     name = "ToolCallLine",
     render = function(p)
-        return { { hl.glyph(p.status or "pending") .. " " }, { p.title } }
+        local glyph = hl.glyph(p.status or "pending")
+        return { { (glyph ~= "" and glyph or "•") .. " " }, { p.title } }
     end,
 })
 

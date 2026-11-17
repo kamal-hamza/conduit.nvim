@@ -3224,3 +3224,91 @@ test("history: inline answers and edits are kept per project, separate from thre
     vim.cmd("cclose")
     vim.cmd("bwipeout!")
 end)
+
+-- Transcript decorations ---------------------------------------------------------------
+
+---@param chat conduit.Chat
+---@return table[] decoration extmarks with details
+local function decorations(chat)
+    chat:_decorate()
+    return vim.api.nvim_buf_get_extmarks(
+        chat.transcript,
+        vim.api.nvim_create_namespace("conduit.decor"),
+        0,
+        -1,
+        { details = true }
+    )
+end
+
+---@param marks table[]
+---@param row integer 0-based
+---@return table[] details of the marks on `row`
+local function on_row(marks, row)
+    local out = {}
+    for _, m in ipairs(marks) do
+        if m[2] == row then
+            table.insert(out, m[4])
+        end
+    end
+    return out
+end
+
+test("transcript: role headers become rules, thinking folds, the buffer stays markdown", function()
+    local chat = assert(conduit.new())
+    send(chat, "hello there")
+    local text = transcript(chat)
+    assert(text:find("## You\n\nhello there", 1, true), "the buffer keeps its markdown: " .. text)
+    local you, thinking, agent = row_of(chat, "## You"), row_of(chat, "### Thinking"), row_of(chat, "## mock")
+    local marks = decorations(chat)
+
+    local rule = on_row(marks, you)[1]
+    local rule_text = table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, rule.virt_text))
+    assert(rule.virt_text_pos == "overlay" and vim.startswith(rule_text, "── You ──"), rule_text)
+    assert(on_row(marks, you + 2)[1].line_hl_group == "ConduitUserTurn", "the user's turn is shaded")
+
+    -- Thinking is folded to one line: the header says how much, the lines are concealed.
+    local fold = on_row(marks, thinking)[1]
+    assert(fold.virt_text[1][1]:find("▸ thought for 1 line", 1, true), vim.inspect(fold.virt_text))
+    local hidden = on_row(marks, thinking + 1)[1]
+    assert(hidden.conceal_lines == "" and hidden.end_row == agent - 2, vim.inspect(hidden))
+    assert(vim.wo[assert(chat:wins())].conceallevel == 2)
+
+    -- The agent's header after thinking continues the turn: no second rule, just hidden.
+    assert(on_row(marks, agent)[1].conceal_lines == "", vim.inspect(on_row(marks, agent)))
+
+    -- <CR> on the thinking header opens it.
+    local twin = assert(chat:wins())
+    vim.api.nvim_set_current_win(twin)
+    vim.api.nvim_win_set_cursor(twin, { thinking + 1, 0 })
+    press(chat.transcript, "<CR>")
+    marks = decorations(chat)
+    assert(on_row(marks, thinking)[1].virt_text[1][1]:find("▾ thinking", 1, true))
+    assert(#on_row(marks, thinking + 1) == 0, "open thinking isn't concealed")
+    reset_threads()
+end)
+
+test("transcript: forks keep their decorations; ui.icons = false uses ASCII glyphs", function()
+    local chat = assert(conduit.new())
+    send(chat, "hi")
+    local copy = require("conduit.ui.chat").new(chat.agent)
+    copy:copy_transcript(chat)
+    local marks = decorations(copy)
+    local you = row_of(copy, "## You")
+    assert(#on_row(marks, you) == 1 and on_row(marks, you)[1].virt_text_pos == "overlay", "rule in the copy")
+    copy:destroy()
+
+    local ui = require("conduit.config").options.ui
+    ui.icons = false
+    local hl = require("conduit.ui.hl")
+    assert(hl.glyph("completed") == "+" and hl.glyph("marker") == "*" and hl.glyph("model") == "")
+    local tool = require("conduit.ui.tool").header({ title = "Run make", status = "failed" })
+    assert(tool == "x Run make", tool)
+    local status = require("conduit.ui.status").of_chat(chat)
+    local bar =
+        require("conduit.ui.component").text(require("conduit.ui.component").render("ChipBar", { status = status }))
+    assert(not bar:find("◆", 1, true) and bar:find(status.model, 1, true), bar)
+    ui.icons = true
+    reset_threads()
+end)

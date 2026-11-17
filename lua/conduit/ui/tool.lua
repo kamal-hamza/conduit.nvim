@@ -20,13 +20,6 @@ local M = {}
 ---@field terminal? fun(id: string): conduit.Terminal? Looks up terminals the call embeds
 ---@field review? string Review state of the files the call changed ("review pending", "accepted", ...)
 
-local STATUS_ICONS = {
-    pending = "○",
-    in_progress = "◐",
-    completed = "✓",
-    failed = "✗",
-}
-
 -- Locations listed in a collapsed block (search hits can be many).
 local MAX_LOCATIONS = 5
 -- Bytes of terminal output looked at for a collapsed preview.
@@ -69,7 +62,8 @@ function M.header(tool)
     if first ~= title then
         first = first .. " …"
     end
-    return ("%s %s"):format(STATUS_ICONS[tool.status or "pending"] or "•", first)
+    local spans = require("conduit.ui.component").render("ToolCallLine", { status = tool.status, title = first })
+    return require("conduit.ui.component").text(spans)
 end
 
 ---@param path string
