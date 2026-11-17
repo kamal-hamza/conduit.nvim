@@ -5,8 +5,9 @@ conduit.setup({
     agents = { mock = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua" } } },
     log_level = vim.log.levels.OFF,
 })
--- Keep the thread index out of the user's data directory.
+-- Keep the thread index and the inline history out of the user's directories.
 require("conduit.history").path = vim.fn.tempname() .. "/threads.json"
+require("conduit.inline_history").dir = vim.fn.tempname() .. "/inline"
 
 local function transcript(chat)
     return table.concat(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false), "\n")
@@ -299,10 +300,11 @@ test("options: config options, defaults and set_option", function()
     end, "set_option")
     assert(assert(options.find(chat.agent:get_options(sid), "model")).current == "smart")
     chat:_refresh_winbar()
-    -- With the thread bar on, state and options sit in the prompt's winbar.
+    -- Options show as chips in the prompt's winbar; "ready" needs no chip.
     local _, iwin = chat:wins()
     local winbar = winbar_text(assert(iwin))
-    assert(winbar:find("mock · ready · SMART · LOW", 1, true), winbar)
+    assert(winbar:find("◆ SMART   ◐ LOW", 1, true), winbar)
+    assert(not winbar:find("ready", 1, true), winbar)
 end)
 
 test("options: legacy modes and models", function()
@@ -349,7 +351,17 @@ test("inline: rewrites the selected lines", function()
     end, "inline edit")
     local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
     assert(vim.deep_equal(lines, { "keep", "LOCAL A = 1", "LOCAL B = 2", "keep" }), vim.inspect(lines))
-    assert(#vim.api.nvim_buf_get_extmarks(0, -1, 0, -1, {}) == 0, "marks should be cleared")
+    assert(#vim.api.nvim_buf_get_extmarks(0, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {}) == 0)
+    -- The new lines flash briefly, without a window.
+    local flash = vim.api.nvim_buf_get_extmarks(
+        0,
+        vim.api.nvim_create_namespace("conduit.inline.flash"),
+        0,
+        -1,
+        { details = true }
+    )
+    assert(#flash == 1 and flash[1][2] == 1 and flash[1][4].end_row == 2, vim.inspect(flash))
+    assert(flash[1][4].line_hl_group == "ConduitInlineAdded")
     vim.cmd("bwipeout!")
 end)
 
@@ -641,7 +653,8 @@ local function wait_turn(job)
     end, "inline turn")
 end
 
-test("inline: auto mode answers questions in a float under the selection", function()
+test("inline: with answer = float, answers open in a focused float under the selection", function()
+    require("conduit.config").options.inline.answer = "float"
     local buf = inline_buf()
     local job = assert(conduit.inline(2, 3, "explain this"))
     wait_turn(job)
@@ -666,8 +679,9 @@ test("inline: auto mode answers questions in a float under the selection", funct
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     assert(vim.deep_equal(lines, { "keep", "return 42", "keep" }), vim.inspect(lines))
     assert(not job.answer:is_open())
-    assert(#vim.api.nvim_buf_get_extmarks(buf, -1, 0, -1, {}) == 0, "marks should be cleared")
+    assert(#vim.api.nvim_buf_get_extmarks(buf, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {}) == 0)
     assert(job.agent.sessions[job.session_id] == nil, "session should be released")
+    require("conduit.config").options.inline.answer = "peek"
     vim.cmd("bwipeout!")
 end)
 
@@ -835,7 +849,8 @@ test("inline: shows a spinner status and marks the range while running", functio
         return c[1]
     end, status.virt_lines[1]))
     assert(vim.startswith(line, "    "), "status is indented like the range: " .. line)
-    assert(line:find("mock", 1, true) and line:find(":Conduit cancel", 1, true), line)
+    -- Minimal: the spinner and the agent, nothing else.
+    assert(vim.trim(line):match("^%S+ mock$"), line)
 
     wait_for(function()
         return job.cleaned
@@ -859,15 +874,19 @@ test("api: every :Conduit subcommand resolves", function()
     vim.list_extend(fns, { "thread_delete", "thread_fork", "thread_rename", "thread_alternate", "thread_goto" })
     vim.list_extend(fns, { "thread_search", "resume", "status" })
     vim.list_extend(fns, { "review", "accept", "reject" })
+    vim.list_extend(fns, { "answer", "answers", "history", "cycle_option", "statusline" })
     for _, fn in ipairs(fns) do
         assert(type(conduit[fn]) == "function", "missing conduit." .. fn)
     end
     local complete = vim.fn.getcompletion("Conduit ", "cmdline")
     local subs =
         { "inline", "ask", "edit", "stop", "model", "effort", "mode", "threads", "thread", "continue", "resume" }
-    vim.list_extend(subs, { "commands", "review", "accept", "reject" })
+    vim.list_extend(subs, { "commands", "review", "accept", "reject", "answer", "answers", "history" })
     for _, sub in ipairs(subs) do
         assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
+    end
+    for _, plug in ipairs({ "model", "effort-next", "effort-prev", "mode-next", "answer", "history", "ask" }) do
+        assert(vim.fn.maparg(("<Plug>(conduit-%s)"):format(plug), "n") ~= "", "missing <Plug>(conduit-" .. plug .. ")")
     end
     local actions = vim.fn.getcompletion("Conduit thread ", "cmdline")
     for _, action in ipairs({ "new", "next", "prev", "alt", "goto", "search", "close", "delete", "fork", "rename" }) do
@@ -987,10 +1006,10 @@ test("threads: titles come from the first prompt, then the agent", function()
     local twin = assert(chat:wins())
     assert(winbar_text(twin) == " 1 Refactor the parser ", winbar_text(twin))
 
-    -- Without the thread bar, the title and state share the chat's winbar.
+    -- Without the thread bar, the transcript's winbar shows the title and agent.
     require("conduit.config").options.ui.thread_bar = false
     chat:_refresh_winbar()
-    assert(winbar_text(twin):find("^ mock · Refactor the parser .* ready"), winbar_text(twin))
+    assert(winbar_text(twin) == " Refactor the parser%=mock ", winbar_text(twin))
     require("conduit.config").options.ui.thread_bar = true
     reset_threads()
 end)
@@ -2157,7 +2176,18 @@ test("commands: typing / at the start of the prompt completes agent commands", f
     assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
     assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
     assert(vim.api.nvim_get_current_win() == select(2, chat:wins()))
-    assert(chat.input and vim.wo.winbar:find("/ command", 1, true), vim.wo.winbar)
+    -- The empty input's placeholder mentions commands once the agent has some.
+    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
+    chat.mounts.placeholder:update()
+    local marks = vim.api.nvim_buf_get_extmarks(
+        chat.input,
+        vim.api.nvim_create_namespace("conduit.placeholder"),
+        0,
+        -1,
+        { details = true }
+    )
+    local hint = marks[1] and marks[1][4].virt_text[1][1] or ""
+    assert(hint:find("/ commands", 1, true), hint)
     vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
 end)
 
@@ -2224,7 +2254,7 @@ test("commands: inline commands are sent unwrapped with the selection, as an ans
     local job = assert(conduit.inline(2, 3, "/review naming"))
     wait_turn(job)
     assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
-    local text = assert(job.answer):text()
+    local text = job:_display()
     assert(text:find("ran review: naming (1 context)", 1, true), text)
     job:close()
 
@@ -2753,4 +2783,532 @@ test("review: replayed tool calls aren't reviewed", function()
         locations = { { path = path } },
     })
     assert(next(review.files) == nil)
+end)
+
+-- UI components, headless models and the status model ---------------------------------
+
+---Run a normal-mode mapping of the current buffer in the current window (unlike
+---`press`, focus changes the mapping makes stick).
+---@param lhs string
+local function press_here(lhs)
+    vim.fn.maparg(lhs, "n", false, true).callback()
+end
+
+test("components: render overrides and mounts that redraw only on change", function()
+    local component = require("conduit.ui.component")
+    local ui = require("conduit.config").options.ui
+    local chip = component.render("Chip", { icon = "◆", label = "opus" })
+    assert(component.text(chip) == "◆ opus", component.text(chip))
+
+    -- Overrides get the props and the built-in; a failing one falls back to it.
+    ui.components = {
+        Chip = function(props, builtin)
+            return vim.list_extend({ { "[" } }, builtin(props))
+        end,
+    }
+    assert(component.text(component.render("Chip", { label = "x" })) == "[x")
+    ui.components = {
+        Chip = function()
+            error("boom")
+        end,
+    }
+    assert(component.text(component.render("Chip", { label = "x" })) == "x")
+    ui.components = {}
+
+    local draws, label = 0, "a"
+    local mount = component.mount(
+        {
+            draw = function()
+                draws = draws + 1
+            end,
+        },
+        "Chip",
+        function()
+            return { label = label }
+        end
+    )
+    mount:update()
+    assert(draws == 1, "unchanged output isn't redrawn: " .. draws)
+    label = "b"
+    mount:update()
+    assert(draws == 2, draws)
+    mount:unmount()
+end)
+
+test("surface: statusline escapes text, keeps raw spans and adds clicks with ui.mouse", function()
+    local surface = require("conduit.ui.surface")
+    local ui = require("conduit.config").options.ui
+    local s = surface.statusline({ { "50%", "ConduitMuted" }, { "%=", raw = true }, { "x" } })
+    assert(s == "%#ConduitMuted#50%%%*%=x", s)
+    local fn = function() end
+    assert(not surface.statusline({ { "m", click = fn } }):find("@", 1, true), "no clicks without ui.mouse")
+    ui.mouse = true
+    local clickable = surface.statusline({ { "m", click = fn } })
+    ui.mouse = false
+    assert(clickable:find("@ConduitClick@m%X", 1, true), clickable)
+end)
+
+test("status: usage_update shows context use in the chips and the statusline", function()
+    local chat = assert(conduit.new())
+    send(chat, "hello")
+    local info = require("conduit.ui.status").of_chat(chat)
+    assert(info.context and info.context.percent == 42, vim.inspect(info.context))
+    assert(info.model and info.effort and info.state == "ready", vim.inspect(info))
+    wait_for(function()
+        local _, iwin = chat:wins()
+        return iwin and winbar_text(iwin):find("ctx 42%%", 1, true)
+    end, "context chip")
+    local line = conduit.statusline()
+    assert(line:find(info.model, 1, true) and line:find("ctx 42%%", 1, true), line)
+    assert(line:find("0.50 USD", 1, true), line)
+    assert(not conduit.statusline({ context = false }):find("ctx", 1, true))
+    reset_threads()
+end)
+
+test("headless: picker filters, moves with counts and picks by number", function()
+    local picked ---@type any
+    local cancelled = false
+    local model = require("conduit.ui.headless.picker").new({
+        items = { { value = 1, label = "low" }, { value = 2, label = "medium" }, { value = 3, label = "high" } },
+        current = 2,
+        on_pick = function(item)
+            picked = item.value
+        end,
+        on_cancel = function()
+            cancelled = true
+        end,
+    })
+    assert(model.cursor == 2, "cursor starts on the current item")
+    model:next(2)
+    assert(model.cursor == 1, "moves wrap: " .. model.cursor)
+    model:filter("i")
+    assert(#model.filtered == 2 and model.filtered[1].label == "medium", vim.inspect(model.filtered))
+    model:pick(2)
+    assert(picked == 3, tostring(picked))
+    model:cancel()
+    assert(not cancelled, "a finished picker can't be cancelled")
+end)
+
+test("headless: options step through values both ways", function()
+    local step = require("conduit.ui.headless.options").step
+    local option = {
+        id = "effort",
+        name = "effort",
+        current = "low",
+        choices = {
+            { value = "low", name = "low" },
+            { value = "mid", name = "mid" },
+            { value = "high", name = "high" },
+        },
+    }
+    assert(step(option, 1) == "mid" and step(option, 2) == "high" and step(option, -1) == "high")
+    option.current = "unknown"
+    assert(step(option, 1) == "low" and step(option, -1) == "high")
+end)
+
+test("chat: keys cycle effort and open a keyboard picker for the model", function()
+    local chat = assert(conduit.new())
+    send(chat, "hi")
+    -- The mock's option values outlive sessions; start from a known model.
+    local set = false
+    chat.agent:set_option(assert(chat.session_id), "model", "fast", function()
+        set = true
+    end)
+    wait_for(function()
+        return set
+    end, "model reset")
+    local options = require("conduit.options")
+    local function effort()
+        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "effort")).current
+    end
+    local before = effort()
+    press(chat.input, "<M-e>")
+    wait_for(function()
+        return effort() ~= before
+    end, "effort to change")
+    press(chat.input, "<M-E>")
+    wait_for(function()
+        return effort() == before
+    end, "effort to go back")
+
+    -- <M-m> opens the picker on the model; `2` picks the second choice.
+    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
+    press_here("<M-m>")
+    local win = vim.api.nvim_get_current_win()
+    assert(vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "conduit_picker", "picker should be focused")
+    local rows = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    assert(rows[1]:find("1 ● FAST", 1, true) and rows[2]:find("2   SMART", 1, true), vim.inspect(rows))
+    vim.api.nvim_feedkeys("2", "x", false)
+    wait_for(function()
+        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "model")).current == "smart"
+    end, "model to change")
+    assert(not vim.api.nvim_win_is_valid(win), "picker closes")
+    assert(vim.api.nvim_get_current_buf() == chat.input, "focus goes back to the input")
+    chat.agent:set_option(assert(chat.session_id), "model", "fast")
+    chat.agent:set_option(assert(chat.session_id), "effort", before)
+    reset_threads()
+end)
+
+test("help: g? lists the chat's keys in a filterable float", function()
+    local chat = assert(conduit.new())
+    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
+    press_here("g?")
+    local help = require("conduit.ui.help_float").current
+    assert(help and vim.api.nvim_get_current_win() == help.win, "help float is focused")
+    local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false), "\n")
+    assert(text:find("<M-e>", 1, true) and text:find("next effort level", 1, true), text)
+    help.model:filter("thread")
+    local filtered = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false)
+    for i = 2, #filtered do
+        assert(filtered[i]:find("thread", 1, true), vim.inspect(filtered))
+    end
+    help.model:close()
+    assert(not vim.api.nvim_win_is_valid(help.win))
+    reset_threads()
+end)
+
+test("prompt: title shows the request's model and effort; <C-o> changes them for it", function()
+    vim.cmd.enew()
+    local code_win = vim.api.nvim_get_current_win()
+    local submitted ---@type table?
+    local list = {
+        {
+            id = "model",
+            name = "model",
+            category = "model",
+            current = "fast",
+            choices = { { value = "fast", name = "FAST" }, { value = "smart", name = "SMART" } },
+        },
+        {
+            id = "effort",
+            name = "effort",
+            category = "thought_level",
+            current = "low",
+            choices = { { value = "low", name = "LOW" }, { value = "high", name = "HIGH" } },
+        },
+    }
+    local _, win = require("conduit.ui.prompt").open({
+        title = "init.lua:1",
+        agent = "mock",
+        mode = "auto",
+        anchor = { win = code_win, first = 0, last = 0 },
+        options = function()
+            return list
+        end,
+        on_submit = function(text, _, overrides)
+            submitted = { text = text, overrides = overrides }
+        end,
+    })
+    vim.cmd.stopinsert()
+    assert(chunks_text(win, "title"):find("FAST/LOW", 1, true), chunks_text(win, "title"))
+
+    -- <C-o>: pick "effort" (row 2), then "HIGH" (row 2).
+    press_here("<C-o>")
+    vim.api.nvim_feedkeys("2", "x", false)
+    wait_for(function()
+        return vim.bo.filetype == "conduit_picker"
+            and vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:find("LOW", 1, true)
+    end, "value picker")
+    vim.api.nvim_feedkeys("2", "x", false)
+    assert(vim.api.nvim_get_current_win() == win, "focus returns to the prompt")
+    assert(chunks_text(win, "title"):find("FAST/HIGH", 1, true), chunks_text(win, "title"))
+    assert(list[2].current == "low", "the agent's options are untouched")
+
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "explain" })
+    press_here("<CR>")
+    wait_for(function()
+        return submitted
+    end, "submit")
+    assert(submitted and submitted.overrides and submitted.overrides.effort == "high", vim.inspect(submitted))
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: request options reach the inline session", function()
+    local buf = inline_buf()
+    local job = require("conduit.inline").run({
+        agent = assert(conduit.agent()),
+        buf = buf,
+        line1 = 2,
+        line2 = 3,
+        instruction = "explain this",
+        options = { effort = "high" },
+    })
+    wait_turn(job)
+    local option = require("conduit.options").find(job.agent:get_options(assert(job.session_id)), "effort")
+    assert(option and option.current == "high", vim.inspect(option))
+    job.agent:set_option(assert(job.session_id), "effort", "low")
+    job:close()
+    vim.cmd("bwipeout!")
+end)
+
+-- Inline answers that stay out of the way -------------------------------------------
+
+---A buffer with the usual range on lines 2-3 and room to move away from it.
+---@return integer buf
+local function long_buf()
+    local buf = inline_buf()
+    local lines = { "keep", "local a = 1", "local b = 2", "keep" }
+    for i = 5, 30 do
+        lines[i] = "-- filler " .. i
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    return buf
+end
+
+---@param buf integer
+---@return table[] extmarks of the inline namespace with details
+local function inline_marks(buf)
+    return vim.api.nvim_buf_get_extmarks(
+        buf,
+        vim.api.nvim_create_namespace("conduit.inline"),
+        0,
+        -1,
+        { details = true }
+    )
+end
+
+test("inline: answers peek in a float that never takes focus", function()
+    local buf = long_buf()
+    local code_win = vim.api.nvim_get_current_win()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
+    local model, peek = assert(job.model), assert(job.peek)
+    assert(model.phase == "peek" and peek:is_open(), model.phase)
+    local cfg = vim.api.nvim_win_get_config(assert(peek.win))
+    assert(cfg.relative == "win" and cfg.focusable == false, vim.inspect(cfg))
+    assert(cfg.border == nil or cfg.border == "none" or vim.deep_equal(cfg.border, { "", "", "", "", "", "", "", "" }))
+    assert(peek:text():find("This code **adds** things.", 1, true), peek:text())
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "buffer must not change")
+
+    -- :Conduit answer focuses it; <Esc> goes back and leaves it shown.
+    assert(conduit.answer())
+    assert(vim.api.nvim_get_current_win() == peek.win and model.phase == "focused")
+    press_here("<Esc>")
+    assert(vim.api.nvim_get_current_win() == code_win and model.phase == "peek", model.phase)
+
+    -- `a` (here through the model) applies the last code block.
+    model:apply()
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "return 42")
+    assert(not peek:is_open() and next(require("conduit.inline").answers) == nil)
+    assert(job.agent.sessions[job.session_id] == nil, "session released")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: answers collapse when the cursor leaves and come back when it returns", function()
+    local buf = long_buf()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    local model, peek = assert(job.model), assert(job.peek)
+    vim.api.nvim_win_set_cursor(0, { 20, 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+    assert(model.phase == "collapsed" and not peek:is_open(), model.phase)
+    local marker ---@type table?
+    for _, m in ipairs(inline_marks(buf)) do
+        if m[4].virt_text_pos == "eol" then
+            marker = m
+        end
+    end
+    assert(marker and marker[2] == 1 and marker[4].virt_text[1][1]:find("◆", 1, true), vim.inspect(marker))
+
+    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
+    assert(model.phase == "peek" and peek:is_open(), model.phase)
+
+    -- Entering insert mode far from the range collapses it too.
+    vim.api.nvim_win_set_cursor(0, { 25, 0 })
+    vim.api.nvim_exec_autocmds("InsertEnter", { buffer = buf })
+    assert(model.phase == "collapsed", model.phase)
+
+    -- :Conduit answers lists it; picking it goes back and shows it.
+    conduit.answers()
+    assert(vim.bo.filetype == "conduit_picker")
+    vim.api.nvim_feedkeys("1", "x", false)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2 and model.phase == "peek", model.phase)
+    job:close()
+    assert(#inline_marks(buf) == 0, "marks cleared")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: short answers are virtual lines under the range, without a window", function()
+    local buf = long_buf()
+    local job = assert(conduit.inline(2, 3, "short answer please"))
+    wait_turn(job)
+    local model = assert(job.model)
+    assert(model.phase == "short" and not assert(job.peek):is_open(), model.phase)
+    local virt ---@type table?
+    for _, m in ipairs(inline_marks(buf)) do
+        if m[4].virt_lines and not m[4].virt_lines_above then
+            virt = m
+        end
+    end
+    assert(virt and virt[2] == 2, vim.inspect(inline_marks(buf)))
+    local text = table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, virt[4].virt_lines[1]))
+    assert(text:find("│ It adds one.", 1, true), text)
+    -- Focusing a short answer opens it in the float.
+    assert(conduit.answer())
+    assert(vim.api.nvim_get_current_win() == job.peek.win)
+    job:close()
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: with answer = chat, answers stream into the chat without moving focus", function()
+    require("conduit.config").options.inline.answer = "chat"
+    long_buf()
+    local code_win = vim.api.nvim_get_current_win()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_for(function()
+        return job.cleaned
+    end, "answer in the chat")
+    require("conduit.config").options.inline.answer = "peek"
+    local chat = assert(conduit.current)
+    assert(chat == job.chat and chat.session_id == job.session_id)
+    local text = transcript(chat)
+    assert(text:find("## You\n\nexplain this", 1, true) and text:find("This code **adds** things.", 1, true), text)
+    assert(not chat.busy, "the chat isn't busy once the turn ends")
+    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
+    reset_threads()
+    vim.cmd("bwipeout!")
+end)
+
+test("history: inline answers and edits are kept per project, separate from threads", function()
+    local inline_history = require("conduit.inline_history")
+    vim.fn.delete(inline_history.dir, "rf")
+    local buf = long_buf()
+    local path = vim.fn.tempname() .. ".lua"
+    vim.api.nvim_buf_set_name(buf, path)
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    job:close()
+    local edit = assert(conduit.inline(2, 3, "uppercase it"))
+    wait_for(function()
+        return edit.cleaned
+    end, "inline edit")
+
+    local entries = inline_history.load()
+    assert(#entries == 2, vim.inspect(entries))
+    local e, a = entries[1], entries[2]
+    assert(e.kind == "edit" and e.outcome == "applied" and e.file == path and e.line1 == 2, vim.inspect(e))
+    assert(vim.deep_equal(e.old, { "local a = 1", "local b = 2" }) and e.new[1] == "LOCAL A = 1", vim.inspect(e))
+    assert(a.kind == "answer" and a.prompt == "explain this" and a.text:find("adds", 1, true), vim.inspect(a))
+    assert(a.model and a.effort, "entries remember the model and effort")
+
+    -- The list: newest first; `u` reverts the edit; `dd` deletes an entry.
+    local view = require("conduit.ui.history_float").open()
+    local rows = vim.api.nvim_buf_get_lines(view.buf, 0, -1, false)
+    assert(
+        #rows == 2 and rows[1]:find("uppercase it", 1, true) and rows[2]:find("explain this", 1, true),
+        vim.inspect(rows)
+    )
+    view.model:run("revert")
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "edit reverted")
+    assert(vim.api.nvim_buf_get_lines(view.buf, 0, 1, false)[1]:find("reverted", 1, true))
+    view.model:next()
+    view.model:run("delete")
+    assert(#inline_history.load() == 1 and inline_history.load()[1].outcome == "reverted")
+    press_here("q")
+    assert(not vim.api.nvim_win_is_valid(view.win))
+
+    -- Another file's history isn't listed under "buffer" scope.
+    local model = require("conduit.ui.headless.history").new({ entries = inline_history.load(), file = "/elsewhere" })
+    assert(model.scope == "project", "falls back to the project when the buffer has none")
+    model:toggle_scope()
+    assert(model.scope == "buffer" and #model.filtered == 0)
+
+    conduit.history({ qf = true })
+    local qf = vim.fn.getqflist()
+    assert(#qf == 1 and qf[1].lnum == 2 and qf[1].text:find("uppercase it", 1, true), vim.inspect(qf))
+    vim.cmd("cclose")
+    vim.cmd("bwipeout!")
+end)
+
+-- Transcript decorations ---------------------------------------------------------------
+
+---@param chat conduit.Chat
+---@return table[] decoration extmarks with details
+local function decorations(chat)
+    chat:_decorate()
+    return vim.api.nvim_buf_get_extmarks(
+        chat.transcript,
+        vim.api.nvim_create_namespace("conduit.decor"),
+        0,
+        -1,
+        { details = true }
+    )
+end
+
+---@param marks table[]
+---@param row integer 0-based
+---@return table[] details of the marks on `row`
+local function on_row(marks, row)
+    local out = {}
+    for _, m in ipairs(marks) do
+        if m[2] == row then
+            table.insert(out, m[4])
+        end
+    end
+    return out
+end
+
+test("transcript: role headers become rules, thinking folds, the buffer stays markdown", function()
+    local chat = assert(conduit.new())
+    send(chat, "hello there")
+    local text = transcript(chat)
+    assert(text:find("## You\n\nhello there", 1, true), "the buffer keeps its markdown: " .. text)
+    local you, thinking, agent = row_of(chat, "## You"), row_of(chat, "### Thinking"), row_of(chat, "## mock")
+    local marks = decorations(chat)
+
+    local rule = on_row(marks, you)[1]
+    local rule_text = table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, rule.virt_text))
+    assert(rule.virt_text_pos == "overlay" and vim.startswith(rule_text, "── You ──"), rule_text)
+    assert(on_row(marks, you + 2)[1].line_hl_group == "ConduitUserTurn", "the user's turn is shaded")
+
+    -- Thinking is folded to one line: the header says how much, the lines are concealed.
+    local fold = on_row(marks, thinking)[1]
+    assert(fold.virt_text[1][1]:find("▸ thought for 1 line", 1, true), vim.inspect(fold.virt_text))
+    local hidden = on_row(marks, thinking + 1)[1]
+    assert(hidden.conceal_lines == "" and hidden.end_row == agent - 2, vim.inspect(hidden))
+    assert(vim.wo[assert(chat:wins())].conceallevel == 2)
+
+    -- The agent's header after thinking continues the turn: no second rule, just hidden.
+    assert(on_row(marks, agent)[1].conceal_lines == "", vim.inspect(on_row(marks, agent)))
+
+    -- <CR> on the thinking header opens it.
+    local twin = assert(chat:wins())
+    vim.api.nvim_set_current_win(twin)
+    vim.api.nvim_win_set_cursor(twin, { thinking + 1, 0 })
+    press(chat.transcript, "<CR>")
+    marks = decorations(chat)
+    assert(on_row(marks, thinking)[1].virt_text[1][1]:find("▾ thinking", 1, true))
+    assert(#on_row(marks, thinking + 1) == 0, "open thinking isn't concealed")
+    reset_threads()
+end)
+
+test("transcript: forks keep their decorations; ui.icons = false uses ASCII glyphs", function()
+    local chat = assert(conduit.new())
+    send(chat, "hi")
+    local copy = require("conduit.ui.chat").new(chat.agent)
+    copy:copy_transcript(chat)
+    local marks = decorations(copy)
+    local you = row_of(copy, "## You")
+    assert(#on_row(marks, you) == 1 and on_row(marks, you)[1].virt_text_pos == "overlay", "rule in the copy")
+    copy:destroy()
+
+    local ui = require("conduit.config").options.ui
+    ui.icons = false
+    local hl = require("conduit.ui.hl")
+    assert(hl.glyph("completed") == "+" and hl.glyph("marker") == "*" and hl.glyph("model") == "")
+    local tool = require("conduit.ui.tool").header({ title = "Run make", status = "failed" })
+    assert(tool == "x Run make", tool)
+    local status = require("conduit.ui.status").of_chat(chat)
+    local bar =
+        require("conduit.ui.component").text(require("conduit.ui.component").render("ChipBar", { status = status }))
+    assert(not bar:find("◆", 1, true) and bar:find(status.model, 1, true), bar)
+    ui.icons = true
+    reset_threads()
 end)

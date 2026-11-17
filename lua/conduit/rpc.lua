@@ -87,6 +87,7 @@ end
 ---@param params? table
 ---@param cb? fun(err: table?, result: any)
 function Rpc:request(method, params, cb)
+    -- check if process running
     if self.closed then
         if cb then
             cb({ code = -32603, message = "agent process is not running" })

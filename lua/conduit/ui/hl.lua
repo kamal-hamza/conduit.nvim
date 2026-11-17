@@ -33,7 +33,90 @@ local GROUPS = {
     ConduitReviewDelete = { link = "DiffDelete" },
     ConduitReviewSign = { link = "DiagnosticInfo" },
     ConduitReviewHint = { link = "Comment" },
+    ConduitAccent = { link = "Special" },
+    ConduitMuted = { link = "Comment" },
+    ConduitTitleText = { link = "Title" },
+    ConduitChip = { link = "Normal" },
+    ConduitChipIcon = { link = "Special" },
+    ConduitContextHigh = { link = "DiagnosticWarn" },
+    ConduitRule = { link = "WinSeparator" },
+    ConduitRoleUser = { link = "Title" },
+    ConduitRoleAgent = { link = "Special" },
+    ConduitUserTurn = { link = "CursorLine" },
+    ConduitThinking = { link = "Comment" },
+    ConduitAnswer = { link = "NormalFloat" },
+    ConduitAnswerVirt = { link = "Comment" },
+    ConduitAnswerMarker = { link = "DiagnosticInfo" },
+    ConduitInlineAdded = { link = "DiffAdd" },
+    ConduitPickerCursor = { link = "CursorLine" },
+    ConduitPickerCurrent = { link = "Special" },
+    ConduitPickerIndex = { link = "Comment" },
+    ConduitHistoryAnswer = { link = "DiagnosticInfo" },
+    ConduitHistoryEdit = { link = "DiagnosticWarn" },
 }
+
+---Glyph sets: `ui.icons = true` (Unicode, in most fonts), `false` (ASCII) or
+---`"nerd"` (Nerd Font glyphs where they exist, Unicode for the rest).
+local GLYPHS = {
+    unicode = {
+        model = "◆",
+        thought_level = "◐",
+        effort = "◐",
+        mode = "⏵",
+        marker = "◆",
+        current = "●",
+        rule = "─",
+        bar = "│",
+        fold_closed = "▸",
+        fold_open = "▾",
+        pending = "○",
+        in_progress = "◐",
+        completed = "✓",
+        failed = "✗",
+        answer = "?",
+        edit = "~",
+        agent = "",
+    },
+    ascii = {
+        model = "",
+        thought_level = "",
+        effort = "",
+        mode = "",
+        marker = "*",
+        current = "*",
+        rule = "-",
+        bar = "|",
+        fold_closed = "+",
+        fold_open = "-",
+        pending = "o",
+        in_progress = "~",
+        completed = "+",
+        failed = "x",
+        answer = "?",
+        edit = "~",
+        agent = "",
+    },
+    nerd = {
+        model = "󰚩",
+        effort = "󰓅",
+        thought_level = "󰓅",
+        mode = "󰘳",
+        agent = "󰚩 ",
+    },
+}
+
+---The glyph for `name` in the configured set.
+---@param name string
+---@return string
+function M.glyph(name)
+    local icons = require("conduit.config").options.ui.icons
+    if icons == false then
+        return GLYPHS.ascii[name] or ""
+    elseif icons == "nerd" then
+        return GLYPHS.nerd[name] or GLYPHS.unicode[name] or ""
+    end
+    return GLYPHS.unicode[name] or ""
+end
 
 local function apply()
     for name, spec in pairs(GROUPS) do
@@ -63,10 +146,21 @@ M.WINHIGHLIGHT = "NormalFloat:ConduitNormal,FloatBorder:ConduitBorder,FloatTitle
 -- Borders without a top edge can't hold a title (nvim_open_win errors).
 local NO_TITLE = { [""] = true, none = true, shadow = true }
 
----Border for floats: nil defers to the user's 'winborder' when it's set.
----@return "rounded"?
+---Border for floats with a title (prompts, pickers): `ui.border` when set, else
+---the user's 'winborder', else rounded.
+---@return string|string[]|nil
 function M.border()
+    local border = require("conduit.config").options.ui.border
+    if border then
+        return border
+    end
     return NO_TITLE[vim.o.winborder] and "rounded" or nil
+end
+
+---Border for content floats (inline answers): none unless `ui.border` is set.
+---@return string|string[]
+function M.content_border()
+    return require("conduit.config").options.ui.border or "none"
 end
 
 ---Width of an inline float shown over `win`: `ui.inline.width` clamped to the
@@ -86,8 +180,7 @@ end
 ---@param name string
 ---@return [string, string]
 function M.agent(name)
-    local icons = require("conduit.config").options.ui.icons
-    return { (" %s%s "):format(icons and "󰚩 " or "", name), "ConduitAgent" }
+    return { (" %s%s "):format(M.glyph("agent"), name), "ConduitAgent" }
 end
 
 ---Footer chunks for key hints, e.g. `{ { "<CR>", "send" }, { "q", "close" } }`.

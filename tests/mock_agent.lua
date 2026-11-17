@@ -6,8 +6,9 @@
 -- "run") ask permission for a multi-line command. `run tools` sends tool calls
 -- with output, locations and diffs. Inline requests get the selection back
 -- upper-cased in <replace>, or an answer for questions ("explain…" or ask
--- mode). Prompts starting "follow:" get a follow-up answer. `title <text>`
--- names the session with a `session_info_update`. `/review <args>` runs the
+-- mode; "short…" gets a one-line answer). Prompts starting "follow:" get a follow-up answer. `title <text>`
+-- names the session with a `session_info_update`. Echoed turns end with a
+-- `usage_update` (4200 of 10000 tokens, 0.50 USD). `/review <args>` runs the
 -- review command (see COMMANDS, advertised after every session/new, load,
 -- resume and fork). Anything else is echoed back.
 --
@@ -560,7 +561,9 @@ handlers["session/prompt"] = function(params)
         return run_command(sid, false)
     end
     if inline_request and code then
-        if text:find("You are answering", 1, true) or inline_request:match("^explain") then
+        if inline_request:match("^short") then
+            say(sid, "It adds one.")
+        elseif text:find("You are answering", 1, true) or inline_request:match("^explain") then
             say(sid, "This code **adds** things.\n\n```lua\n")
             say(sid, "return 42\n```\n")
         else
@@ -696,6 +699,11 @@ handlers["session/prompt"] = function(params)
                 say(sid, ("\n%s %s %d"):format(b.type, name, b.resource and #b.resource.text or 0))
             end
         end
+        -- Context use after the turn (ACP usage_update): 42% of a 10k window.
+        update(
+            sid,
+            { sessionUpdate = "usage_update", used = 4200, size = 10000, cost = { amount = 0.5, currency = "USD" } }
+        )
         return { stopReason = "end_turn" }
     end
 
