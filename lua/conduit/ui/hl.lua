@@ -19,40 +19,20 @@ local GROUPS = {
     ConduitInlinePending = { link = "CursorLine" },
     ConduitInlineSign = { link = "DiagnosticInfo" },
     ConduitInlineStatus = { link = "Comment" },
-    ConduitThreadActive = { link = "Title" },
-    ConduitThreadInactive = { link = "Comment" },
-    ConduitThreadSeparator = { link = "WinSeparator" },
-    ConduitThreadBusy = { link = "DiagnosticInfo" },
-    ConduitThreadUnread = { link = "DiagnosticWarn" },
-    ConduitThreadWaiting = { link = "DiagnosticError" },
-    ConduitThreadNew = { link = "Special" },
-    ConduitThreadMeta = { link = "Comment" },
-    ConduitSearchMatch = { link = "Search" },
     ConduitReviewAdd = { link = "DiffAdd" },
     ConduitReviewChange = { link = "DiffChange" },
     ConduitReviewDelete = { link = "DiffDelete" },
     ConduitReviewSign = { link = "DiagnosticInfo" },
     ConduitReviewHint = { link = "Comment" },
-    ConduitAccent = { link = "Special" },
     ConduitMuted = { link = "Comment" },
     ConduitTitleText = { link = "Title" },
-    ConduitChip = { link = "Normal" },
-    ConduitChipIcon = { link = "Special" },
-    ConduitContextHigh = { link = "DiagnosticWarn" },
-    ConduitRule = { link = "WinSeparator" },
-    ConduitRoleUser = { link = "Title" },
-    ConduitRoleAgent = { link = "Special" },
-    ConduitUserTurn = { link = "CursorLine" },
-    ConduitThinking = { link = "Comment" },
-    ConduitAnswer = { link = "NormalFloat" },
-    ConduitAnswerVirt = { link = "Comment" },
-    ConduitAnswerMarker = { link = "DiagnosticInfo" },
     ConduitInlineAdded = { link = "DiffAdd" },
     ConduitPickerCursor = { link = "CursorLine" },
     ConduitPickerCurrent = { link = "Special" },
     ConduitPickerIndex = { link = "Comment" },
     ConduitHistoryAnswer = { link = "DiagnosticInfo" },
     ConduitHistoryEdit = { link = "DiagnosticWarn" },
+    ConduitHistoryChange = { link = "DiagnosticHint" },
 }
 
 ---Glyph sets: `ui.icons = true` (Unicode, in most fonts), `false` (ASCII) or
@@ -63,18 +43,14 @@ local GLYPHS = {
         thought_level = "◐",
         effort = "◐",
         mode = "⏵",
-        marker = "◆",
         current = "●",
-        rule = "─",
-        bar = "│",
-        fold_closed = "▸",
-        fold_open = "▾",
         pending = "○",
         in_progress = "◐",
         completed = "✓",
         failed = "✗",
         answer = "?",
         edit = "~",
+        change = "±",
         agent = "",
     },
     ascii = {
@@ -82,18 +58,14 @@ local GLYPHS = {
         thought_level = "",
         effort = "",
         mode = "",
-        marker = "*",
         current = "*",
-        rule = "-",
-        bar = "|",
-        fold_closed = "+",
-        fold_open = "-",
         pending = "o",
         in_progress = "~",
         completed = "+",
         failed = "x",
         answer = "?",
         edit = "~",
+        change = "+",
         agent = "",
     },
     nerd = {
@@ -157,13 +129,13 @@ function M.border()
     return NO_TITLE[vim.o.winborder] and "rounded" or nil
 end
 
----Border for content floats (inline answers): none unless `ui.border` is set.
+---Border for content floats (history list, help): none unless `ui.border` is set.
 ---@return string|string[]
 function M.content_border()
     return require("conduit.config").options.ui.border or "none"
 end
 
----Width of an inline float shown over `win`: `ui.inline.width` clamped to the
+---Width of an inline prompt shown over `win`: `ui.inline.width` clamped to the
 ---window, and never wider than the editor.
 ---@param win integer
 ---@return integer

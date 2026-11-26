@@ -8,69 +8,66 @@ local M = {}
 ---option id or category, e.g. `{ model = "opus", effort = "high", mode = "acceptEdits" }`
 ---@field mcp_servers? conduit.McpServers MCP servers for this agent, replacing global ones of the
 ---same name; `false` leaves a global server out
-
----@class conduit.ThreadsConfig
----@field scope "cwd"|"all" Which past threads to list: this directory's, or all of them
----@field persist boolean Keep a local index of threads (ids and titles, not transcripts)
----@field max_listed integer Most past threads to fetch from the agent
----@field hide_inline boolean Leave inline requests' sessions out of thread lists
----@field notify boolean Notify when a thread you're not looking at finishes or needs permission
+---@field session_meta? table Extra `_meta` for `session/new`, merged over what the sandbox sends
+---(e.g. `{ claudeCode = { options = { ... } } }` for Claude's adapter)
 
 ---@class conduit.TerminalConfig
 ---@field enabled boolean Offer to run the agent's commands (ACP `terminal` capability)
 ---@field output_limit integer Most bytes of output kept per command
 
----@class conduit.UiKeys Keys in the chat (input and transcript); false disables one
----@field model string|false Pick the model
----@field effort_next string|false Next effort level (takes a count)
----@field effort_prev string|false Previous effort level (takes a count)
----@field mode_next string|false Next mode (takes a count)
----@field options string|false Pick any session option
----@field help string|false List the keys
-
 ---@class conduit.UiConfig
----@field width number
----@field input_height integer
 ---@field icons boolean|"nerd"
 ---@field spinner string[]
----@field picker "auto"|"snacks"|"telescope"|"fzf_lua"|"mini_pick"|"select"|conduit.PickerProvider
----@field thread_bar boolean
----@field inline { width: { min: integer, max: integer }, max_height: integer }
----@field keys conduit.UiKeys
----@field mouse boolean
+---@field inline { width: { min: integer, max: integer } }
+---@field sidebar { width: number, position: "right"|"left" }
 ---@field border? string|string[]
 ---@field components table<string, fun(props: table, builtin: fun(props: table): table): table>
----@field remember_options boolean
-
----@class conduit.ToolsConfig
----@field diff_lines integer Most diff lines shown per tool call before it's expanded
----@field output_lines integer Most output lines shown per tool call before it's expanded
----@field hide_output table<string, boolean> Tool kinds whose output stays hidden until expanded
 
 ---@class conduit.ReviewConfig
----@field enabled boolean Review agent edits at all; false applies them as they come
----@field chat boolean Review edits made during chat turns
----@field inline boolean Review edits from inline requests (their replies and any tool edits)
+---@field enabled boolean Review agent edits; false applies them as they come
+---@field replies boolean Review inline replies (the rewritten selection) too
 ---@field keys conduit.ReviewKeys Buffer-local keys in files with changes to review; false disables one
 
 ---@class conduit.InlineConfig
 ---@field agent? string
 ---@field options table<string, string>
 ---@field mcp_servers boolean
----@field answer "peek"|"chat"|"float" Where answers go
----@field history { enabled: boolean, max_entries: integer }
+
+---@class conduit.HistoryConfig
+---@field enabled boolean
+---@field max_entries integer
+
+---@class conduit.CommandPolicy
+---@field default "ask"|"allow"|"deny" For commands no rule matches
+---@field allow string[] Lua patterns; a command runs without asking when every part matches one
+---@field deny string[] Lua patterns; a command is refused when any part matches one
+
+---@class conduit.IsolationConfig
+---@field enabled boolean Run ACP terminal commands in an OS sandbox (sandbox-exec, bwrap)
+---@field network boolean Let sandboxed commands use the network
+---@field writable string[] Directories sandboxed commands may write besides the roots and temp dirs
+---@field env "inherit"|"minimal" Pass Neovim's environment, or only PATH, HOME, locale and the like
+---@field unavailable "ask"|"run"|"deny" What to do when no OS sandbox is installed
+
+---@class conduit.SandboxConfig
+---@field enabled boolean
+---@field roots string[] Directories the agent may touch besides the working directory
+---@field outside "deny"|"ask" File access and edits outside the roots
+---@field commands conduit.CommandPolicy
+---@field isolation conduit.IsolationConfig
+---@field bypass boolean Allow the agent's own "bypass permissions" mode (it skips every check)
 
 ---@class conduit.Config
 ---@field default_agent string
 ---@field agents table<string, conduit.AgentSpec>
 ---@field ui conduit.UiConfig
 ---@field inline conduit.InlineConfig
+---@field history conduit.HistoryConfig
 ---@field mcp_servers conduit.McpServers
 ---@field mentions { completion: "auto"|"blink"|"native" }
----@field threads conduit.ThreadsConfig
----@field tools conduit.ToolsConfig
 ---@field terminal conduit.TerminalConfig
 ---@field review conduit.ReviewConfig
+---@field sandbox conduit.SandboxConfig
 ---@field log_level integer
 M.defaults = {
     default_agent = "claude",
@@ -80,60 +77,34 @@ M.defaults = {
         codex = { cmd = "npx", args = { "-y", "@agentclientprotocol/codex-acp" } },
     },
     ui = {
-        -- Fraction of the editor width (<= 1) or an absolute column count.
-        width = 0.4,
-        input_height = 6,
         -- Glyphs: true (Unicode: ◆ ◐ ⏵ ✓), false (ASCII only) or "nerd" (Nerd Font).
         icons = true,
         -- Progress animation frames; a single frame disables the animation.
         spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
-        -- Picker for threads and search: "auto" uses snacks.nvim, telescope.nvim, fzf-lua
-        -- or mini.pick when loaded (in that order), else vim.ui.select. Or name one, or
-        -- pass a function that takes a conduit.PickerSpec.
-        picker = "auto",
-        -- Show threads as tabs in the chat's winbar; state and options move to the
-        -- prompt's winbar.
-        thread_bar = true,
         inline = {
-            -- Width of the inline prompt and answer floats, in columns.
+            -- Width of the inline prompt, in columns.
             width = { min = 40, max = 84 },
-            -- Most lines an unfocused answer float shows.
-            max_height = 10,
         },
-        -- Chat keys (input and transcript buffers); false disables one. Every action
-        -- is also a <Plug>(conduit-...) mapping and a require("conduit") function.
-        keys = {
-            model = "<M-m>",
-            effort_next = "<M-e>",
-            effort_prev = "<M-E>",
-            mode_next = "<S-Tab>",
-            options = "go",
-            help = "g?",
-        },
-        -- Click the status chips to change options. Off: everything is on keys.
-        mouse = false,
-        -- Border for conduit floats. nil: answers have none, prompts follow 'winborder'.
+        -- Where answers are shown. `width` is a fraction of the editor (<= 1) or columns.
+        sidebar = { width = 0.35, position = "right" },
+        -- Border for conduit floats. nil: prompts follow 'winborder'.
         border = nil,
         -- Replace or add components by name, e.g.
-        -- `Chip = function(props, builtin) return builtin(props) end` (see :h conduit-components).
+        -- `HistoryLine = function(props, builtin) return builtin(props) end` (see :h conduit-components).
         components = {},
-        -- Options you pick in a chat become the defaults for new threads (this session).
-        remember_options = false,
     },
     inline = {
-        -- Agent for inline edits; defaults to `default_agent`.
+        -- Agent for inline requests; defaults to `default_agent`.
         agent = nil,
-        -- Session options for inline edits, layered over the agent's `options`.
+        -- Session options for inline requests, layered over the agent's `options`.
         options = {},
-        -- Give inline sessions the MCP servers too. Each inline request opens a new
-        -- session, so the agent would start every server per request.
+        -- Give inline sessions the MCP servers too. Each request opens a new session,
+        -- so the agent starts every server per request.
         mcp_servers = false,
-        -- Where answers go: "peek" (an unfocused float or virtual lines by the code),
-        -- "chat" (the chat panel) or "float" (a focused float, the old behaviour).
-        answer = "peek",
-        -- Every inline answer and edit, per project, separate from chat threads.
-        history = { enabled = true, max_entries = 500 },
     },
+    -- Every answer, edit, agent change and command, per project, in
+    -- stdpath("state")/conduit/history.
+    history = { enabled = true, max_entries = 1000 },
     -- MCP servers handed to the agent for every session, keyed by name, e.g.
     -- `github = { command = "github-mcp", env = { TOKEN = function() return os.getenv("GH") end } }`
     -- or `docs = { type = "http", url = "https://example.com/mcp", headers = {} }`.
@@ -143,43 +114,19 @@ M.defaults = {
         -- `@` completion: "auto" uses blink.cmp when it's loaded, else the native popup.
         completion = "auto",
     },
-    threads = {
-        -- Past threads to offer: "cwd" (sessions started in the current directory) or "all".
-        scope = "cwd",
-        -- Remember threads (session ids and titles, never transcripts) in
-        -- stdpath("data")/conduit/threads.json. Agents that can load sessions but not
-        -- list them rely on it for their history.
-        persist = true,
-        max_listed = 200,
-        -- Leave inline requests' sessions out of thread lists.
-        hide_inline = true,
-        -- Notify when a thread you're not looking at finishes a turn or asks for permission.
-        notify = true,
-    },
-    -- Tool calls in the chat: diffs and output are previewed under each call, up to
-    -- these many lines; <CR> on a call shows all of it.
-    tools = {
-        diff_lines = 20,
-        output_lines = 8,
-        -- Kinds whose output (often a whole file) stays hidden until expanded.
-        hide_output = { read = true, search = true, fetch = true },
-    },
     terminal = {
-        -- Let agents run commands through Neovim (ACP terminals). Agents that run
-        -- commands themselves (Claude, Codex) still show their output in the chat.
+        -- Let agents run commands through Neovim (ACP terminals), under `sandbox`.
+        -- Agents that run commands themselves (Claude, Codex) ask for permission
+        -- instead, and the same command policy answers those requests.
         enabled = true,
         -- Most bytes of output kept per command; the oldest output is dropped first.
-        -- Agents can ask for less.
         output_limit = 1024 * 1024,
     },
     -- Review of agent edits: files the agent changes keep their earlier content, and
-    -- the changes show in the file as hunks to accept or reject. Off, edits apply as
-    -- they come (combine with the agent's `mode = "acceptEdits"` option for no prompts at all).
+    -- the changes show in the file as hunks to accept or reject.
     review = {
         enabled = true,
-        chat = true,
-        -- Inline requests stay fire-and-forget unless this is on.
-        inline = false,
+        replies = true,
         keys = {
             next = "]r",
             prev = "[r",
@@ -188,6 +135,63 @@ M.defaults = {
             accept_file = "<localleader>A",
             reject_file = "<localleader>R",
         },
+    },
+    -- What agents may do: which files they can touch, which commands they can run
+    -- (asked, allowed or refused), and how ACP terminal commands are isolated.
+    sandbox = {
+        enabled = true,
+        -- The working directory is always a root.
+        roots = {},
+        outside = "deny",
+        -- Commands are split at `&&`, `||`, `;`, `|` and newlines; each part is
+        -- matched on its own. Command substitution (`$(...)`, backticks) always asks.
+        commands = {
+            default = "ask",
+            -- Read-only commands that run without asking.
+            allow = {
+                "^ls%f[%s%z]",
+                "^pwd$",
+                "^cat%f[%s%z]",
+                "^head%f[%s%z]",
+                "^tail%f[%s%z]",
+                "^wc%f[%s%z]",
+                "^rg%f[%s%z]",
+                "^grep%f[%s%z]",
+                "^git status%f[%s%z]",
+                "^git diff%f[%s%z]",
+                "^git log%f[%s%z]",
+                "^git show%f[%s%z]",
+            },
+            deny = {
+                "^sudo%f[%s%z]",
+                "^doas%f[%s%z]",
+                "^su%f[%s%z]",
+                "^rm%s.*%-%a*[rR]%a*f",
+                "^rm%s.*%-%a*f%a*[rR]",
+                "^rm%s.*%-%-recursive",
+                "^mkfs",
+                "^dd%s",
+                "^shutdown%f[%s%z]",
+                "^reboot%f[%s%z]",
+                "^chmod%s+%-R%s+777",
+                "^git push%s.*%-%-force",
+                "^git push%s.*%-f%f[%s%z]",
+                "^git reset%s+%-%-hard",
+                "^git clean%s+%-%a*f",
+                -- Piping into a shell (`curl ... | sh`).
+                "^sh$",
+                "^bash$",
+                "^zsh$",
+            },
+        },
+        isolation = {
+            enabled = true,
+            network = false,
+            writable = {},
+            env = "inherit",
+            unavailable = "ask",
+        },
+        bypass = false,
     },
     log_level = vim.log.levels.WARN,
 }
@@ -198,6 +202,13 @@ M.options = vim.deepcopy(M.defaults)
 ---@param opts? table
 function M.setup(opts)
     M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
+    -- Pattern lists replace the defaults instead of merging index by index.
+    local cmds = opts and opts.sandbox and opts.sandbox.commands
+    for _, key in ipairs({ "allow", "deny" }) do
+        if cmds and cmds[key] then
+            M.options.sandbox.commands[key] = vim.deepcopy(cmds[key])
+        end
+    end
 end
 
 return M

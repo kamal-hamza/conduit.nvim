@@ -4,28 +4,363 @@ conduit.setup({
     default_agent = "mock",
     agents = { mock = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua" } } },
     log_level = vim.log.levels.OFF,
+    sandbox = {
+        -- Temp files are fair game; commands run unless a test says otherwise, and
+        -- CI machines without an OS sandbox run them unisolated.
+        roots = { vim.fn.fnamemodify(vim.fn.tempname(), ":h:h") },
+        commands = { default = "allow" },
+        isolation = { unavailable = "run" },
+    },
 })
--- Keep the thread index and the inline history out of the user's directories.
-require("conduit.history").path = vim.fn.tempname() .. "/threads.json"
-require("conduit.inline_history").dir = vim.fn.tempname() .. "/inline"
+-- Keep the history out of the user's directories.
+require("conduit.history").dir = vim.fn.tempname() .. "/history"
 
-local function transcript(chat)
-    return table.concat(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false), "\n")
+---A session handler for tests that talk to the agent directly (what the chat
+---used to be): collects the agent's text, tool calls, terminals and decisions.
+---@class conduit.test.Session: conduit.SessionHandler
+---@field agent conduit.Agent
+---@field session_id? string
+---@field text string
+---@field tools table<string, table>
+---@field terminals conduit.Terminal[]
+---@field decisions table<string, string>
+---@field history { role: string, text: string }[]
+---@field exited? integer
+---@field err? string
+local Session = {}
+Session.__index = Session
+
+function Session:on_update(u)
+    if u.sessionUpdate == "agent_message_chunk" and u.content and u.content.type == "text" then
+        self.text = self.text .. u.content.text
+    elseif (u.sessionUpdate == "tool_call" or u.sessionUpdate == "tool_call_update") and u.toolCallId then
+        self.tools[u.toolCallId] = vim.tbl_extend("force", self.tools[u.toolCallId] or {}, u)
+    end
 end
 
----A window's winbar without highlight groups.
----@param win integer
----@return string
-local function winbar_text(win)
-    return (vim.wo[win].winbar:gsub("%%#[%w_]+#", ""):gsub("%%%*", ""))
+function Session:request_permission(params, respond, reason)
+    local permission = require("conduit.ui.permission")
+    local call = params.toolCall or {}
+    permission.ask(self.agent.name, permission.merge(self.tools[call.toolCallId], call), params, respond, reason)
 end
 
-local function send(chat, text)
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { text })
-    chat:submit()
+function Session:on_agent_exit(code)
+    self.exited = code
+end
+
+function Session:on_terminal(term)
+    table.insert(self.terminals, term)
+end
+
+function Session:on_decision(id, decision)
+    self.decisions[id] = decision
+end
+
+---@param name? string Agent
+---@return conduit.test.Session
+local function session(name)
+    return setmetatable({
+        agent = assert(conduit.agent(name)),
+        text = "",
+        tools = {},
+        terminals = {},
+        decisions = {},
+        history = {},
+        cwd = vim.fn.getcwd(),
+    }, Session)
+end
+
+---Send `text` (with its @ mentions) as a turn, starting the session if needed.
+---@param s conduit.test.Session
+---@param text string
+local function send(s, text)
+    local done = false
+    local function prompt()
+        table.insert(s.history, { role = "user", text = text })
+        local blocks = require("conduit.mentions").blocks(text, s.agent)
+        s.agent:prompt(assert(s.session_id), blocks, function(err)
+            s.err, done = err, true
+        end)
+    end
+    if s.session_id then
+        prompt()
+    else
+        s.agent:start(function(err)
+            assert(not err, err)
+            s.agent:new_session(s.cwd, s, function(serr, sid)
+                assert(not serr, serr)
+                s.session_id = sid
+                prompt()
+            end)
+        end)
+    end
     wait_for(function()
-        return not chat.busy
+        return done
     end, "turn to finish")
+end
+
+---Text of a float's title or footer chunks.
+---@param win integer
+---@param key "title"|"footer"
+---@return string
+local function chunks_text(win, key)
+    local cfg = vim.api.nvim_win_get_config(win) --[[@as table]]
+    return table.concat(vim.tbl_map(function(c)
+        return c[1]
+    end, cfg[key] or {}))
+end
+
+local function fixture()
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root .. "/sub", "p")
+    vim.fn.writefile({ "alpha" }, root .. "/a.lua")
+    vim.fn.writefile({ "bravo" }, root .. "/sub/b.lua")
+    return root
+end
+
+-- A valid 1x1 PNG.
+local PNG = vim.base64.decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+---@param path string
+---@param bytes string
+local function write_bytes(path, bytes)
+    local f = assert(io.open(path, "wb"))
+    f:write(bytes)
+    f:close()
+end
+
+---Image fixtures: shot.png, photo.jpg (JPEG signature only) and fake.png (text).
+local function image_fixture()
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    write_bytes(root .. "/shot.png", PNG)
+    write_bytes(root .. "/photo.jpg", "\255\216\255\224\0\16JFIF\0rest")
+    vim.fn.writefile({ "not really a png" }, root .. "/fake.png")
+    return root
+end
+
+---Run `fn` with vim.notify captured; returns the messages.
+---@param fn fun()
+---@return string[]
+local function capture_notify(fn)
+    local orig = vim.notify
+    local msgs = {} ---@type string[]
+    vim.notify = function(msg)
+        table.insert(msgs, msg)
+    end
+    local ok, err = pcall(fn)
+    vim.notify = orig
+    assert(ok, err)
+    return msgs
+end
+
+local function prompt_caps(caps)
+    return { info = { agentCapabilities = { promptCapabilities = caps } } }
+end
+
+local function inline_buf()
+    vim.cmd.enew()
+    vim.bo.filetype = "lua"
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "keep", "local a = 1", "local b = 2", "keep" })
+    return vim.api.nvim_get_current_buf()
+end
+
+local function wait_turn(job)
+    wait_for(function()
+        return not job.busy and job.session_id ~= nil or job.cleaned
+    end, "inline turn")
+end
+
+---@param buf integer
+---@param lhs string
+local function press(buf, lhs)
+    vim.api.nvim_buf_call(buf, function()
+        vim.fn.maparg(lhs, "n", false, true).callback()
+    end)
+end
+
+---Run a normal-mode mapping of the current buffer in the current window (unlike
+---`press`, focus changes the mapping makes stick).
+---@param lhs string
+local function press_here(lhs)
+    vim.fn.maparg(lhs, "n", false, true).callback()
+end
+
+---Stub vim.ui.select with `choose` (returns the item to pick, or nil) while `fn` runs.
+---@param choose fun(items: any[], opts: table): any
+---@param fn fun()
+---@return string[] prompts
+local function with_select(choose, fn)
+    local orig = vim.ui.select
+    local prompts = {} ---@type string[]
+    vim.ui.select = function(items, opts, cb)
+        table.insert(prompts, opts.prompt or "")
+        cb(choose(items, opts))
+    end
+    local ok, err = pcall(fn)
+    vim.ui.select = orig
+    assert(ok, err)
+    return prompts
+end
+
+---The sidebar's buffer text.
+---@return string
+local function sidebar_text()
+    local sidebar = require("conduit.ui.sidebar")
+    local buf = assert(sidebar.buf, "no sidebar buffer")
+    return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+end
+
+local function reset_sidebar()
+    require("conduit.ui.sidebar").reset()
+    if #vim.api.nvim_tabpage_list_wins(0) > 1 then
+        vim.cmd("only")
+    end
+end
+
+---A handler for sessions a test opens directly.
+---@type conduit.SessionHandler
+local null_handler = {
+    on_update = function() end,
+    request_permission = function(_, _, respond)
+        respond(nil, { outcome = { outcome = "cancelled" } })
+    end,
+    on_agent_exit = function() end,
+}
+
+---Collect log warnings while `fn` runs.
+---@param fn fun()
+---@return string[]
+local function warnings(fn)
+    local log = require("conduit.log")
+    local orig, out = log.warn, {}
+    log.warn = function(msg)
+        table.insert(out, msg)
+    end
+    local ok, err = pcall(fn)
+    log.warn = orig
+    assert(ok, err)
+    return out
+end
+
+local ALL_CAPS = "--threads=load,list,resume,close,delete,fork,title"
+
+---Register a mock agent with extra arguments under a new name and start it.
+---@param name string
+---@param ... string Extra mock arguments
+---@return conduit.Agent agent
+local function extra_agent(name, ...)
+    local config = require("conduit.config").options
+    config.agents[name] = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua", ... } }
+    local agent = assert(conduit.agent(name))
+    local started
+    agent:start(function(err)
+        assert(not err, err)
+        started = true
+    end)
+    wait_for(function()
+        return started
+    end, name .. " to start")
+    return agent
+end
+
+---@param name string
+local function drop_agent(name)
+    local agent = conduit.agents[name] ---@type conduit.Agent?
+    if agent then
+        agent:stop()
+        conduit.agents[name] = nil
+    end
+    require("conduit.config").options.agents[name] = nil
+end
+
+---@param list conduit.Command[]
+---@return string[]
+local function names(list)
+    return vim.tbl_map(function(c)
+        return c.name
+    end, list)
+end
+
+---Results the mock said for each terminal step (`<step> <json>` lines), in order.
+---@param s conduit.test.Session
+---@return { step: string, value: table }[]
+local function term_results(s)
+    local out = {}
+    for _, line in ipairs(vim.split(s.text, "\n", { plain = true })) do
+        local step, json = line:match("^(%a+) ({.*})$")
+        if step and json then
+            table.insert(out, { step = step, value = vim.json.decode(json, { luanil = { object = true } }) })
+        end
+    end
+    return out
+end
+
+---Run a `term` prompt in a new session.
+---@param create table terminal/create params
+---@param steps string[]
+---@return conduit.test.Session, table<string, table> results Last result per step
+local function run_term(create, steps)
+    local s = session()
+    send(s, "term " .. vim.json.encode({ create = create, steps = steps }))
+    local by_step = {}
+    for _, r in ipairs(term_results(s)) do
+        by_step[r.step] = r.value
+    end
+    return s, by_step
+end
+
+-- Review helpers -----------------------------------------------------------
+
+local review = require("conduit.review")
+local review_ui = require("conduit.ui.review")
+
+---A temp file with `lines`, its canonical path.
+---@param lines string[]
+---@return string
+local function review_file(lines)
+    local path = vim.fn.tempname()
+    vim.fn.writefile(lines, path)
+    return require("conduit.fs").canonical(path)
+end
+
+---The review entry for `path`, if it's tracked.
+---@param path string
+---@return conduit.ReviewFile?
+local function tracked(path)
+    local file = review.files[path] ---@type conduit.ReviewFile?
+    return file
+end
+
+local function review_marks(buf)
+    return vim.api.nvim_buf_get_extmarks(buf, review_ui.ns, 0, -1, { details = true })
+end
+
+---@param buf integer
+---@param lhs string
+---@return boolean
+local function has_map(buf, lhs)
+    return vim.api.nvim_buf_call(buf, function()
+        return vim.fn.maparg(lhs, "n", false, true).buffer == 1
+    end)
+end
+
+local function review_cleanup()
+    review.reset()
+    reset_sidebar()
+    vim.cmd("silent! %bwipeout!")
+end
+
+---Entries of this project's history.
+---@return conduit.HistoryEntry[]
+local function history_entries()
+    return require("conduit.history").load()
+end
+
+local function clear_history()
+    vim.fn.delete(require("conduit.history").path())
 end
 
 test("rpc: initialize handshake", function()
@@ -40,182 +375,6 @@ test("rpc: initialize handshake", function()
     assert(not err, err)
     assert(assert(agent.info).protocolVersion == 1)
     agent:stop()
-end)
-
-test("chat: streams agent message chunks into the transcript", function()
-    local chat = assert(conduit.new())
-    send(chat, "hi there")
-    local text = transcript(chat)
-    assert(text:find("## You\n\nhi there", 1, true), text)
-    assert(text:find("### Thinking\n\npondering", 1, true), text)
-    assert(text:find("## mock\n\nHello from mock\nyou said: hi there", 1, true), text)
-    assert(chat.session_id == "mock-session")
-end)
-
-test("chat: tool calls, permissions and fs read/write", function()
-    local path = vim.fn.tempname()
-    vim.fn.writefile({ "hello", "world" }, path)
-
-    local orig_select = vim.ui.select
-    local prompt
-    local shown ---@type string?
-    local chat = assert(conduit.new())
-    vim.ui.select = function(items, opts, cb)
-        prompt, shown = opts.prompt, transcript(chat)
-        cb(items[1])
-    end
-
-    send(chat, "edit " .. path)
-    vim.ui.select = orig_select
-
-    -- Kind and location come from the earlier tool call: the request only adds the diff.
-    local rel = vim.fn.fnamemodify(path, ":~:.")
-    assert(prompt == ("mock wants to Edit %s\nkind: edit\n  %s:1"):format(path, rel), tostring(prompt))
-    -- The diff sent with the permission request is drawn before asking.
-    assert(shown and shown:find("○ Edit " .. path, 1, true), shown)
-    assert(shown:find("(+2 −2)\n```diff\n@@ -1,2 +1,2 @@\n-hello\n-world\n+HELLO\n+WORLD\n```", 1, true), shown)
-    local text = transcript(chat)
-    -- The status-only update that completes the call keeps its diff.
-    assert(
-        text:find(
-            "✓ Edit " .. path .. " · review pending\n`" .. vim.fn.fnamemodify(path, ":~") .. "` (+2 −2)\n```diff",
-            1,
-            true
-        ),
-        text
-    )
-    assert(text:find("> 1 file waiting for review · :Conduit review", 1, true), text)
-    assert(text:find("- [x] Read file", 1, true), text)
-    assert(not text:find("[~]", 1, true), "plan should be replaced in place:\n" .. text)
-    assert(text:find("first line was: hello", 1, true), text)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "HELLO", "WORLD" }))
-    require("conduit.review").reset()
-end)
-
----Headings of a markdown text, as parsed by treesitter (so not ones inside code blocks).
----@param text string
----@return string[]
-local function headings(text)
-    local parser = vim.treesitter.get_string_parser(text, "markdown")
-    local root = assert(parser:parse())[1]:root()
-    local query = vim.treesitter.query.parse("markdown", "(atx_heading) @h")
-    local out = {}
-    for _, node in query:iter_captures(root, text) do
-        table.insert(out, (vim.treesitter.get_node_text(node, text):gsub("\n$", "")))
-    end
-    return out
-end
-
----0-based row of the first transcript line starting with `prefix`.
-local function row_of(chat, prefix)
-    for i, line in ipairs(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)) do
-        if vim.startswith(line, prefix) then
-            return i - 1
-        end
-    end
-    error("no line starting with " .. prefix)
-end
-
-test("chat: tool calls show diffs, output and locations, and expand in place", function()
-    local chat = assert(conduit.new())
-    send(chat, "run tools")
-    local text = transcript(chat)
-
-    -- Output: the agent's own fence is replaced by one longer than anything inside,
-    -- and the preview is cut at `output_lines`.
-    assert(
-        text:find("✓ Run make\n`````console\nout 1\n````md\n```\nout 4\n", 1, true)
-            and text:find("out 8\n`````\n… 12 more lines (`<CR>` to expand)\n", 1, true),
-        text
-    )
-    assert(not text:find("out 9", 1, true), text)
-    -- Read output stays hidden; its location is listed relative to the cwd.
-    assert(text:find("✓ Read notes.md\n→ `notes.md:3`\n… 2 lines of output (`<CR>` to show)\n", 1, true), text)
-    assert(not text:find("secret body", 1, true), text)
-    -- New files and long diffs.
-    assert(text:find("`new.lua` (new file, +1)\n```diff\n@@ -0,0 +1 @@\n+print(1)\n```", 1, true), text)
-    assert(text:find("`big.txt` (+30 −30)\n```diff\n", 1, true), text)
-    assert(text:find("… 41 more diff lines (`<CR>` to expand)", 1, true), text)
-    -- Every fence is closed: the reply after the tools is still a heading.
-    local hs = headings(text)
-    assert(hs[#hs] == "## mock" and text:find("## mock\n\ntools done$"), vim.inspect(hs))
-
-    -- <CR> on any line of a block expands it, and again collapses it.
-    chat:open()
-    local twin = assert(chat:wins())
-    vim.api.nvim_set_current_win(twin)
-    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "→ `notes.md:3`") + 1, 0 })
-    vim.api.nvim_feedkeys(vim.keycode("<CR>"), "mx", false)
-    text = transcript(chat)
-    assert(text:find("→ `notes.md:3`\n```\nsecret body\nline two\n```\n", 1, true), text)
-    assert(chat:toggle_tool(row_of(chat, "✓ Run make")))
-    assert(transcript(chat):find("out 20\n`````\n\n✓ Read notes.md", 1, true), transcript(chat))
-    assert(chat:toggle_tool(row_of(chat, "✓ Read notes.md")))
-    assert(chat:toggle_tool(row_of(chat, "✓ Run make")))
-    assert(chat:toggle_tool(row_of(chat, "`big.txt`") + 3))
-    text = transcript(chat)
-    assert(not text:find("secret body", 1, true) and not text:find("out 9", 1, true), text)
-    assert(text:find("+b 30\n```\n\n## mock", 1, true), text)
-    assert(not chat:toggle_tool(row_of(chat, "tools done")), "not a tool call")
-
-    -- A copy (as in a fork) keeps the blocks expandable.
-    local copy = assert(conduit.new())
-    copy:copy_transcript(chat)
-    assert(copy:toggle_tool(row_of(copy, "✓ Read notes.md")))
-    assert(transcript(copy):find("secret body", 1, true) and not transcript(chat):find("secret body", 1, true))
-end)
-
-test("chat: gd shows a tool call's diff side by side, gf opens its file", function()
-    local chat = assert(conduit.new())
-    send(chat, "run tools")
-    chat:open()
-    local twin = assert(chat:wins())
-    vim.api.nvim_set_current_win(twin)
-    local tabs = #vim.api.nvim_list_tabpages()
-    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "`big.txt`") + 1, 0 })
-    vim.api.nvim_feedkeys("gd", "mx", false)
-    local wins = vim.api.nvim_tabpage_list_wins(0)
-    assert(#vim.api.nvim_list_tabpages() == tabs + 1 and #wins == 2, "diff tab")
-    local old = vim.api.nvim_win_get_buf(wins[1])
-    local new = vim.api.nvim_win_get_buf(wins[2])
-    assert(vim.wo[wins[1]].diff and vim.wo[wins[2]].diff)
-    assert(vim.api.nvim_buf_get_lines(old, 0, 1, false)[1] == "a 1")
-    assert(vim.api.nvim_buf_get_lines(new, 29, 30, false)[1] == "b 30")
-    assert(vim.wo[wins[2]].winbar == "after: big.txt", vim.wo[wins[2]].winbar)
-    vim.api.nvim_feedkeys("q", "mx", false)
-    assert(#vim.api.nvim_list_tabpages() == tabs and not vim.api.nvim_buf_is_valid(old))
-
-    vim.api.nvim_set_current_win(twin)
-    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "✓ Read notes.md") + 1, 0 })
-    vim.api.nvim_feedkeys("gf", "mx", false)
-    local win = vim.api.nvim_get_current_win()
-    assert(win ~= twin and vim.api.nvim_buf_get_name(0) == vim.fn.getcwd() .. "/notes.md", vim.api.nvim_buf_get_name(0))
-    vim.cmd("bwipeout!")
-end)
-
-test("permission: prompts show the kind, the full command and paths", function()
-    local orig_select = vim.ui.select
-    local prompts = {} ---@type string[]
-    vim.ui.select = function(items, opts, cb)
-        table.insert(prompts, opts.prompt)
-        cb(items[2])
-    end
-    local chat = assert(conduit.new())
-    send(chat, "run")
-    send(chat, "run-argv")
-    vim.ui.select = orig_select
-
-    local expected = table.concat({
-        "mock wants to echo one",
-        "kind: execute",
-        "  /tmp/conduit-run",
-        "$ echo one",
-        "  echo two",
-        "  echo three",
-    }, "\n")
-    assert(prompts[1] == expected, tostring(prompts[1]))
-    assert(prompts[2] == expected, "argv commands show the shell script:\n" .. tostring(prompts[2]))
-    assert(transcript(chat):find("chose reject", 1, true), transcript(chat))
 end)
 
 test("permission: describe handles each rawInput shape and fallbacks", function()
@@ -264,75 +423,6 @@ test("agent: missing executable reports an error", function()
     assert(err and err:find("executable not found"), err)
 end)
 
-test("chat: uses its own filetypes with diagnostics disabled", function()
-    local chat = assert(conduit.new())
-    assert(vim.bo[chat.transcript].filetype == "conduit")
-    assert(vim.bo[chat.input].filetype == "conduit_input")
-    assert(not vim.diagnostic.is_enabled({ bufnr = chat.input }))
-end)
-
-test("options: config options, defaults and set_option", function()
-    local config = require("conduit.config").options
-    config.agents.mock.options = { effort = "low" }
-    local chat = assert(conduit.new())
-    local done
-    chat:ensure_session(function()
-        done = true
-    end)
-    wait_for(function()
-        return done
-    end, "session")
-    config.agents.mock.options = nil
-
-    local options = require("conduit.options")
-    local sid = assert(chat.session_id)
-    local opts = chat.agent:get_options(sid)
-    assert(assert(options.find(opts, "effort")).current == "low", "default should be applied")
-    assert(assert(options.find(opts, "thought_level")).id == "effort", "effort is found by category")
-
-    done = false
-    chat.agent:set_option(sid, "model", "smart", function(err)
-        assert(not err, err)
-        done = true
-    end)
-    wait_for(function()
-        return done
-    end, "set_option")
-    assert(assert(options.find(chat.agent:get_options(sid), "model")).current == "smart")
-    chat:_refresh_winbar()
-    -- Options show as chips in the prompt's winbar; "ready" needs no chip.
-    local _, iwin = chat:wins()
-    local winbar = winbar_text(assert(iwin))
-    assert(winbar:find("◆ SMART   ◐ LOW", 1, true), winbar)
-    assert(not winbar:find("ready", 1, true), winbar)
-end)
-
-test("options: legacy modes and models", function()
-    local config = require("conduit.config").options
-    config.agents.legacy = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua", "--legacy" } }
-    local chat = assert(conduit.new("legacy"))
-    local done
-    chat:ensure_session(function()
-        done = true
-    end)
-    wait_for(function()
-        return done
-    end, "session")
-    local options = require("conduit.options")
-    local sid = assert(chat.session_id)
-    local opts = chat.agent:get_options(sid)
-    assert(assert(options.find(opts, "mode")).current == "ask")
-    done = false
-    chat.agent:set_option(sid, "model", "m2", function(err)
-        assert(not err, err)
-        done = true
-    end)
-    wait_for(function()
-        return done
-    end, "set_model")
-    assert(assert(options.find(opts, "model")).current == "m2")
-end)
-
 test("inline: extracts the outermost fenced block", function()
     local extract = require("conduit.inline").extract
     assert(extract("sure:\n```lua\nlocal x = 1\n```\n") == "local x = 1")
@@ -365,25 +455,6 @@ test("inline: rewrites the selected lines", function()
     vim.cmd("bwipeout!")
 end)
 
----Text of a float's title or footer chunks.
----@param win integer
----@param key "title"|"footer"
----@return string
-local function chunks_text(win, key)
-    local cfg = vim.api.nvim_win_get_config(win) --[[@as table]]
-    return table.concat(vim.tbl_map(function(c)
-        return c[1]
-    end, cfg[key] or {}))
-end
-
-local function fixture()
-    local root = vim.fn.tempname()
-    vim.fn.mkdir(root .. "/sub", "p")
-    vim.fn.writefile({ "alpha" }, root .. "/a.lua")
-    vim.fn.writefile({ "bravo" }, root .. "/sub/b.lua")
-    return root
-end
-
 test("mentions: parses existing files and directories only", function()
     local root = fixture()
     local mentions = require("conduit.mentions")
@@ -406,48 +477,6 @@ test("mentions: embeds content when supported, links otherwise", function()
     assert(link.type == "resource_link" and link.name == "a.lua")
     assert(link.uri == vim.uri_from_fname(root .. "/a.lua"))
 end)
-
--- A valid 1x1 PNG.
-local PNG = vim.base64.decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-)
-
----@param path string
----@param bytes string
-local function write_bytes(path, bytes)
-    local f = assert(io.open(path, "wb"))
-    f:write(bytes)
-    f:close()
-end
-
----Image fixtures: shot.png, photo.jpg (JPEG signature only) and fake.png (text).
-local function image_fixture()
-    local root = vim.fn.tempname()
-    vim.fn.mkdir(root, "p")
-    write_bytes(root .. "/shot.png", PNG)
-    write_bytes(root .. "/photo.jpg", "\255\216\255\224\0\16JFIF\0rest")
-    vim.fn.writefile({ "not really a png" }, root .. "/fake.png")
-    return root
-end
-
----Run `fn` with vim.notify captured; returns the messages.
----@param fn fun()
----@return string[]
-local function capture_notify(fn)
-    local orig = vim.notify
-    local msgs = {} ---@type string[]
-    vim.notify = function(msg)
-        table.insert(msgs, msg)
-    end
-    local ok, err = pcall(fn)
-    vim.notify = orig
-    assert(ok, err)
-    return msgs
-end
-
-local function prompt_caps(caps)
-    return { info = { agentCapabilities = { promptCapabilities = caps } } }
-end
 
 test("mentions: images become image blocks when the agent accepts them", function()
     local root = image_fixture()
@@ -519,35 +548,6 @@ test("mentions: fuzzy candidates include files and directories", function()
     assert(vim.tbl_contains(words(""), "diagnostics"), "specials are offered")
     local ranked = words("su")
     assert(ranked[1] == "sub/", "path-prefix directories rank first: " .. vim.inspect(ranked))
-end)
-
-test("mentions: typing @ opens completion in the input", function()
-    local chat = assert(conduit.new())
-    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
-    local items ---@type { col: integer, list: table[] }?
-    local orig = vim.fn.complete
-    require("conduit.mentions").reset()
-    vim.fn.complete = function(col, list)
-        items = { col = col, list = list }
-    end
-    -- Cursor on the trailing "x" stands in for the insert-mode cursor after "co".
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "hi @lua/cox" })
-    vim.api.nvim_win_set_cursor(0, { 1, 10 })
-    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
-    vim.fn.complete = orig
-    assert(items and items.col == 5, vim.inspect(items))
-    local words = vim.tbl_map(function(i)
-        return i.word
-    end, items.list)
-    assert(vim.tbl_contains(words, "lua/conduit/"), vim.inspect(words))
-end)
-
-test("chat: @mentions are sent as resources", function()
-    local chat = assert(conduit.new())
-    send(chat, "look at @tests/run.lua and @lua/conduit/ui/")
-    local text = transcript(chat)
-    assert(text:find("resource run.lua %d+"), text)
-    assert(text:find("resource ui %d+"), text)
 end)
 
 test("prompt: floating input submits its text and closes", function()
@@ -640,53 +640,11 @@ test("blink: source returns ranked items with a text edit after @", function()
     assert(#assert(inside_word).items == 0, "no completion inside words")
 end)
 
-local function inline_buf()
-    vim.cmd.enew()
-    vim.bo.filetype = "lua"
-    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "keep", "local a = 1", "local b = 2", "keep" })
-    return vim.api.nvim_get_current_buf()
-end
-
-local function wait_turn(job)
-    wait_for(function()
-        return not job.busy and job.session_id ~= nil or job.cleaned
-    end, "inline turn")
-end
-
-test("inline: with answer = float, answers open in a focused float under the selection", function()
-    require("conduit.config").options.inline.answer = "float"
-    local buf = inline_buf()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    assert(job.kind == "answer" and job.answer and job.answer:is_open(), "answer float should be open")
-    local text = job.answer:text()
-    assert(text:find("This code **adds** things.", 1, true), text)
-    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "buffer must not change")
-    assert(vim.api.nvim_win_get_config(job.answer.win).relative == "win")
-    assert(chunks_text(job.answer.win, "title"):find("mock", 1, true), chunks_text(job.answer.win, "title"))
-    local footer = chunks_text(job.answer.win, "footer")
-    assert(footer:find("a apply", 1, true) and footer:find("g? keys", 1, true), footer)
-    assert(not job.spinner:is_running(), "spinner should stop when the turn ends")
-
-    job:follow_up("follow: more please")
-    wait_turn(job)
-    text = job.answer:text()
-    assert(text:find("**You:** follow: more please", 1, true), text)
-    assert(text:find("Follow-up answer to: follow: more please", 1, true), text)
-
-    -- `a` applies the last code block from the answer to the selection.
-    job:apply_code()
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert(vim.deep_equal(lines, { "keep", "return 42", "keep" }), vim.inspect(lines))
-    assert(not job.answer:is_open())
-    assert(#vim.api.nvim_buf_get_extmarks(buf, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {}) == 0)
-    assert(job.agent.sessions[job.session_id] == nil, "session should be released")
-    require("conduit.config").options.inline.answer = "peek"
-    vim.cmd("bwipeout!")
-end)
-
 test("inline: permission prompts include what the agent wants to run", function()
+    reset_sidebar()
     inline_buf()
+    -- The command runs in /tmp, outside the roots: without the sandbox, the user decides.
+    require("conduit.config").options.sandbox.enabled = false
     local orig_select = vim.ui.select
     local prompt ---@type string?
     vim.ui.select = function(items, opts, cb)
@@ -696,39 +654,12 @@ test("inline: permission prompts include what the agent wants to run", function(
     local job = assert(conduit.inline(2, 3, "run it"))
     wait_turn(job)
     vim.ui.select = orig_select
+    require("conduit.config").options.sandbox.enabled = true
     assert(prompt, "no permission prompt")
     assert(prompt:find("^mock wants to echo one\nkind: execute\n"), prompt)
     assert(prompt:find("$ echo one\n  echo two\n  echo three", 1, true), prompt)
     assert(job.tools.r1 and job.tools.r1.status == "completed", vim.inspect(job.tools))
-    job:close()
-    vim.cmd("bwipeout!")
-end)
-
-test("inline: a leading ? forces ask mode", function()
-    inline_buf()
-    local job = assert(conduit.inline(2, 3, "? uppercase it"))
-    wait_turn(job)
-    assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
-    job:close()
-    vim.cmd("bwipeout!")
-end)
-
-test("inline: answers can move into the chat with their session", function()
-    inline_buf()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    local sid = job.session_id
-    job:to_chat()
-    local chat = assert(conduit.current)
-    assert(chat.session_id == sid and chat.agent.sessions[sid] == chat)
-    local text = transcript(chat)
-    assert(text:find("## You\n\nexplain this", 1, true), text)
-    assert(text:find("This code **adds** things.", 1, true), text)
-    assert(require("conduit.threads").index(chat), "adopted chat is a thread")
-    assert(chat.title == "explain this", tostring(chat.title))
-    send(chat, "hi again")
-    assert(transcript(chat):find("you said: hi again", 1, true))
-    vim.cmd("only")
+    reset_sidebar()
     vim.cmd("bwipeout!")
 end)
 
@@ -867,601 +798,6 @@ test("highlights: conduit groups survive :colorscheme", function()
     assert(vim.api.nvim_get_hl(0, { name = "ConduitModeEdit" }).link == "DiagnosticWarn")
 end)
 
-test("api: every :Conduit subcommand resolves", function()
-    local fns = { "open", "new", "toggle", "cancel", "stop", "add_range", "inline", "ask", "edit", "option" }
-    table.insert(fns, "commands")
-    vim.list_extend(fns, { "threads", "continue_thread", "thread_next", "thread_prev", "thread_close" })
-    vim.list_extend(fns, { "thread_delete", "thread_fork", "thread_rename", "thread_alternate", "thread_goto" })
-    vim.list_extend(fns, { "thread_search", "resume", "status" })
-    vim.list_extend(fns, { "review", "accept", "reject" })
-    vim.list_extend(fns, { "answer", "answers", "history", "cycle_option", "statusline" })
-    for _, fn in ipairs(fns) do
-        assert(type(conduit[fn]) == "function", "missing conduit." .. fn)
-    end
-    local complete = vim.fn.getcompletion("Conduit ", "cmdline")
-    local subs =
-        { "inline", "ask", "edit", "stop", "model", "effort", "mode", "threads", "thread", "continue", "resume" }
-    vim.list_extend(subs, { "commands", "review", "accept", "reject", "answer", "answers", "history" })
-    for _, sub in ipairs(subs) do
-        assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
-    end
-    for _, plug in ipairs({ "model", "effort-next", "effort-prev", "mode-next", "answer", "history", "ask" }) do
-        assert(vim.fn.maparg(("<Plug>(conduit-%s)"):format(plug), "n") ~= "", "missing <Plug>(conduit-" .. plug .. ")")
-    end
-    local actions = vim.fn.getcompletion("Conduit thread ", "cmdline")
-    for _, action in ipairs({ "new", "next", "prev", "alt", "goto", "search", "close", "delete", "fork", "rename" }) do
-        assert(vim.tbl_contains(actions, action), "missing thread action " .. action)
-    end
-end)
-
-test("agent: requests after the agent exits fail cleanly", function()
-    local agent = require("conduit.agent").new("mock", require("conduit.config").options.agents.mock)
-    local err
-    agent:prompt("gone", {}, function(e)
-        err = e
-    end)
-    assert(err == "mock is not running", err)
-end)
-
----Delete every thread and close the chat windows, for tests that count threads.
-local function reset_threads()
-    local threads = require("conduit.threads")
-    while threads.list[1] do
-        threads.close(threads.list[1])
-    end
-    vim.cmd("silent! only")
-end
-
----@param buf integer
----@param lhs string
-local function press(buf, lhs)
-    vim.api.nvim_buf_call(buf, function()
-        vim.fn.maparg(lhs, "n", false, true).callback()
-    end)
-end
-
-test("threads: new threads keep earlier ones alive in the same windows", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local a = assert(conduit.new())
-    send(a, "first thread")
-    local twin, iwin = a:wins()
-    twin, iwin = assert(twin), assert(iwin)
-    local wins = #vim.api.nvim_list_wins()
-
-    local b = assert(conduit.new())
-    assert(#threads.list == 2 and threads.current == b and conduit.current == b)
-    assert(#vim.api.nvim_list_wins() == wins, "reuses the chat windows")
-    assert(vim.api.nvim_win_get_buf(twin) == b.transcript)
-    assert(vim.api.nvim_win_get_buf(iwin) == b.input)
-    assert(vim.api.nvim_buf_is_valid(a.transcript) and transcript(a):find("first thread", 1, true))
-    assert(winbar_text(twin) == " 1 first thread │ 2 New thread ", winbar_text(twin))
-
-    send(b, "second thread")
-    assert(a.session_id ~= b.session_id)
-    assert(not transcript(b):find("first thread", 1, true))
-
-    press(b.input, "]t")
-    assert(threads.current == a and vim.api.nvim_win_get_buf(twin) == a.transcript)
-    assert(vim.wo[twin].winbar:find("ConduitThreadActive# 1 first thread", 1, true), vim.wo[twin].winbar)
-    press(a.transcript, "[t")
-    assert(threads.current == b)
-    reset_threads()
-end)
-
-test("threads: picker lists live threads and switches", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local a = assert(conduit.new())
-    send(a, "alpha")
-    local b = assert(conduit.new())
-
-    local orig_select = vim.ui.select
-    local labels ---@type string[]?
-    vim.ui.select = function(items, opts, cb)
-        labels = vim.tbl_map(assert(opts.format_item), items)
-        cb(items[1])
-    end
-    press(b.input, "gs")
-    vim.ui.select = orig_select
-    labels = assert(labels)
-
-    assert(labels[1] == "  alpha · mock", labels[1])
-    assert(labels[2] == "● New thread · mock", labels[2])
-    assert(threads.current == a and a:is_open() and not b:is_open())
-    reset_threads()
-end)
-
-test("threads: closing the current thread shows its neighbour", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local a = assert(conduit.new())
-    send(a, "keep me")
-    local b = assert(conduit.new())
-    send(b, "drop me")
-    local twin = assert(b:wins())
-    local sid = assert(b.session_id)
-
-    vim.cmd("Conduit thread close")
-    assert(#threads.list == 1 and threads.current == a)
-    assert(not vim.api.nvim_buf_is_valid(b.transcript) and not vim.api.nvim_buf_is_valid(b.input))
-    assert(a.agent.sessions[sid] == nil, "session handler removed")
-    assert(vim.api.nvim_win_get_buf(twin) == a.transcript)
-
-    conduit.thread_close()
-    assert(#threads.list == 0 and conduit.current == nil)
-    assert(not vim.api.nvim_buf_is_valid(a.transcript))
-    reset_threads()
-end)
-
-test("threads: titles come from the first prompt, then the agent", function()
-    reset_threads()
-    local chat = assert(conduit.new())
-    assert(chat:display_title() == "New thread")
-    send(chat, ("x"):rep(80))
-    local title = assert(chat.title)
-    assert(vim.fn.strcharlen(title) == 50 and vim.endswith(title, "…"), title)
-    send(chat, "title Refactor the parser")
-    assert(chat.title == "Refactor the parser", chat.title)
-    local twin = assert(chat:wins())
-    assert(winbar_text(twin) == " 1 Refactor the parser ", winbar_text(twin))
-
-    -- Without the thread bar, the transcript's winbar shows the title and agent.
-    require("conduit.config").options.ui.thread_bar = false
-    chat:_refresh_winbar()
-    assert(winbar_text(twin) == " Refactor the parser%=mock ", winbar_text(twin))
-    require("conduit.config").options.ui.thread_bar = true
-    reset_threads()
-end)
-
-test("threads: opening another agent reuses its latest thread", function()
-    reset_threads()
-    local config = require("conduit.config").options
-    config.agents.other = config.agents.mock
-    local a = assert(conduit.new())
-    local b = assert(conduit.open("other"))
-    assert(b ~= a and b.agent.name == "other")
-    assert(conduit.open("mock") == a)
-    assert(conduit.open("other") == b)
-    config.agents.other = nil
-    reset_threads()
-    conduit.agents.other:stop()
-    conduit.agents.other = nil
-end)
-
----@class conduit.test.Methods
----@field [integer] string
----@field last_params? table Params of the last session/load or session/resume
-
-local ALL_CAPS = "--threads=load,list,resume,close,delete,fork,title"
-
----Register a mock agent with thread capabilities under a new name and start it.
----@param name string
----@param ... string Extra mock arguments
----@return conduit.Agent agent, conduit.test.Methods methods Requests sent to it, in order
-local function thread_agent(name, ...)
-    local config = require("conduit.config").options
-    config.agents[name] = { cmd = vim.v.progpath, args = { "-l", "tests/mock_agent.lua", ... } }
-    local agent = assert(conduit.agent(name))
-    local methods = {} ---@type conduit.test.Methods
-    local request = agent._request --[[@as fun(self: conduit.Agent, method: string, params: table, cb: fun(err: table?, result: any))]]
-    ---@param self conduit.Agent
-    ---@param method string
-    ---@param params table
-    ---@param cb fun(err: table?, result: any)
-    local function spy(self, method, params, cb)
-        table.insert(methods, method)
-        if method == "session/load" or method == "session/resume" then
-            methods.last_params = params
-        end
-        return request(self, method, params, cb)
-    end
-    rawset(agent, "_request", spy)
-    local started
-    agent:start(function(err)
-        assert(not err, err)
-        started = true
-    end)
-    wait_for(function()
-        return started
-    end, name .. " to start")
-    return agent, methods
-end
-
----@param name string
-local function drop_agent(name)
-    reset_threads()
-    local agent = conduit.agents[name] ---@type conduit.Agent?
-    if agent then
-        agent:stop()
-        conduit.agents[name] = nil
-    end
-    require("conduit.config").options.agents[name] = nil
-end
-
----@param methods conduit.test.Methods
----@param method string
----@return integer
-local function count(methods, method)
-    return #vim.tbl_filter(function(m)
-        return m == method
-    end, methods)
-end
-
----Run the thread picker for `agent`, choosing the first item `choose` accepts.
----@param agent? conduit.Agent
----@param choose fun(item: conduit.PickItem): boolean
----@return string[] labels
-local function pick(agent, choose)
-    local orig_select = vim.ui.select
-    local labels ---@type string[]?
-    vim.ui.select = function(items, opts, cb)
-        labels = vim.tbl_map(assert(opts.format_item), items)
-        for _, item in ipairs(items) do
-            if choose(item.data) then
-                return cb(item)
-            end
-        end
-        cb(nil)
-    end
-    require("conduit.threads").pick(agent)
-    wait_for(function()
-        return labels ~= nil
-    end, "the thread picker")
-    vim.ui.select = orig_select
-    return assert(labels)
-end
-
----@param haystack string
----@param needle string
----@return integer
-local function occurrences(haystack, needle)
-    local n, init = 0, 1
-    while true do
-        local i = haystack:find(needle, init, true)
-        if not i then
-            return n
-        end
-        n, init = n + 1, i + #needle
-    end
-end
-
-test("threads: timestamps parse as UTC and honour offsets", function()
-    local threads = require("conduit.threads")
-    assert(threads.parse_time("2026-01-03T10:00:00Z") == 1767434400)
-    assert(threads.parse_time("2026-01-03T10:00:00.123Z") == 1767434400)
-    assert(threads.parse_time("2026-01-03T12:00:00+02:00") == 1767434400)
-    assert(threads.parse_time("nonsense") == nil and threads.parse_time(nil) == nil)
-    assert(threads.ago(os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() - 7200) --[[@as string]]) == "2h ago")
-end)
-
-test("threads: past sessions are listed across pages and replayed when opened", function()
-    reset_threads()
-    local agent, methods = thread_agent("past", ALL_CAPS, "--seed")
-    local labels = pick(agent, function(item)
-        return item.info ~= nil and item.info.session_id == "past-1"
-    end)
-    assert(count(methods, "session/list") == 2, "follows nextCursor")
-    assert(labels[1] == "  Old work · past · " .. require("conduit.threads").ago("2026-01-03T10:00:00Z"), labels[1])
-    assert(vim.startswith(assert(labels[2]), "  Older work · past"), labels[2])
-    assert(vim.startswith(assert(labels[3]), "  past-3 · past"), labels[3])
-    assert(labels[4] == "+ New thread" and #labels == 4, vim.inspect(labels))
-
-    local chat = assert(conduit.current)
-    wait_for(function()
-        return chat.session_id == "past-1" and not chat.busy
-    end, "session/load")
-    assert(assert(methods.last_params).cwd == vim.fn.getcwd())
-    local text = transcript(chat)
-    assert(text:find("## You\n\nhello past\n\n## past\n\nhi from the past", 1, true), text)
-    assert(text:find("✓ Read notes\n\n✗ Run make …\n```\nmake: *** no rule\n```", 1, true), text)
-    assert(text:find("## You\n\nfirst part\n\n## You\n\nsecond part\n\n## past\n\nboth parts answered", 1, true), text)
-    assert(chat.title == "Old work" and chat:display_title() == "Old work")
-    assert(require("conduit.history").get("past", "past-1"), "recorded in the index")
-
-    send(chat, "picking up again")
-    assert(transcript(chat):find("you said: picking up again", 1, true))
-
-    -- Live threads aren't listed twice.
-    labels = pick(agent, function()
-        return false
-    end)
-    assert(labels[1] == "● Old work · past", labels[1])
-    assert(not vim.tbl_contains(labels, "  Old work · past"), vim.inspect(labels))
-    drop_agent("past")
-end)
-
-test("threads: agents without session capabilities only offer live threads", function()
-    reset_threads()
-    local agent, methods = thread_agent("plain")
-    local chat = assert(conduit.new("plain"))
-    send(chat, "only me")
-    local labels = pick(agent, function()
-        return false
-    end)
-    assert(vim.deep_equal(labels, { "● only me · plain", "+ New thread" }), vim.inspect(labels))
-    assert(count(methods, "session/list") == 0 and count(methods, "session/load") == 0)
-    drop_agent("plain")
-end)
-
-test("threads: load-only agents list threads from the local index", function()
-    reset_threads()
-    local history = require("conduit.history")
-    local agent, methods = thread_agent("loader", "--threads=load")
-    local chat = assert(conduit.new("loader"))
-    send(chat, "remember me")
-    local sid = assert(chat.session_id)
-    require("conduit.threads").close(chat)
-
-    history.reset() -- reread from disk
-    assert(assert(history.get("loader", sid)).title == "remember me")
-    local labels = pick(agent, function(item)
-        return item.info ~= nil and item.info.session_id == sid
-    end)
-    assert(vim.startswith(assert(labels[1]), "  remember me · loader"), vim.inspect(labels))
-    assert(count(methods, "session/list") == 0)
-    local reopened = assert(conduit.current)
-    wait_for(function()
-        return reopened.session_id == sid and not reopened.busy
-    end, "session/load")
-    assert(
-        transcript(reopened):find("## You\n\nremember me\n\n### Thinking\n\npondering", 1, true),
-        transcript(reopened)
-    )
-    drop_agent("loader")
-end)
-
-test("threads: a corrupt index is ignored", function()
-    local history = require("conduit.history")
-    local path = history.path
-    history.path = vim.fn.tempname()
-    vim.fn.writefile({ "{not json" }, history.path)
-    history.reset()
-    assert(#history.list("mock") == 0)
-    history.record({ agent = "mock", session_id = "s", cwd = "/" })
-    history.reset()
-    assert(history.get("mock", "s"), "rewritten")
-    history.path = path
-    history.reset()
-end)
-
-test("threads: sessions are resumed after the agent restarts", function()
-    reset_threads()
-    local agent, methods = thread_agent("resumer", ALL_CAPS)
-    local chat = assert(conduit.new("resumer"))
-    send(chat, "before exit")
-    local sid = chat.session_id
-    agent:stop()
-    wait_for(function()
-        return chat.resume_id == sid
-    end, "the agent to exit")
-    send(chat, "after exit")
-    local restored = rawget(chat, "session_id")
-    assert(restored == sid, tostring(restored))
-    assert(count(methods, "session/resume") == 1)
-    local text = transcript(chat)
-    assert(occurrences(text, "you said: before exit") == 1, text)
-    assert(text:find("you said: after exit", 1, true), text)
-    drop_agent("resumer")
-end)
-
-test("threads: load-only agents reload a session without re-rendering it", function()
-    reset_threads()
-    local agent, methods = thread_agent("reloader", "--threads=load", "--seed")
-    local chat =
-        require("conduit.threads").open(agent, { agent = "reloader", session_id = "past-1", cwd = vim.fn.getcwd() })
-    wait_for(function()
-        return chat.session_id == "past-1" and not chat.busy
-    end, "session/load")
-    agent:stop()
-    wait_for(function()
-        return chat.resume_id == "past-1"
-    end, "the agent to exit")
-    send(chat, "still there?")
-    assert(chat.session_id == "past-1" and count(methods, "session/load") == 2)
-    local text = transcript(chat)
-    assert(occurrences(text, "hi from the past") == 1, text)
-    assert(text:find("you said: still there?", 1, true), text)
-    drop_agent("reloader")
-end)
-
-test("threads: agents that can't restore sessions start over after exiting", function()
-    reset_threads()
-    local agent = thread_agent("forgetful")
-    local chat = assert(conduit.new("forgetful"))
-    send(chat, "first life")
-    agent:stop()
-    wait_for(function()
-        return chat.resume_id ~= nil
-    end, "the agent to exit")
-    send(chat, "second life")
-    assert(chat.session_id ~= nil and chat.resume_id == nil)
-    local text = transcript(chat)
-    assert(text:find("can't restore sessions; starting a new one without the earlier context", 1, true), text)
-    assert(text:find("you said: second life", 1, true), text)
-    drop_agent("forgetful")
-end)
-
-test("threads: closing releases the session; deleting removes it", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local history = require("conduit.history")
-    local agent, methods = thread_agent("closer", ALL_CAPS)
-    local chat = assert(conduit.new("closer"))
-    send(chat, "close me")
-    local sid = assert(chat.session_id)
-    threads.close(chat)
-    wait_for(function()
-        return count(methods, "session/close") == 1
-    end, "session/close")
-    assert(agent.sessions[sid] == nil)
-    local again ---@type { err: string? }?
-    agent:close_session(sid, function(err)
-        again = { err = err }
-    end)
-    wait_for(function()
-        return again
-    end, "second session/close")
-    assert(assert(again).err == nil, "closing twice (-32002) counts as success")
-
-    -- Closed threads stay in the history.
-    local labels = pick(agent, function(item)
-        return item.info ~= nil and item.info.session_id == sid
-    end)
-    assert(vim.startswith(assert(labels[1]), "  close me · closer"), vim.inspect(labels))
-    local reopened = assert(conduit.current)
-    wait_for(function()
-        return reopened.session_id == sid and not reopened.busy
-    end, "session/load")
-
-    local orig_select = vim.ui.select
-    local question
-    vim.ui.select = function(items, opts, cb)
-        question = opts.prompt
-        cb(items[1])
-    end
-    vim.cmd("Conduit thread delete")
-    vim.ui.select = orig_select
-    assert(question == 'Delete thread "close me" permanently?', question)
-    wait_for(function()
-        return count(methods, "session/delete") == 1
-    end, "session/delete")
-    assert(#threads.list == 0 and history.get("closer", sid) == nil)
-    labels = pick(agent, function()
-        return false
-    end)
-    assert(vim.deep_equal(labels, { "+ New thread" }), vim.inspect(labels))
-    drop_agent("closer")
-end)
-
-test("threads: deleting without session/delete hides the thread", function()
-    reset_threads()
-    local agent = thread_agent("hider", "--threads=load,list", "--seed")
-    require("conduit.threads").delete(agent, "past-2")
-    local labels = pick(agent, function()
-        return false
-    end)
-    assert(not vim.tbl_contains(labels, "  Older work · hider"), vim.inspect(labels))
-    for _, label in ipairs(labels) do
-        assert(not label:find("Older work", 1, true), label)
-    end
-    drop_agent("hider")
-end)
-
-test("threads: forking copies the thread into a new session", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    thread_agent("forker", ALL_CAPS)
-    local chat = assert(conduit.new("forker"))
-    send(chat, "fork me")
-    local forked ---@type conduit.Chat?
-    threads.fork(chat, function(err, f)
-        assert(not err, err)
-        forked = f
-    end)
-    wait_for(function()
-        return forked
-    end, "session/fork")
-    local fork = assert(forked)
-    assert(fork.session_id == "fork-1" and threads.current == fork and #threads.list == 2)
-    assert(fork.title == "fork me (fork)", fork.title)
-    local text = transcript(fork)
-    assert(text:find("you said: fork me", 1, true) and text:find("forked from fork me", 1, true), text)
-    send(fork, "only in the fork")
-    assert(not transcript(chat):find("only in the fork", 1, true))
-
-    local plain = assert(conduit.new())
-    send(plain, "no forks here")
-    local err
-    threads.fork(plain, function(e)
-        err = e
-    end)
-    assert(err == "mock doesn't support forking sessions", err)
-    drop_agent("forker")
-end)
-
-test("threads: renamed titles stick and are stored by the agent", function()
-    reset_threads()
-    local _, methods = thread_agent("namer", ALL_CAPS)
-    local chat = assert(conduit.new("namer"))
-    send(chat, "untitled")
-    local done
-    chat:rename("  Custom name ", function(err)
-        done = { err = err }
-    end)
-    wait_for(function()
-        return done
-    end, "session/set_title")
-    assert(count(methods, "session/set_title") == 1)
-    assert(chat.title == "Custom name", chat.title)
-    send(chat, "title Agent's idea")
-    assert(chat:display_title() == "Custom name", "agent titles don't replace user titles")
-    assert(assert(require("conduit.history").get("namer", assert(chat.session_id))).custom_title)
-    drop_agent("namer")
-end)
-
-test("threads: inline requests stay out of thread lists", function()
-    reset_threads()
-    local config = require("conduit.config").options
-    local agent, methods = thread_agent("inliner", ALL_CAPS)
-    config.inline.agent = "inliner"
-    inline_buf()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    local sid = assert(job.session_id)
-    job:close()
-    config.inline.agent = nil
-    vim.cmd("bwipeout!")
-    assert(count(methods, "session/close") == 1, "inline sessions are released")
-    local labels = pick(agent, function()
-        return false
-    end)
-    assert(vim.deep_equal(labels, { "+ New thread" }), vim.inspect(labels))
-    assert(require("conduit.history").is_hidden("inliner", sid))
-    drop_agent("inliner")
-end)
-
-test("threads: continue reopens the most recent past thread", function()
-    reset_threads()
-    thread_agent("continuer", ALL_CAPS, "--seed")
-    vim.cmd("Conduit continue continuer")
-    local chat
-    wait_for(function()
-        chat = conduit.current
-        return chat and chat.session_id == "past-1" and not chat.busy
-    end, "the latest thread to load")
-    -- With a live thread, continue goes back to it.
-    local other = assert(conduit.new())
-    conduit.continue_thread("continuer")
-    assert(conduit.current == chat and other ~= chat)
-    drop_agent("continuer")
-end)
-
----A handler for sessions a test opens directly.
----@type conduit.SessionHandler
-local null_handler = {
-    on_update = function() end,
-    request_permission = function(_, _, respond)
-        respond(nil, { outcome = { outcome = "cancelled" } })
-    end,
-    on_agent_exit = function() end,
-}
-
----Collect log warnings while `fn` runs.
----@param fn fun()
----@return string[]
-local function warnings(fn)
-    local log = require("conduit.log")
-    local orig, out = log.warn, {}
-    log.warn = function(msg)
-        table.insert(out, msg)
-    end
-    local ok, err = pcall(fn)
-    log.warn = orig
-    assert(ok, err)
-    return out
-end
-
 test("mcp: builds stdio and http servers in ACP shape", function()
     local config = require("conduit.config").options
     local sh = vim.fn.exepath("sh")
@@ -1564,14 +900,14 @@ test("mcp: skips servers it can't send, warning once each", function()
     end
 end)
 
-test("mcp: every session method sends the servers", function()
+test("mcp: new sessions send the servers", function()
     local config = require("conduit.config").options
     config.mcp_servers = {
         tool = { command = "sh", env = { A = "1" } },
         docs = { type = "http", url = "https://example.com/mcp" },
         events = { type = "sse", url = "https://example.com/sse" },
     }
-    local agent = thread_agent("mcper", ALL_CAPS, "--mcp=http")
+    local agent = extra_agent("mcper", ALL_CAPS, "--mcp=http")
     local sh = vim.fn.exepath("sh")
     local want = {
         { type = "http", name = "docs", url = "https://example.com/mcp", headers = {} },
@@ -1605,13 +941,7 @@ test("mcp: every session method sends the servers", function()
         end)
     end)
     assert(vim.deep_equal(servers, want), vim.inspect(servers))
-    local ref = { session_id = sid, cwd = cwd }
-    for _, method in ipairs({ "load_session", "resume_session", "fork_session" }) do
-        servers = sent(function(cb)
-            agent[method](agent, ref, null_handler, cb)
-        end)
-        assert(vim.deep_equal(servers, want), method .. ": " .. vim.inspect(servers))
-    end
+    agent:close_session(sid)
     servers = sent(function(cb)
         agent:new_session(cwd, null_handler, cb, nil, { mcp = false })
     end)
@@ -1654,485 +984,6 @@ test("mcp: inline requests only get servers with inline.mcp_servers", function()
     assert(vim.deep_equal(sent, { 0, 1 }), vim.inspect(sent))
 end)
 
----Use a fake picker that records the spec it's given, for the duration of `fn`.
----@param fn fun(specs: table<integer, conduit.PickerSpec>)
-local function with_picker(fn)
-    local config = require("conduit.config").options
-    local specs = {}
-    config.ui.picker = function(spec)
-        table.insert(specs, spec)
-    end
-    local ok, err = pcall(fn, specs)
-    config.ui.picker = "auto"
-    assert(ok, err)
-end
-
----Labels of a picker spec's current items.
----@param spec conduit.PickerSpec
----@return string[]
-local function spec_labels(spec)
-    return vim.tbl_map(require("conduit.ui.picker").label, spec.items())
-end
-
----Run a spec's `load` and wait for it.
----@param spec conduit.PickerSpec
-local function spec_load(spec)
-    local done = false
-    assert(spec.load)(function()
-        done = true
-    end)
-    wait_for(function()
-        return done
-    end, "picker items to load")
-end
-
----@param spec conduit.PickerSpec
----@param pred fun(data: any): boolean
----@return conduit.PickerItem
-local function spec_item(spec, pred)
-    for _, item in ipairs(spec.items()) do
-        if pred(item.data) then
-            return item
-        end
-    end
-    error("no such picker item in " .. vim.inspect(spec_labels(spec)))
-end
-
----@param spec conduit.PickerSpec
----@param key string
----@return fun(item: conduit.PickerItem?)
-local function spec_action(spec, key)
-    for _, action in ipairs(spec.actions or {}) do
-        if action.key == key then
-            return action.fn
-        end
-    end
-    error("no action on " .. key)
-end
-
-test("picker: auto picks an installed picker plugin, else vim.ui.select", function()
-    local picker = require("conduit.ui.picker")
-    local config = require("conduit.config").options
-    local selected
-    local orig_select = vim.ui.select
-    vim.ui.select = function(items, opts, cb)
-        selected = vim.tbl_map(assert(opts.format_item), items)
-        cb(items[2])
-    end
-    local chosen
-    ---@type conduit.PickerSpec
-    local spec = {
-        title = "Test",
-        items = function()
-            return {
-                { text = "one", segments = { { "one" } }, data = 1 },
-                { text = "two", segments = { { "t", "Special" }, { "wo" } }, data = 2 },
-            }
-        end,
-        on_select = function(item)
-            chosen = item.data
-        end,
-    }
-    picker.pick(spec)
-    vim.ui.select = orig_select
-    assert(vim.deep_equal(selected, { "one", "two" }) and chosen == 2, vim.inspect(selected))
-
-    -- A loaded snacks.nvim wins; its items keep the highlighted segments.
-    local opts ---@type any
-    package.loaded["snacks"] = {
-        picker = {
-            pick = function(o)
-                opts = o
-                return { closed = false }
-            end,
-        },
-    }
-    spec.actions = {
-        {
-            key = "<C-d>",
-            desc = "Delete",
-            fn = function(item)
-                chosen = "deleted " .. assert(item).data
-            end,
-        },
-    }
-    picker.pick(spec)
-    package.loaded["snacks"] = nil
-    local items = opts.finder()
-    assert(#items == 2 and items[2].text == "two")
-    assert(vim.deep_equal(opts.format(items[2]), { { "t", "Special" }, { "wo" } }))
-    assert(opts.win.input.keys["<C-d>"][1] == "conduit_1")
-    local fake = {
-        close = function() end,
-    }
-    opts.actions.conduit_1.action(fake, items[1])
-    opts.confirm(fake, items[1])
-    wait_for(function()
-        return chosen == 1
-    end, "the snacks confirm")
-
-    -- fzf-lua gets numbered lines and fzf key names.
-    package.loaded["fzf-lua"] = {
-        fzf_exec = function(contents, o)
-            opts = { contents = contents, o = o }
-        end,
-    }
-    config.ui.picker = "fzf_lua"
-    picker.pick(spec)
-    config.ui.picker = "auto"
-    package.loaded["fzf-lua"] = nil
-    assert(vim.deep_equal(opts.contents, { "1\tone", "2\ttwo" }), vim.inspect(opts.contents))
-    opts.o.actions["ctrl-d"]({ "2\ttwo" })
-    wait_for(function()
-        return chosen == "deleted 2"
-    end, "the fzf action")
-end)
-
-test("threads: picker orders by recent use and streams in past threads", function()
-    reset_threads()
-    thread_agent("streamer", ALL_CAPS, "--seed")
-    with_picker(function(specs)
-        local a = assert(conduit.new("streamer"))
-        send(a, "alpha")
-        local b = assert(conduit.new("streamer"))
-        send(b, "beta")
-        local c = assert(conduit.new("streamer"))
-        send(c, "gamma")
-        require("conduit.threads").switch(a)
-        -- Used most recently: a (current), c, b.
-        conduit.threads("streamer")
-        local spec = specs[1]
-        assert(spec.title == "Conduit threads", spec.title)
-        assert(
-            vim.deep_equal(spec_labels(spec), {
-                "  gamma · streamer",
-                "  beta · streamer",
-                "● alpha · streamer",
-                "+ New thread",
-            }),
-            vim.inspect(spec_labels(spec))
-        )
-        spec_load(spec)
-        local labels = spec_labels(spec)
-        assert(vim.startswith(assert(labels[4]), "  Old work · streamer"), vim.inspect(labels))
-        assert(labels[#labels] == "+ New thread", vim.inspect(labels))
-
-        -- Previews: live threads show their transcript, past ones their details.
-        local preview = assert(spec.preview)
-        local lines, ft = preview(assert(spec.items()[1]))
-        assert(ft == "markdown" and table.concat(lines, "\n"):find("you said: gamma", 1, true))
-        lines = preview(spec_item(spec, function(d)
-            return d.info and d.info.session_id == "past-1"
-        end))
-        assert(lines[1] == "# Old work" and vim.tbl_contains(lines, "- session: past-1"), vim.inspect(lines))
-
-        -- <C-g> reopens with every directory's threads.
-        spec_action(spec, "<C-g>")()
-        local all = specs[2]
-        assert(all.title == "Conduit threads (all directories)", all.title)
-        spec_load(all)
-        local found = false
-        for _, label in ipairs(spec_labels(all)) do
-            found = found or label:find("Other project", 1, true) ~= nil
-        end
-        assert(found, vim.inspect(spec_labels(all)))
-
-        all.on_select(spec_item(all, function(d)
-            return d.chat == b
-        end))
-        assert(conduit.current == b and b:is_open())
-    end)
-    drop_agent("streamer")
-end)
-
-test("threads: picker actions rename, delete and start threads", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local history = require("conduit.history")
-    local agent, methods = thread_agent("actor", ALL_CAPS, "--seed")
-    local orig_input, orig_select = vim.ui.input, vim.ui.select
-    vim.ui.input = function(_, cb)
-        cb("  Renamed ")
-    end
-    vim.ui.select = function(items, _, cb)
-        cb(items[1]) -- "Delete"
-    end
-    local ok, err = pcall(with_picker, function(specs)
-        local chat = assert(conduit.new("actor"))
-        send(chat, "rename me")
-        conduit.threads("actor")
-        spec_action(specs[1], "<C-r>")(spec_item(specs[1], function(d)
-            return d.chat == chat
-        end))
-        wait_for(function()
-            return count(methods, "session/set_title") == 1
-        end, "session/set_title")
-        assert(chat.title == "Renamed" and #specs == 2, chat.title)
-
-        -- Past threads are renamed locally.
-        spec_load(specs[2])
-        spec_action(specs[2], "<C-r>")(spec_item(specs[2], function(d)
-            return d.info and d.info.session_id == "past-2"
-        end))
-        local known = assert(history.get("actor", "past-2"))
-        assert(known.title == "Renamed" and known.custom_title)
-        spec_load(specs[3])
-        spec_item(specs[3], function(d)
-            return d.info and d.info.session_id == "past-2" and d.info.title == "Renamed"
-        end)
-
-        spec_action(specs[3], "<C-d>")(spec_item(specs[3], function(d)
-            return d.chat == chat
-        end))
-        wait_for(function()
-            return count(methods, "session/delete") == 1 and #specs == 4
-        end, "session/delete")
-        assert(#threads.list == 0)
-
-        spec_action(specs[4], "<C-n>")()
-        assert(#threads.list == 1 and assert(conduit.current).agent == agent)
-    end)
-    vim.ui.input, vim.ui.select = orig_input, orig_select
-    assert(ok, err)
-    drop_agent("actor")
-end)
-
-test("threads: alternate, goto and resume", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    thread_agent("jumper", ALL_CAPS, "--seed")
-    local a = assert(conduit.new("jumper"))
-    send(a, "Parser work")
-    local b = assert(conduit.new("jumper"))
-    send(b, "Lexer work")
-    local c = assert(conduit.new("jumper"))
-    send(c, "Docs")
-
-    press(c.input, "g<Tab>")
-    assert(threads.current == b)
-    vim.cmd("Conduit thread alt")
-    assert(threads.current == c)
-
-    vim.cmd("Conduit thread goto 1")
-    assert(threads.current == a)
-    conduit.thread_goto("lexer WORK")
-    assert(threads.current == b)
-    conduit.thread_goto("doc")
-    assert(threads.current == c)
-    conduit.thread_goto(assert(a.session_id))
-    assert(threads.current == a)
-    assert(vim.tbl_contains(vim.fn.getcompletion("Conduit thread goto Lex", "cmdline"), "Lexer work"))
-
-    with_picker(function(specs)
-        -- Ambiguous: pick with the query.
-        conduit.thread_goto("work")
-        assert(specs[1] and specs[1].query == "work")
-
-        -- resume without an id: past threads only.
-        conduit.resume()
-        local spec = specs[2]
-        assert(spec.title == "Conduit: resume a thread", spec.title)
-        assert(#spec.items() == 0)
-        spec_load(spec)
-        local labels = spec_labels(spec)
-        assert(vim.startswith(assert(labels[1]), "  Old work · jumper") and #labels == 3, vim.inspect(labels))
-    end)
-
-    vim.cmd("Conduit resume " .. b.session_id)
-    assert(threads.current == b)
-    vim.cmd("Conduit resume past-2")
-    local chat
-    wait_for(function()
-        chat = conduit.current
-        return chat and chat.session_id == "past-2" and not chat.busy
-    end, "past-2 to load")
-    assert(transcript(chat):find("older question\n[image: shot.png](file:///tmp/shot.png)", 1, true), transcript(chat))
-    drop_agent("jumper")
-end)
-
-test("threads: background turns and permission requests are flagged", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local notes = {}
-    local orig_notify = vim.notify
-    vim.notify = function(msg)
-        table.insert(notes, msg)
-    end
-    local a = assert(conduit.new())
-    send(a, "first")
-    local b = assert(conduit.new())
-    -- Start a turn in a, then look at b before it finishes.
-    threads.switch(a)
-    vim.api.nvim_buf_set_lines(a.input, 0, -1, false, { "background work" })
-    a:submit()
-    threads.switch(b)
-    wait_for(function()
-        return not a.busy
-    end, "the background turn")
-    vim.notify = orig_notify
-    assert(a.unread, "flagged unread")
-    assert(vim.tbl_contains(notes, "[conduit] first: the agent replied"), vim.inspect(notes))
-    assert(threads.label(a) == "  first · mock · unread", threads.label(a))
-    local twin = assert(b:wins())
-    assert(winbar_text(twin):find("1 first ● │ 2 New thread", 1, true), winbar_text(twin))
-    assert(conduit.status().unread == 1 and conduit.status().count == 2)
-    threads.switch(a)
-    assert(conduit.status().unread == 0, "switching marks it read")
-
-    -- Permission requests: flagged while waiting for the answer.
-    local path = vim.fn.tempname()
-    vim.fn.writefile({ "x" }, path)
-    local orig_select = vim.ui.select
-    local answer ---@type fun()?
-    vim.ui.select = function(items, _, cb)
-        answer = function()
-            cb(items[1])
-        end
-    end
-    vim.api.nvim_buf_set_lines(a.input, 0, -1, false, { "edit " .. path })
-    a:submit()
-    wait_for(function()
-        return a.waiting
-    end, "the permission request")
-    assert(threads.label(a):find("needs permission", 1, true), threads.label(a))
-    assert(conduit.status().waiting == 1)
-    assert(answer)()
-    vim.ui.select = orig_select
-    assert(not a.waiting)
-    wait_for(function()
-        return not a.busy
-    end, "the turn to finish")
-    reset_threads()
-end)
-
-test("threads: the thread bar fits narrow windows around the current thread", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local chats = {}
-    for i = 1, 6 do
-        chats[i] = assert(conduit.new())
-        chats[i].title = ("Thread number %d with a long title"):format(i)
-    end
-    local function text(chat, width)
-        return (threads.bar(chat, width):gsub("%%#[%w_]+#", ""):gsub("%%%*", ""))
-    end
-    local wide = text(chats[1], 400)
-    assert(wide:find("1 Thread number 1 with a long t… │ 2 Thread number 2 wit… │", 1, true), wide)
-    local narrow = text(chats[4], 40)
-    assert(narrow:find("4 Thread number 4 with a …", 1, true), narrow)
-    local medium = text(chats[4], 60)
-    assert(medium == "‹ 4 Thread number 4 with a … │ 5 Thread nu… ›", medium)
-    assert(vim.startswith(narrow, "‹") and vim.endswith(narrow, "›"), narrow)
-    assert(vim.fn.strdisplaywidth(narrow) <= 40, narrow)
-    chats[2].title = "100%"
-    assert(threads.bar(chats[1], 400):find("100%%", 1, true), "escapes %")
-    reset_threads()
-end)
-
-test("threads: search finds text in live transcripts", function()
-    reset_threads()
-    local threads = require("conduit.threads")
-    local a = assert(conduit.new())
-    send(a, "needle in alpha")
-    local b = assert(conduit.new())
-    send(b, "nothing here")
-    with_picker(function(specs)
-        local matches = assert(conduit.thread_search("NEEDLE"))
-        assert(#matches == 0, "smartcase: upper case matches exactly")
-        matches = assert(conduit.thread_search("needle"))
-        -- The prompt and the echo in the reply.
-        assert(#matches == 2 and matches[1].chat == a, vim.inspect(#matches))
-        local spec = specs[1]
-        local item = assert(spec.items()[2])
-        local match = assert(item.segments[3])
-        assert(match[1] == "needle" and match[2] == "ConduitSearchMatch")
-        spec.on_select(item)
-        assert(threads.current == a)
-        local twin = assert(a:wins())
-        assert(vim.api.nvim_get_current_win() == twin)
-        local cursor = vim.api.nvim_win_get_cursor(twin)
-        assert(cursor[1] == matches[2].lnum and cursor[2] == matches[2].col - 1, vim.inspect(cursor))
-    end)
-    vim.cmd("Conduit thread search --qf alpha")
-    local qf = vim.fn.getqflist({ items = 0, title = 0 })
-    assert(qf.title == "Conduit: alpha" and #qf.items == 2, vim.inspect(qf))
-    assert(qf.items[1].bufnr == a.transcript)
-    vim.cmd("cclose")
-    reset_threads()
-end)
-
-test("threads: lifecycle events fire as User autocmds", function()
-    reset_threads()
-    local events = {}
-    local group = vim.api.nvim_create_augroup("conduit.test.events", { clear = true })
-    vim.api.nvim_create_autocmd("User", {
-        group = group,
-        pattern = "ConduitThread*",
-        callback = function(ev)
-            table.insert(events, { ev.match, ev.data.title })
-        end,
-    })
-    local a = assert(conduit.new())
-    send(a, "evented")
-    local b = assert(conduit.new())
-    require("conduit.threads").close(b)
-    vim.api.nvim_del_augroup_by_id(group)
-    local names = vim.tbl_map(function(e)
-        return e[1]
-    end, events)
-    assert(names[1] == "ConduitThreadCreated" and names[2] == "ConduitThreadSwitched", vim.inspect(names))
-    assert(vim.tbl_contains(names, "ConduitThreadUpdated"))
-    assert(vim.deep_equal(events[#events - 1], { "ConduitThreadClosed", "New thread" }), vim.inspect(events))
-    assert(vim.deep_equal(events[#events], { "ConduitThreadSwitched", "evented" }), vim.inspect(events))
-    reset_threads()
-end)
-
-test("chat: @ mentioned images reach the agent as image blocks", function()
-    reset_threads()
-    local root = image_fixture()
-    local chat = assert(conduit.new())
-    send(chat, "what is in @" .. root .. "/shot.png")
-    local text = transcript(chat)
-    assert(text:find(("image shot.png image/png %d"):format(#PNG), 1, true), text)
-    reset_threads()
-end)
-
-test("chat: agents without image support get a link and a warning", function()
-    reset_threads()
-    local root = image_fixture()
-    thread_agent("blind", "--no-image")
-    local chat = assert(conduit.new("blind"))
-    local msgs = capture_notify(function()
-        send(chat, "what is in @" .. root .. "/shot.png")
-    end)
-    local text = transcript(chat)
-    assert(text:find("resource_link shot.png 0", 1, true), text)
-    assert(
-        vim.tbl_contains(msgs, function(m)
-            return m:find("doesn't accept images", 1, true) ~= nil
-        end, { predicate = true }),
-        vim.inspect(msgs)
-    )
-    drop_agent("blind")
-end)
-
----A chat whose session has received the mock's slash commands.
----@return conduit.Chat
-local function chat_with_commands()
-    local chat = assert(conduit.new())
-    send(chat, "hi")
-    wait_for(function()
-        return #chat.agent:get_commands(chat.session_id) > 0
-    end, "available_commands_update")
-    return chat
-end
-
-local function names(list)
-    return vim.tbl_map(function(cmd)
-        return cmd.name
-    end, list)
-end
-
 test("commands: the agent keeps each session's slash commands", function()
     local agent = require("conduit.agent").new("cmds", require("conduit.config").options.agents.mock)
     local noop = function() end
@@ -2153,189 +1004,6 @@ test("commands: the agent keeps each session's slash commands", function()
     agent:close_session(id)
     assert(agent.commands[id] == nil, "closing forgets the session's commands")
     agent:stop()
-end)
-
-test("commands: typing / at the start of the prompt completes agent commands", function()
-    local chat = chat_with_commands()
-    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
-    local orig = vim.fn.complete
-    local calls = {} ---@type { col: integer, list: table[] }[]
-    vim.fn.complete = function(col, list)
-        table.insert(calls, { col = col, list = list })
-    end
-    -- Cursor on the trailing "x" stands in for the insert-mode cursor after "re".
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "/rex" })
-    vim.api.nvim_win_set_cursor(0, { 1, 3 })
-    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "hi /rex" })
-    vim.api.nvim_win_set_cursor(0, { 1, 6 })
-    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = chat.input })
-    vim.fn.complete = orig
-    assert(#calls == 1, "only a leading / completes commands: " .. vim.inspect(calls))
-    local first = assert(calls[1].list[1])
-    assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
-    assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
-    assert(vim.api.nvim_get_current_win() == select(2, chat:wins()))
-    -- The empty input's placeholder mentions commands once the agent has some.
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
-    chat.mounts.placeholder:update()
-    local marks = vim.api.nvim_buf_get_extmarks(
-        chat.input,
-        vim.api.nvim_create_namespace("conduit.placeholder"),
-        0,
-        -1,
-        { details = true }
-    )
-    local hint = marks[1] and marks[1][4].virt_text[1][1] or ""
-    assert(hint:find("/ commands", 1, true), hint)
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
-end)
-
-test("commands: the input hint shows after the command until arguments are typed", function()
-    local chat = chat_with_commands()
-    local ns = vim.api.nvim_get_namespaces()["conduit.commands"]
-    local function hint(line)
-        vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { line })
-        vim.api.nvim_exec_autocmds("TextChanged", { buffer = chat.input })
-        local marks = vim.api.nvim_buf_get_extmarks(chat.input, ns, 0, -1, { details = true })
-        local details = marks[1] and marks[1][4]
-        local virt = details and details.virt_text
-        return virt and virt[1] and virt[1][1]
-    end
-    assert(hint("/review ") == "optional focus", tostring(hint("/review ")))
-    assert(hint("/review") == " optional focus")
-    assert(hint("/review auth") == nil, "hint hides once arguments are typed")
-    assert(hint("/compact ") == nil, "commands without input have no hint")
-    assert(hint("/nope ") == nil)
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
-end)
-
-test("blink: / completes agent commands with their input hint", function()
-    local chat = chat_with_commands()
-    local source = require("conduit.blink").new()
-    assert(vim.tbl_contains(source:get_trigger_characters(), "/"))
-    ---@type { is_incomplete_forward: boolean, items: table[] }?
-    local got
-    source:get_completions({ cursor = { 1, 3 }, line = "/re", bufnr = chat.input }, function(res)
-        got = res
-    end)
-    got = assert(got)
-    local first = assert(got.items[1])
-    assert(first.label == "/review" and first.labelDetails.description == "optional focus", vim.inspect(first))
-    assert(first.textEdit.newText == "review ", "commands with input get a trailing space")
-    local range = first.textEdit.range
-    assert(range.start.character == 1 and range["end"].character == 3, vim.inspect(range))
-    ---@type table?
-    local resolved
-    source:resolve(first, function(r)
-        resolved = r
-    end)
-    local doc = assert(resolved).documentation.value
-    assert(doc:find("/review", 1, true) and doc:find("Review the current changes", 1, true), doc)
-
-    ---@type { items: table[] }?
-    local later
-    source:get_completions({ cursor = { 2, 3 }, line = "/re", bufnr = chat.input }, function(res)
-        later = res
-    end)
-    assert(#assert(later).items == 0, "commands only complete on the first line")
-end)
-
-test("commands: chat prompts starting with /name run the command", function()
-    local chat = chat_with_commands()
-    send(chat, "/review auth")
-    local text = transcript(chat)
-    assert(text:find("ran review: auth (0 context)", 1, true), text)
-end)
-
-test("commands: inline commands are sent unwrapped with the selection, as an answer", function()
-    chat_with_commands():close()
-    inline_buf()
-    local job = assert(conduit.inline(2, 3, "/review naming"))
-    wait_turn(job)
-    assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
-    local text = job:_display()
-    assert(text:find("ran review: naming (1 context)", 1, true), text)
-    job:close()
-
-    -- The inline prompt completes from the agent's last list before a session exists.
-    conduit.inline(2, 3)
-    local buf = vim.api.nvim_get_current_buf()
-    assert(vim.bo[buf].filetype == "conduit_input")
-    assert(vim.deep_equal(names(require("conduit.commands").list(buf)), { "review", "compact" }))
-    vim.cmd.stopinsert()
-    vim.api.nvim_win_close(0, true)
-    vim.cmd("bwipeout!")
-end)
-
-test("commands: :Conduit commands starts the prompt with the picked command", function()
-    local chat = chat_with_commands()
-    local orig = vim.ui.select
-    local shown ---@type string[]?
-    vim.ui.select = function(items, opts, cb)
-        shown = vim.tbl_map(assert(opts.format_item), items)
-        cb(items[1])
-    end
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, { "keep this" })
-    vim.cmd("Conduit commands")
-    vim.ui.select = orig
-    vim.cmd.stopinsert()
-    assert(shown and shown[1] == "/review optional focus — Review the current changes", vim.inspect(shown))
-    local lines = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
-    assert(lines[1] == "/review keep this", vim.inspect(lines))
-    vim.cmd("Conduit commands /compact")
-    vim.cmd.stopinsert()
-    local compact = vim.api.nvim_buf_get_lines(chat.input, 0, -1, false)
-    assert(compact[1] == "/compact keep this", vim.inspect(compact))
-    assert(vim.tbl_contains(vim.fn.getcompletion("Conduit commands ", "cmdline"), "review"))
-    vim.api.nvim_buf_set_lines(chat.input, 0, -1, false, {})
-end)
-
----Results the mock said for each terminal step (`<step> <json>` lines), in order.
----@param chat conduit.Chat
----@return { step: string, value: table }[]
-local function term_results(chat)
-    local out = {}
-    for _, line in ipairs(vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)) do
-        local step, json = line:match("^(%a+) ({.*})$")
-        -- "term" is the prompt itself.
-        if step and json and step ~= "term" then
-            table.insert(out, { step = step, value = vim.json.decode(json, { luanil = { object = true } }) })
-        end
-    end
-    return out
-end
-
----Run a `term` prompt in a new chat.
----@param create table terminal/create params
----@param steps string[]
----@return conduit.Chat, table<string, table> results Last result per step
-local function run_term(create, steps)
-    local chat = assert(conduit.new())
-    send(chat, "term " .. vim.json.encode({ create = create, steps = steps }))
-    local by_step = {}
-    for _, r in ipairs(term_results(chat)) do
-        by_step[r.step] = r.value
-    end
-    return chat, by_step
-end
-
-test("terminal: the client advertises terminals and display terminals", function()
-    local chat = assert(conduit.new())
-    send(chat, "caps")
-    local caps = assert(term_results(chat)[1]).value
-    assert(caps.terminal == true, vim.inspect(caps))
-    assert(caps._meta.terminal_output == true and caps._meta.terminal_output_delta == true, vim.inspect(caps))
-end)
-
-test("terminal: runs a command, reports output and exit code", function()
-    local chat, r = run_term({ command = "sh", args = { "-c", "printf 'a\\nb\\n'; exit 3" } }, { "wait", "output" })
-    assert(r.create and r.create.terminalId, vim.inspect(r))
-    assert(r.wait.exitCode == 3 and r.wait.signal == nil, vim.inspect(r.wait))
-    assert(r.output.output == "a\nb\n" and r.output.truncated == false, vim.inspect(r.output))
-    assert(r.output.exitStatus.exitCode == 3, vim.inspect(r.output))
-    local text = transcript(chat)
-    assert(text:find("✓ sh\n```console\na\nb\n```\nexit code 3\n", 1, true), text)
 end)
 
 test("terminal: honours cwd and env", function()
@@ -2363,84 +1031,9 @@ test("terminal: output beyond the byte limit drops the oldest output", function(
     assert(r.output.output == "9é", vim.inspect(r.output))
 end)
 
-test("terminal: kill stops the command and keeps its output", function()
-    local chat, r = run_term(
-        { command = "sh", args = { "-c", "echo started; sleep 30" } },
-        { "sleep:300", "kill", "wait", "output" }
-    )
-    assert(r.wait.signal == "SIGTERM" and r.wait.exitCode == nil, vim.inspect(r.wait))
-    assert(r.output.output == "started\n", vim.inspect(r.output))
-    assert(transcript(chat):find("started\n```\nkilled by SIGTERM", 1, true), transcript(chat))
-end)
-
-test("terminal: released terminals reject requests but stay visible", function()
-    local chat, r = run_term({ command = "echo", args = { "kept" } }, { "wait", "release", "output" })
-    assert(r.output.code == -32602, vim.inspect(r.output))
-    assert(transcript(chat):find("```console\nkept\n```", 1, true), transcript(chat))
-end)
-
 test("terminal: missing executables are reported to the agent", function()
     local _, r = run_term({ command = "conduit-no-such-cmd", args = { "x" } }, {})
     assert(r.create.code == -32603 and r.create.message:find("conduit%-no%-such%-cmd"), vim.inspect(r.create))
-end)
-
-test("terminal: disabled terminals aren't advertised or run", function()
-    local config = require("conduit.config").options
-    config.terminal.enabled = false
-    thread_agent("noterm")
-    local chat = assert(conduit.new("noterm"))
-    send(chat, "caps")
-    local caps = assert(term_results(chat)[1]).value
-    send(chat, "term " .. vim.json.encode({ create = { command = "echo" } }))
-    config.terminal.enabled = true
-    assert(caps.terminal == false, vim.inspect(caps))
-    local create = assert(term_results(chat)[2]).value
-    assert(create.code == -32601, vim.inspect(create))
-    drop_agent("noterm")
-end)
-
-test("terminal: running commands are killed when the agent exits", function()
-    local agent = thread_agent("termexit")
-    local chat = assert(conduit.new("termexit"))
-    send(chat, "term " .. vim.json.encode({ create = { command = "sleep", args = { "30" } } }))
-    local term = assert(agent:terminal("term-1"))
-    local pid = assert(term.proc).pid
-    agent:stop()
-    wait_for(function()
-        return term.exit ~= nil
-    end, "command to be killed")
-    assert(assert(term.exit).signal == "SIGTERM", vim.inspect(term.exit))
-    assert(next(agent.terminals) == nil)
-    drop_agent("termexit")
-    assert(not vim.uv.kill(pid, 0) or vim.uv.kill(pid, 0) ~= 0, "process still running")
-end)
-
-test("terminal: display terminals from tool call _meta render live", function()
-    local chat = assert(conduit.new())
-    send(chat, "display")
-    wait_for(function()
-        return transcript(chat):find("exit code 2", 1, true)
-    end, "display terminal output")
-    local text = transcript(chat)
-    assert(text:find("✗ make test\n```console\nbuilding\nfailed\n```\nexit code 2\n", 1, true), text)
-end)
-
-test("terminal: long output shows the last lines and expands in place", function()
-    local config = require("conduit.config").options
-    config.tools.output_lines = 3
-    local chat = run_term({ command = "sh", args = { "-c", "for i in 1 2 3 4 5 6; do echo line$i; done" } }, { "wait" })
-    local text = transcript(chat)
-    assert(
-        text:find("✓ sh\n… 3 earlier lines (`<CR>` to expand)\n```console\nline4\nline5\nline6\n```\n", 1, true),
-        text
-    )
-    local lines = vim.api.nvim_buf_get_lines(chat.transcript, 0, -1, false)
-    local row = vim.fn.index(lines, "✓ sh")
-    assert(row >= 0, "no tool call line")
-    assert(chat:toggle_tool(row))
-    config.tools.output_lines = 8
-    text = transcript(chat)
-    assert(text:find("✓ sh\n```console\nline1\nline2\nline3\nline4\nline5\nline6\n```\n", 1, true), text)
 end)
 
 test("terminal: display lines strip escapes and resolve carriage returns", function()
@@ -2449,420 +1042,6 @@ test("terminal: display lines strip escapes and resolve carriage returns", funct
     assert(vim.deep_equal(lines, { "ok", "100%", "end" }), vim.inspect(lines))
     assert(Terminal.sanitize("a\255b") == "a\239\191\189b")
     assert(Terminal.sanitize("é") == "é")
-end)
-
--- Review of agent edits ---------------------------------------------------
-
-local review = require("conduit.review")
-local review_ui = require("conduit.ui.review")
-
----A temp file with `lines`, its canonical path.
----@param lines string[]
----@return string
-local function review_file(lines)
-    local path = vim.fn.tempname()
-    vim.fn.writefile(lines, path)
-    return require("conduit.fs").canonical(path)
-end
-
----The review entry for `path`, if it's tracked.
----@param path string
----@return conduit.ReviewFile?
-local function tracked(path)
-    local file = review.files[path] ---@type conduit.ReviewFile?
-    return file
-end
-
-local function review_marks(buf)
-    return vim.api.nvim_buf_get_extmarks(buf, review_ui.ns, 0, -1, { details = true })
-end
-
----@param buf integer
----@param lhs string
----@return boolean
-local function has_map(buf, lhs)
-    return vim.api.nvim_buf_call(buf, function()
-        return vim.fn.maparg(lhs, "n", false, true).buffer == 1
-    end)
-end
-
-local function review_cleanup()
-    review.reset()
-    reset_threads()
-    vim.cmd("silent! %bwipeout!")
-end
-
-test("review: edits made on disk show as hunks in the open buffer", function()
-    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-
-    -- The unmodified buffer was reloaded from disk.
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert(vim.deep_equal(lines, { "a", "new", "b", "c", "d", "new", "e" }), vim.inspect(lines))
-    local file = assert(tracked(path), "file should be tracked")
-    assert(vim.deep_equal(file.baseline, { "a", "old", "b", "c", "d", "old", "e" }), vim.inspect(file.baseline))
-    assert(#file.hunks == 2, vim.inspect(file.hunks))
-
-    -- Changed lines are highlighted, removed ones shown as virtual lines.
-    local marks = review_marks(buf)
-    local changed, virt = 0, {}
-    for _, m in ipairs(marks) do
-        local details = assert(m[4])
-        if details.line_hl_group == "ConduitReviewChange" then
-            changed = changed + 1
-        end
-        for _, vl in ipairs(details.virt_lines or {}) do
-            table.insert(virt, vim.trim(vl[1][1]))
-        end
-    end
-    assert(changed == 2, vim.inspect(marks))
-    assert(vim.deep_equal(virt, { "old", "old" }), vim.inspect(virt))
-    assert(has_map(buf, "]r") and has_map(buf, "<localleader>a"))
-
-    local text = transcript(chat)
-    assert(text:find("✓ Edit " .. path .. " · review pending", 1, true), text)
-    assert(text:find("> 1 file waiting for review · :Conduit review", 1, true), text)
-
-    -- ]r jumps between hunks.
-    vim.api.nvim_set_current_buf(buf)
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
-    review_ui.jump(1)
-    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
-    review_ui.jump(1)
-    assert(vim.api.nvim_win_get_cursor(0)[1] == 6)
-    review_ui.jump(-1)
-    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
-    review_cleanup()
-end)
-
-test("review: hunks are accepted and rejected one at a time", function()
-    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    vim.api.nvim_set_current_buf(buf)
-
-    -- Reject the first hunk: its line comes back, in the buffer and on disk.
-    vim.api.nvim_win_set_cursor(0, { 2, 0 })
-    review_ui.act("reject")
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert(vim.deep_equal(lines, { "a", "old", "b", "c", "d", "new", "e" }), vim.inspect(lines))
-    assert(not vim.bo[buf].modified)
-    assert(vim.deep_equal(vim.fn.readfile(path), lines))
-    assert(#assert(tracked(path)).hunks == 1)
-
-    -- Accept the second: nothing is left to review and the overlay goes away.
-    vim.api.nvim_win_set_cursor(0, { 6, 0 })
-    review_ui.act("accept")
-    assert(tracked(path) == nil)
-    assert(#review_marks(buf) == 0)
-    assert(not has_map(buf, "]r") and not has_map(buf, "<localleader>a"))
-    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b", "c", "d", "new", "e" }))
-    -- One hunk of each: the tool call reads as reviewed.
-    local text = transcript(chat)
-    assert(text:find("✓ Edit " .. path .. " · reviewed", 1, true), text)
-    review_cleanup()
-end)
-
-test("review: rejecting restores files that aren't open", function()
-    local path = review_file({ "old", "keep" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "new", "keep" }))
-    local items = review.qflist()
-    assert(#items == 1 and items[1].text == "+1 −1" and items[1].lnum == 1, vim.inspect(items))
-    review.reject(path)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "keep" }))
-    assert(tracked(path) == nil)
-    assert(transcript(chat):find("· rejected", 1, true), transcript(chat))
-    review_cleanup()
-end)
-
-test("review: created and deleted files are restored by rejecting them", function()
-    local chat = assert(conduit.new())
-    local created = require("conduit.fs").canonical(vim.fn.tempname())
-    send(chat, "disk-create " .. created)
-    assert(vim.uv.fs_stat(created))
-    local items = review.qflist()
-    assert(#items == 1 and items[1].text == "created by the agent", vim.inspect(items))
-    review.reject(created)
-    assert(not vim.uv.fs_stat(created), "created file should be removed")
-
-    local deleted = review_file({ "precious", "lines" })
-    send(chat, "disk-delete " .. deleted)
-    assert(not vim.uv.fs_stat(deleted))
-    local deleted_items = review.qflist()
-    assert(#deleted_items == 1 and deleted_items[1].text == "deleted by the agent", vim.inspect(deleted_items))
-    review.reject(deleted)
-    assert(vim.deep_equal(vim.fn.readfile(deleted), { "precious", "lines" }))
-    assert(#review.list() == 0)
-    review_cleanup()
-end)
-
-test("review: a write that lands before its tool call is rebuilt from the diff", function()
-    local path = review_file({ "a", "old", "b" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit-fast " .. path)
-    local file = assert(tracked(path), "file should be tracked")
-    assert(vim.deep_equal(file.baseline, { "a", "old", "b" }), vim.inspect(file.baseline))
-    review.reject(path)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b" }))
-    review_cleanup()
-end)
-
-test("review: fs/write_text_file edits are reviewed in the buffer", function()
-    local path = review_file({ "hello", "world" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local orig_select = vim.ui.select
-    vim.ui.select = function(items, _, cb)
-        cb(items[1])
-    end
-    local chat = assert(conduit.new())
-    send(chat, "edit " .. path)
-    vim.ui.select = orig_select
-    assert(#assert(tracked(path)).hunks == 1)
-    assert(#review_marks(buf) > 0)
-    review.reject(path)
-    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "hello", "world" }))
-    assert(vim.deep_equal(vim.fn.readfile(path), { "hello", "world" }))
-    review_cleanup()
-end)
-
-test("review: unsaved changes in the buffer are left alone as a conflict", function()
-    local path = review_file({ "old", "b" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local orig_notify = vim.notify
-    local warned ---@type string?
-    vim.notify = function(msg)
-        warned = msg
-    end
-    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "mine" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    vim.notify = orig_notify
-    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "old", "mine" }))
-    local file = assert(tracked(path))
-    assert(file.conflict)
-    assert(warned and warned:find("unsaved changes", 1, true), tostring(warned))
-    assert(#review_marks(buf) == 0)
-    local item = assert(review.qflist()[1])
-    assert(item.text and item.text:find("conflict", 1, true), vim.inspect(item))
-    -- Rejecting puts back what the buffer had when the agent started.
-    review.reject(path)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "mine" }))
-    review_cleanup()
-end)
-
-test("review: turned off, edits apply as before", function()
-    local config = require("conduit.config").options
-    config.review.enabled = false
-    local path = review_file({ "old" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    config.review.enabled = true
-    assert(next(review.files) == nil)
-    assert(#review_marks(buf) == 0 and not has_map(buf, "]r"))
-    local text = transcript(chat)
-    assert(text:find("✓ Edit " .. path .. "\n", 1, true), text)
-    assert(not text:find("review", 1, true), text)
-    assert(vim.deep_equal(vim.fn.readfile(path), { "new" }))
-    review_cleanup()
-end)
-
-test("review: chat and inline edits follow their own switches", function()
-    local config = require("conduit.config").options
-    local inline = require("conduit.inline")
-    local function run_inline(path)
-        vim.cmd.edit(path)
-        conduit.inline(1, 1, "uppercase it")
-        wait_for(function()
-            return next(inline.jobs) == nil
-        end, "inline edit")
-        return vim.api.nvim_get_current_buf()
-    end
-
-    -- Off by default: inline replies apply untracked.
-    local path = review_file({ "local a = 1", "keep" })
-    local buf = run_inline(path)
-    assert(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "LOCAL A = 1")
-    assert(next(review.files) == nil)
-
-    -- On: the reply is a hunk; rejecting it leaves the buffer as it was (unsaved, like the reply).
-    config.review.inline = true
-    vim.cmd("silent! %bwipeout!")
-    path = review_file({ "local a = 1", "keep" })
-    buf = run_inline(path)
-    config.review.inline = false
-    local file = assert(tracked(path), "inline reply should be tracked")
-    assert(#file.hunks == 1 and #review_marks(buf) > 0)
-    review.reject(path)
-    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "local a = 1", "keep" }))
-
-    -- Chat off, inline on: chat edits aren't tracked.
-    config.review.chat = false
-    path = review_file({ "old" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    config.review.chat = true
-    assert(next(review.files) == nil)
-    review_cleanup()
-end)
-
-test("review: user edits recompute hunks; undoing the change by hand clears it", function()
-    local path = review_file({ "old", "b" })
-    vim.cmd.edit(path)
-    local buf = vim.api.nvim_get_current_buf()
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    assert(tracked(path))
-    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "old" })
-    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
-    wait_for(function()
-        return review.files[path] == nil
-    end, "the review to clear")
-    assert(#review_marks(buf) == 0)
-    review_cleanup()
-end)
-
-test("review: :Conduit review lists changes; toggle and accept all", function()
-    local a = review_file({ "old" })
-    local b = review_file({ "x", "old" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. a)
-    send(chat, "disk-edit " .. b)
-    assert(transcript(chat):find("> 2 files waiting for review", 1, true), transcript(chat))
-    vim.cmd("Conduit review")
-    local qf = vim.fn.getqflist({ title = true, items = true })
-    assert(qf.title == "conduit review" and #qf.items == 2, vim.inspect(qf))
-    vim.cmd("cclose")
-
-    local orig_notify = vim.notify
-    vim.notify = function() end
-    vim.cmd("Conduit review toggle inline")
-    assert(require("conduit.config").options.review.inline == true)
-    vim.cmd("Conduit review toggle inline")
-    vim.notify = orig_notify
-    assert(require("conduit.config").options.review.inline == false)
-
-    vim.cmd("Conduit accept all")
-    assert(#review.list() == 0)
-    assert(vim.deep_equal(vim.fn.readfile(a), { "new" }) and vim.deep_equal(vim.fn.readfile(b), { "x", "new" }))
-    review_cleanup()
-end)
-
-test("review: the chat's file keys reject the tool call's changes", function()
-    local path = review_file({ "old" })
-    local chat = assert(conduit.new())
-    send(chat, "disk-edit " .. path)
-    local twin = assert(chat:wins())
-    vim.api.nvim_set_current_win(twin)
-    vim.api.nvim_win_set_cursor(twin, { row_of(chat, "✓ Edit") + 1, 0 })
-    press(chat.transcript, "<localleader>R")
-    assert(vim.deep_equal(vim.fn.readfile(path), { "old" }))
-    assert(tracked(path) == nil)
-    review_cleanup()
-end)
-
-test("review: replayed tool calls aren't reviewed", function()
-    local noop = function() end
-    local handler = { replaying = true, on_update = noop, request_permission = noop, on_agent_exit = noop }
-    local path = review_file({ "x" })
-    review.on_update(handler, {
-        sessionUpdate = "tool_call",
-        toolCallId = "old",
-        kind = "edit",
-        status = "pending",
-        locations = { { path = path } },
-    })
-    assert(next(review.files) == nil)
-end)
-
--- UI components, headless models and the status model ---------------------------------
-
----Run a normal-mode mapping of the current buffer in the current window (unlike
----`press`, focus changes the mapping makes stick).
----@param lhs string
-local function press_here(lhs)
-    vim.fn.maparg(lhs, "n", false, true).callback()
-end
-
-test("components: render overrides and mounts that redraw only on change", function()
-    local component = require("conduit.ui.component")
-    local ui = require("conduit.config").options.ui
-    local chip = component.render("Chip", { icon = "◆", label = "opus" })
-    assert(component.text(chip) == "◆ opus", component.text(chip))
-
-    -- Overrides get the props and the built-in; a failing one falls back to it.
-    ui.components = {
-        Chip = function(props, builtin)
-            return vim.list_extend({ { "[" } }, builtin(props))
-        end,
-    }
-    assert(component.text(component.render("Chip", { label = "x" })) == "[x")
-    ui.components = {
-        Chip = function()
-            error("boom")
-        end,
-    }
-    assert(component.text(component.render("Chip", { label = "x" })) == "x")
-    ui.components = {}
-
-    local draws, label = 0, "a"
-    local mount = component.mount(
-        {
-            draw = function()
-                draws = draws + 1
-            end,
-        },
-        "Chip",
-        function()
-            return { label = label }
-        end
-    )
-    mount:update()
-    assert(draws == 1, "unchanged output isn't redrawn: " .. draws)
-    label = "b"
-    mount:update()
-    assert(draws == 2, draws)
-    mount:unmount()
-end)
-
-test("surface: statusline escapes text, keeps raw spans and adds clicks with ui.mouse", function()
-    local surface = require("conduit.ui.surface")
-    local ui = require("conduit.config").options.ui
-    local s = surface.statusline({ { "50%", "ConduitMuted" }, { "%=", raw = true }, { "x" } })
-    assert(s == "%#ConduitMuted#50%%%*%=x", s)
-    local fn = function() end
-    assert(not surface.statusline({ { "m", click = fn } }):find("@", 1, true), "no clicks without ui.mouse")
-    ui.mouse = true
-    local clickable = surface.statusline({ { "m", click = fn } })
-    ui.mouse = false
-    assert(clickable:find("@ConduitClick@m%X", 1, true), clickable)
-end)
-
-test("status: usage_update shows context use in the chips and the statusline", function()
-    local chat = assert(conduit.new())
-    send(chat, "hello")
-    local info = require("conduit.ui.status").of_chat(chat)
-    assert(info.context and info.context.percent == 42, vim.inspect(info.context))
-    assert(info.model and info.effort and info.state == "ready", vim.inspect(info))
-    wait_for(function()
-        local _, iwin = chat:wins()
-        return iwin and winbar_text(iwin):find("ctx 42%%", 1, true)
-    end, "context chip")
-    local line = conduit.statusline()
-    assert(line:find(info.model, 1, true) and line:find("ctx 42%%", 1, true), line)
-    assert(line:find("0.50 USD", 1, true), line)
-    assert(not conduit.statusline({ context = false }):find("ctx", 1, true))
-    reset_threads()
 end)
 
 test("headless: picker filters, moves with counts and picks by number", function()
@@ -2904,67 +1083,6 @@ test("headless: options step through values both ways", function()
     assert(step(option, 1) == "mid" and step(option, 2) == "high" and step(option, -1) == "high")
     option.current = "unknown"
     assert(step(option, 1) == "low" and step(option, -1) == "high")
-end)
-
-test("chat: keys cycle effort and open a keyboard picker for the model", function()
-    local chat = assert(conduit.new())
-    send(chat, "hi")
-    -- The mock's option values outlive sessions; start from a known model.
-    local set = false
-    chat.agent:set_option(assert(chat.session_id), "model", "fast", function()
-        set = true
-    end)
-    wait_for(function()
-        return set
-    end, "model reset")
-    local options = require("conduit.options")
-    local function effort()
-        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "effort")).current
-    end
-    local before = effort()
-    press(chat.input, "<M-e>")
-    wait_for(function()
-        return effort() ~= before
-    end, "effort to change")
-    press(chat.input, "<M-E>")
-    wait_for(function()
-        return effort() == before
-    end, "effort to go back")
-
-    -- <M-m> opens the picker on the model; `2` picks the second choice.
-    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
-    press_here("<M-m>")
-    local win = vim.api.nvim_get_current_win()
-    assert(vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "conduit_picker", "picker should be focused")
-    local rows = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
-    assert(rows[1]:find("1 ● FAST", 1, true) and rows[2]:find("2   SMART", 1, true), vim.inspect(rows))
-    vim.api.nvim_feedkeys("2", "x", false)
-    wait_for(function()
-        return assert(options.find(chat.agent:get_options(assert(chat.session_id)), "model")).current == "smart"
-    end, "model to change")
-    assert(not vim.api.nvim_win_is_valid(win), "picker closes")
-    assert(vim.api.nvim_get_current_buf() == chat.input, "focus goes back to the input")
-    chat.agent:set_option(assert(chat.session_id), "model", "fast")
-    chat.agent:set_option(assert(chat.session_id), "effort", before)
-    reset_threads()
-end)
-
-test("help: g? lists the chat's keys in a filterable float", function()
-    local chat = assert(conduit.new())
-    vim.api.nvim_set_current_win(assert(select(2, chat:wins())))
-    press_here("g?")
-    local help = require("conduit.ui.help_float").current
-    assert(help and vim.api.nvim_get_current_win() == help.win, "help float is focused")
-    local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false), "\n")
-    assert(text:find("<M-e>", 1, true) and text:find("next effort level", 1, true), text)
-    help.model:filter("thread")
-    local filtered = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false)
-    for i = 2, #filtered do
-        assert(filtered[i]:find("thread", 1, true), vim.inspect(filtered))
-    end
-    help.model:close()
-    assert(not vim.api.nvim_win_is_valid(help.win))
-    reset_threads()
 end)
 
 test("prompt: title shows the request's model and effort; <C-o> changes them for it", function()
@@ -3037,278 +1155,1146 @@ test("inline: request options reach the inline session", function()
     local option = require("conduit.options").find(job.agent:get_options(assert(job.session_id)), "effort")
     assert(option and option.current == "high", vim.inspect(option))
     job.agent:set_option(assert(job.session_id), "effort", "low")
-    job:close()
+    reset_sidebar()
     vim.cmd("bwipeout!")
 end)
 
--- Inline answers that stay out of the way -------------------------------------------
+test("review: edits made on disk show as hunks in the open buffer", function()
+    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = session()
+    send(chat, "disk-edit " .. path)
 
----A buffer with the usual range on lines 2-3 and room to move away from it.
----@return integer buf
-local function long_buf()
-    local buf = inline_buf()
-    local lines = { "keep", "local a = 1", "local b = 2", "keep" }
-    for i = 5, 30 do
-        lines[i] = "-- filler " .. i
-    end
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.api.nvim_win_set_cursor(0, { 2, 0 })
-    return buf
-end
+    -- The unmodified buffer was reloaded from disk.
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    assert(vim.deep_equal(lines, { "a", "new", "b", "c", "d", "new", "e" }), vim.inspect(lines))
+    local file = assert(tracked(path), "file should be tracked")
+    assert(vim.deep_equal(file.baseline, { "a", "old", "b", "c", "d", "old", "e" }), vim.inspect(file.baseline))
+    assert(#file.hunks == 2, vim.inspect(file.hunks))
 
----@param buf integer
----@return table[] extmarks of the inline namespace with details
-local function inline_marks(buf)
-    return vim.api.nvim_buf_get_extmarks(
-        buf,
-        vim.api.nvim_create_namespace("conduit.inline"),
-        0,
-        -1,
-        { details = true }
-    )
-end
-
-test("inline: answers peek in a float that never takes focus", function()
-    local buf = long_buf()
-    local code_win = vim.api.nvim_get_current_win()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
-    local model, peek = assert(job.model), assert(job.peek)
-    assert(model.phase == "peek" and peek:is_open(), model.phase)
-    local cfg = vim.api.nvim_win_get_config(assert(peek.win))
-    assert(cfg.relative == "win" and cfg.focusable == false, vim.inspect(cfg))
-    assert(cfg.border == nil or cfg.border == "none" or vim.deep_equal(cfg.border, { "", "", "", "", "", "", "", "" }))
-    assert(peek:text():find("This code **adds** things.", 1, true), peek:text())
-    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "buffer must not change")
-
-    -- :Conduit answer focuses it; <Esc> goes back and leaves it shown.
-    assert(conduit.answer())
-    assert(vim.api.nvim_get_current_win() == peek.win and model.phase == "focused")
-    press_here("<Esc>")
-    assert(vim.api.nvim_get_current_win() == code_win and model.phase == "peek", model.phase)
-
-    -- `a` (here through the model) applies the last code block.
-    model:apply()
-    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "return 42")
-    assert(not peek:is_open() and next(require("conduit.inline").answers) == nil)
-    assert(job.agent.sessions[job.session_id] == nil, "session released")
-    vim.cmd("bwipeout!")
-end)
-
-test("inline: answers collapse when the cursor leaves and come back when it returns", function()
-    local buf = long_buf()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    local model, peek = assert(job.model), assert(job.peek)
-    vim.api.nvim_win_set_cursor(0, { 20, 0 })
-    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
-    assert(model.phase == "collapsed" and not peek:is_open(), model.phase)
-    local marker ---@type table?
-    for _, m in ipairs(inline_marks(buf)) do
-        if m[4].virt_text_pos == "eol" then
-            marker = m
-        end
-    end
-    assert(marker and marker[2] == 1 and marker[4].virt_text[1][1]:find("◆", 1, true), vim.inspect(marker))
-
-    vim.api.nvim_win_set_cursor(0, { 3, 0 })
-    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buf })
-    assert(model.phase == "peek" and peek:is_open(), model.phase)
-
-    -- Entering insert mode far from the range collapses it too.
-    vim.api.nvim_win_set_cursor(0, { 25, 0 })
-    vim.api.nvim_exec_autocmds("InsertEnter", { buffer = buf })
-    assert(model.phase == "collapsed", model.phase)
-
-    -- :Conduit answers lists it; picking it goes back and shows it.
-    conduit.answers()
-    assert(vim.bo.filetype == "conduit_picker")
-    vim.api.nvim_feedkeys("1", "x", false)
-    assert(vim.api.nvim_win_get_cursor(0)[1] == 2 and model.phase == "peek", model.phase)
-    job:close()
-    assert(#inline_marks(buf) == 0, "marks cleared")
-    vim.cmd("bwipeout!")
-end)
-
-test("inline: short answers are virtual lines under the range, without a window", function()
-    local buf = long_buf()
-    local job = assert(conduit.inline(2, 3, "short answer please"))
-    wait_turn(job)
-    local model = assert(job.model)
-    assert(model.phase == "short" and not assert(job.peek):is_open(), model.phase)
-    local virt ---@type table?
-    for _, m in ipairs(inline_marks(buf)) do
-        if m[4].virt_lines and not m[4].virt_lines_above then
-            virt = m
-        end
-    end
-    assert(virt and virt[2] == 2, vim.inspect(inline_marks(buf)))
-    local text = table.concat(vim.tbl_map(function(c)
-        return c[1]
-    end, virt[4].virt_lines[1]))
-    assert(text:find("│ It adds one.", 1, true), text)
-    -- Focusing a short answer opens it in the float.
-    assert(conduit.answer())
-    assert(vim.api.nvim_get_current_win() == job.peek.win)
-    job:close()
-    vim.cmd("bwipeout!")
-end)
-
-test("inline: with answer = chat, answers stream into the chat without moving focus", function()
-    require("conduit.config").options.inline.answer = "chat"
-    long_buf()
-    local code_win = vim.api.nvim_get_current_win()
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_for(function()
-        return job.cleaned
-    end, "answer in the chat")
-    require("conduit.config").options.inline.answer = "peek"
-    local chat = assert(conduit.current)
-    assert(chat == job.chat and chat.session_id == job.session_id)
-    local text = transcript(chat)
-    assert(text:find("## You\n\nexplain this", 1, true) and text:find("This code **adds** things.", 1, true), text)
-    assert(not chat.busy, "the chat isn't busy once the turn ends")
-    assert(vim.api.nvim_get_current_win() == code_win, "focus stays in the code")
-    reset_threads()
-    vim.cmd("bwipeout!")
-end)
-
-test("history: inline answers and edits are kept per project, separate from threads", function()
-    local inline_history = require("conduit.inline_history")
-    vim.fn.delete(inline_history.dir, "rf")
-    local buf = long_buf()
-    local path = vim.fn.tempname() .. ".lua"
-    vim.api.nvim_buf_set_name(buf, path)
-    local job = assert(conduit.inline(2, 3, "explain this"))
-    wait_turn(job)
-    job:close()
-    local edit = assert(conduit.inline(2, 3, "uppercase it"))
-    wait_for(function()
-        return edit.cleaned
-    end, "inline edit")
-
-    local entries = inline_history.load()
-    assert(#entries == 2, vim.inspect(entries))
-    local e, a = entries[1], entries[2]
-    assert(e.kind == "edit" and e.outcome == "applied" and e.file == path and e.line1 == 2, vim.inspect(e))
-    assert(vim.deep_equal(e.old, { "local a = 1", "local b = 2" }) and e.new[1] == "LOCAL A = 1", vim.inspect(e))
-    assert(a.kind == "answer" and a.prompt == "explain this" and a.text:find("adds", 1, true), vim.inspect(a))
-    assert(a.model and a.effort, "entries remember the model and effort")
-
-    -- The list: newest first; `u` reverts the edit; `dd` deletes an entry.
-    local view = require("conduit.ui.history_float").open()
-    local rows = vim.api.nvim_buf_get_lines(view.buf, 0, -1, false)
-    assert(
-        #rows == 2 and rows[1]:find("uppercase it", 1, true) and rows[2]:find("explain this", 1, true),
-        vim.inspect(rows)
-    )
-    view.model:run("revert")
-    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1", "edit reverted")
-    assert(vim.api.nvim_buf_get_lines(view.buf, 0, 1, false)[1]:find("reverted", 1, true))
-    view.model:next()
-    view.model:run("delete")
-    assert(#inline_history.load() == 1 and inline_history.load()[1].outcome == "reverted")
-    press_here("q")
-    assert(not vim.api.nvim_win_is_valid(view.win))
-
-    -- Another file's history isn't listed under "buffer" scope.
-    local model = require("conduit.ui.headless.history").new({ entries = inline_history.load(), file = "/elsewhere" })
-    assert(model.scope == "project", "falls back to the project when the buffer has none")
-    model:toggle_scope()
-    assert(model.scope == "buffer" and #model.filtered == 0)
-
-    conduit.history({ qf = true })
-    local qf = vim.fn.getqflist()
-    assert(#qf == 1 and qf[1].lnum == 2 and qf[1].text:find("uppercase it", 1, true), vim.inspect(qf))
-    vim.cmd("cclose")
-    vim.cmd("bwipeout!")
-end)
-
--- Transcript decorations ---------------------------------------------------------------
-
----@param chat conduit.Chat
----@return table[] decoration extmarks with details
-local function decorations(chat)
-    chat:_decorate()
-    return vim.api.nvim_buf_get_extmarks(
-        chat.transcript,
-        vim.api.nvim_create_namespace("conduit.decor"),
-        0,
-        -1,
-        { details = true }
-    )
-end
-
----@param marks table[]
----@param row integer 0-based
----@return table[] details of the marks on `row`
-local function on_row(marks, row)
-    local out = {}
+    -- Changed lines are highlighted, removed ones shown as virtual lines.
+    local marks = review_marks(buf)
+    local changed, virt = 0, {}
     for _, m in ipairs(marks) do
-        if m[2] == row then
-            table.insert(out, m[4])
+        local details = assert(m[4])
+        if details.line_hl_group == "ConduitReviewChange" then
+            changed = changed + 1
+        end
+        for _, vl in ipairs(details.virt_lines or {}) do
+            table.insert(virt, vim.trim(vl[1][1]))
         end
     end
-    return out
-end
+    assert(changed == 2, vim.inspect(marks))
+    assert(vim.deep_equal(virt, { "old", "old" }), vim.inspect(virt))
+    assert(has_map(buf, "]r") and has_map(buf, "<localleader>a"))
 
-test("transcript: role headers become rules, thinking folds, the buffer stays markdown", function()
-    local chat = assert(conduit.new())
-    send(chat, "hello there")
-    local text = transcript(chat)
-    assert(text:find("## You\n\nhello there", 1, true), "the buffer keeps its markdown: " .. text)
-    local you, thinking, agent = row_of(chat, "## You"), row_of(chat, "### Thinking"), row_of(chat, "## mock")
-    local marks = decorations(chat)
-
-    local rule = on_row(marks, you)[1]
-    local rule_text = table.concat(vim.tbl_map(function(c)
-        return c[1]
-    end, rule.virt_text))
-    assert(rule.virt_text_pos == "overlay" and vim.startswith(rule_text, "── You ──"), rule_text)
-    assert(on_row(marks, you + 2)[1].line_hl_group == "ConduitUserTurn", "the user's turn is shaded")
-
-    -- Thinking is folded to one line: the header says how much, the lines are concealed.
-    local fold = on_row(marks, thinking)[1]
-    assert(fold.virt_text[1][1]:find("▸ thought for 1 line", 1, true), vim.inspect(fold.virt_text))
-    local hidden = on_row(marks, thinking + 1)[1]
-    assert(hidden.conceal_lines == "" and hidden.end_row == agent - 2, vim.inspect(hidden))
-    assert(vim.wo[assert(chat:wins())].conceallevel == 2)
-
-    -- The agent's header after thinking continues the turn: no second rule, just hidden.
-    assert(on_row(marks, agent)[1].conceal_lines == "", vim.inspect(on_row(marks, agent)))
-
-    -- <CR> on the thinking header opens it.
-    local twin = assert(chat:wins())
-    vim.api.nvim_set_current_win(twin)
-    vim.api.nvim_win_set_cursor(twin, { thinking + 1, 0 })
-    press(chat.transcript, "<CR>")
-    marks = decorations(chat)
-    assert(on_row(marks, thinking)[1].virt_text[1][1]:find("▾ thinking", 1, true))
-    assert(#on_row(marks, thinking + 1) == 0, "open thinking isn't concealed")
-    reset_threads()
+    -- ]r jumps between hunks.
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    review_ui.jump(1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
+    review_ui.jump(1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 6)
+    review_ui.jump(-1)
+    assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
+    review_cleanup()
 end)
 
-test("transcript: forks keep their decorations; ui.icons = false uses ASCII glyphs", function()
-    local chat = assert(conduit.new())
-    send(chat, "hi")
-    local copy = require("conduit.ui.chat").new(chat.agent)
-    copy:copy_transcript(chat)
-    local marks = decorations(copy)
-    local you = row_of(copy, "## You")
-    assert(#on_row(marks, you) == 1 and on_row(marks, you)[1].virt_text_pos == "overlay", "rule in the copy")
-    copy:destroy()
+test("review: hunks are accepted and rejected one at a time", function()
+    local path = review_file({ "a", "old", "b", "c", "d", "old", "e" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = session()
+    send(chat, "disk-edit " .. path)
+    vim.api.nvim_set_current_buf(buf)
 
+    -- Reject the first hunk: its line comes back, in the buffer and on disk.
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    review_ui.act("reject")
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    assert(vim.deep_equal(lines, { "a", "old", "b", "c", "d", "new", "e" }), vim.inspect(lines))
+    assert(not vim.bo[buf].modified)
+    assert(vim.deep_equal(vim.fn.readfile(path), lines))
+    assert(#assert(tracked(path)).hunks == 1)
+
+    -- Accept the second: nothing is left to review and the overlay goes away.
+    vim.api.nvim_win_set_cursor(0, { 6, 0 })
+    review_ui.act("accept")
+    assert(tracked(path) == nil)
+    assert(#review_marks(buf) == 0)
+    assert(not has_map(buf, "]r") and not has_map(buf, "<localleader>a"))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b", "c", "d", "new", "e" }))
+    review_cleanup()
+end)
+
+test("review: rejecting restores files that aren't open", function()
+    local path = review_file({ "old", "keep" })
+    local chat = session()
+    send(chat, "disk-edit " .. path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "new", "keep" }))
+    local items = review.qflist()
+    assert(#items == 1 and items[1].text == "+1 −1" and items[1].lnum == 1, vim.inspect(items))
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "keep" }))
+    assert(tracked(path) == nil)
+    review_cleanup()
+end)
+
+test("review: created and deleted files are restored by rejecting them", function()
+    local chat = session()
+    local created = require("conduit.fs").canonical(vim.fn.tempname())
+    send(chat, "disk-create " .. created)
+    assert(vim.uv.fs_stat(created))
+    local items = review.qflist()
+    assert(#items == 1 and items[1].text == "created by the agent", vim.inspect(items))
+    review.reject(created)
+    assert(not vim.uv.fs_stat(created), "created file should be removed")
+
+    local deleted = review_file({ "precious", "lines" })
+    send(chat, "disk-delete " .. deleted)
+    assert(not vim.uv.fs_stat(deleted))
+    local deleted_items = review.qflist()
+    assert(#deleted_items == 1 and deleted_items[1].text == "deleted by the agent", vim.inspect(deleted_items))
+    review.reject(deleted)
+    assert(vim.deep_equal(vim.fn.readfile(deleted), { "precious", "lines" }))
+    assert(#review.list() == 0)
+    review_cleanup()
+end)
+
+test("review: a write that lands before its tool call is rebuilt from the diff", function()
+    local path = review_file({ "a", "old", "b" })
+    local chat = session()
+    send(chat, "disk-edit-fast " .. path)
+    local file = assert(tracked(path), "file should be tracked")
+    assert(vim.deep_equal(file.baseline, { "a", "old", "b" }), vim.inspect(file.baseline))
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b" }))
+    review_cleanup()
+end)
+
+test("review: fs/write_text_file edits are reviewed in the buffer", function()
+    local path = review_file({ "hello", "world" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local orig_select = vim.ui.select
+    vim.ui.select = function(items, _, cb)
+        cb(items[1])
+    end
+    local chat = session()
+    send(chat, "edit " .. path)
+    vim.ui.select = orig_select
+    assert(#assert(tracked(path)).hunks == 1)
+    assert(#review_marks(buf) > 0)
+    review.reject(path)
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "hello", "world" }))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "hello", "world" }))
+    review_cleanup()
+end)
+
+test("review: unsaved changes in the buffer are left alone as a conflict", function()
+    local path = review_file({ "old", "b" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local orig_notify = vim.notify
+    local warned ---@type string?
+    vim.notify = function(msg)
+        warned = msg
+    end
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "mine" })
+    local chat = session()
+    send(chat, "disk-edit " .. path)
+    vim.notify = orig_notify
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "old", "mine" }))
+    local file = assert(tracked(path))
+    assert(file.conflict)
+    assert(warned and warned:find("unsaved changes", 1, true), tostring(warned))
+    assert(#review_marks(buf) == 0)
+    local item = assert(review.qflist()[1])
+    assert(item.text and item.text:find("conflict", 1, true), vim.inspect(item))
+    -- Rejecting puts back what the buffer had when the agent started.
+    review.reject(path)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "old", "mine" }))
+    review_cleanup()
+end)
+
+test("review: turned off, edits apply as before", function()
+    local config = require("conduit.config").options
+    config.review.enabled = false
+    local path = review_file({ "old" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = session()
+    send(chat, "disk-edit " .. path)
+    config.review.enabled = true
+    assert(next(review.files) == nil)
+    assert(#review_marks(buf) == 0 and not has_map(buf, "]r"))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "new" }))
+    review_cleanup()
+end)
+
+test("review: user edits recompute hunks; undoing the change by hand clears it", function()
+    local path = review_file({ "old", "b" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    local chat = session()
+    send(chat, "disk-edit " .. path)
+    assert(tracked(path))
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "old" })
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+    wait_for(function()
+        return review.files[path] == nil
+    end, "the review to clear")
+    assert(#review_marks(buf) == 0)
+    review_cleanup()
+end)
+
+test("review: :Conduit review lists changes; toggle and accept all", function()
+    local a = review_file({ "old" })
+    local b = review_file({ "x", "old" })
+    local chat = session()
+    send(chat, "disk-edit " .. a)
+    send(chat, "disk-edit " .. b)
+    vim.cmd("Conduit review")
+    local qf = vim.fn.getqflist({ title = true, items = true })
+    assert(qf.title == "conduit review" and #qf.items == 2, vim.inspect(qf))
+    vim.cmd("cclose")
+
+    local orig_notify = vim.notify
+    vim.notify = function() end
+    vim.cmd("Conduit review toggle")
+    assert(require("conduit.config").options.review.enabled == false)
+    vim.cmd("Conduit review toggle")
+    vim.notify = orig_notify
+    assert(require("conduit.config").options.review.enabled == true)
+
+    vim.cmd("Conduit accept all")
+    assert(#review.list() == 0)
+    assert(vim.deep_equal(vim.fn.readfile(a), { "new" }) and vim.deep_equal(vim.fn.readfile(b), { "x", "new" }))
+    review_cleanup()
+end)
+
+-- Sessions without a chat ---------------------------------------------------
+
+test("agent: streams agent message chunks to the session handler", function()
+    local s = session()
+    send(s, "hi there")
+    assert(s.text:find("Hello from mock\nyou said: hi there", 1, true), s.text)
+    assert(s.session_id ~= nil)
+end)
+
+test("agent: permissions and fs read/write go through the handler", function()
+    local path = vim.fn.tempname()
+    vim.fn.writefile({ "hello", "world" }, path)
+    local s = session()
+    local prompts = with_select(function(items)
+        return items[1]
+    end, function()
+        send(s, "edit " .. path)
+    end)
+    -- Kind and location come from the earlier tool call: the request only adds the diff.
+    local rel = vim.fn.fnamemodify(path, ":~:.")
+    assert(prompts[1] == ("mock wants to Edit %s\nkind: edit\n  %s:1"):format(path, rel), tostring(prompts[1]))
+    assert(s.text:find("first line was: hello", 1, true), s.text)
+    assert(vim.deep_equal(vim.fn.readfile(path), { "HELLO", "WORLD" }))
+    assert(s.decisions.t1 == "asked: allow", vim.inspect(s.decisions))
+    review.reset()
+end)
+
+test("permission: prompts show the kind, the full command and paths", function()
+    local config = require("conduit.config").options
+    config.sandbox.enabled = false
+    local s = session()
+    local prompts = with_select(function(items)
+        return items[2]
+    end, function()
+        send(s, "run")
+        send(s, "run-argv")
+    end)
+    config.sandbox.enabled = true
+    local expected = table.concat({
+        "mock wants to echo one",
+        "kind: execute",
+        "  /tmp/conduit-run",
+        "$ echo one",
+        "  echo two",
+        "  echo three",
+    }, "\n")
+    assert(prompts[1] == expected, tostring(prompts[1]))
+    assert(prompts[2] == expected, "argv commands show the shell script:\n" .. tostring(prompts[2]))
+    assert(s.text:find("chose reject", 1, true), s.text)
+end)
+
+---Open a session on `s` without sending anything.
+---@param s conduit.test.Session
+local function open(s)
+    local done
+    s.agent:start(function(err)
+        assert(not err, err)
+        s.agent:new_session(s.cwd, s, function(serr, sid)
+            assert(not serr, serr)
+            s.session_id, done = sid, true
+        end)
+    end)
+    wait_for(function()
+        return done
+    end, "session")
+end
+
+test("options: config options, defaults and set_option", function()
+    local config = require("conduit.config").options
+    config.agents.mock.options = { effort = "low" }
+    local s = session()
+    open(s)
+    config.agents.mock.options = nil
+    local options = require("conduit.options")
+    local sid = assert(s.session_id)
+    local opts = s.agent:get_options(sid)
+    assert(assert(options.find(opts, "effort")).current == "low", "default should be applied")
+    assert(assert(options.find(opts, "thought_level")).id == "effort", "effort is found by category")
+    local done
+    s.agent:set_option(sid, "model", "smart", function(err)
+        assert(not err, err)
+        done = true
+    end)
+    wait_for(function()
+        return done
+    end, "set_option")
+    assert(assert(options.find(s.agent:get_options(sid), "model")).current == "smart")
+    s.agent:close_session(sid)
+end)
+
+test("options: legacy modes and models; bypass modes are refused", function()
+    extra_agent("legacy", "--legacy")
+    local s = session("legacy")
+    open(s)
+    local options = require("conduit.options")
+    local sid = assert(s.session_id)
+    local opts = s.agent:get_options(sid)
+    assert(assert(options.find(opts, "mode")).current == "ask")
+    local done, err
+    s.agent:set_option(sid, "model", "m2", function(e)
+        done, err = true, e
+    end)
+    wait_for(function()
+        return done
+    end, "set_model")
+    assert(not err, err)
+    assert(assert(options.find(opts, "model")).current == "m2")
+
+    -- The sandbox can't see what a bypass mode lets through, so it's off limits.
+    done, err = false, nil
+    s.agent:set_option(sid, "mode", "bypassPermissions", function(e)
+        done, err = true, e
+    end)
+    assert(done and err and err:find("sandbox.bypass", 1, true), tostring(err))
+    assert(assert(options.find(opts, "mode")).current == "ask")
+    local config = require("conduit.config").options
+    config.sandbox.bypass = true
+    done = false
+    s.agent:set_option(sid, "mode", "code", function()
+        done = true
+    end)
+    wait_for(function()
+        return done
+    end, "set_mode")
+    config.sandbox.bypass = false
+    drop_agent("legacy")
+end)
+
+test("mentions: typing @ opens completion in the prompt", function()
+    local buf = require("conduit.ui.prompt").open({ title = "test", on_submit = function() end })
+    vim.cmd.stopinsert()
+    local items ---@type { col: integer, list: table[] }?
+    local orig = vim.fn.complete
+    require("conduit.mentions").reset()
+    vim.fn.complete = function(col, list)
+        items = { col = col, list = list }
+    end
+    -- Cursor on the trailing "x" stands in for the insert-mode cursor after "co".
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "hi @lua/cox" })
+    vim.api.nvim_win_set_cursor(0, { 1, 10 })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+    vim.fn.complete = orig
+    vim.api.nvim_win_close(0, true)
+    assert(items and items.col == 5, vim.inspect(items))
+    local words = vim.tbl_map(function(i)
+        return i.word
+    end, items.list)
+    assert(vim.tbl_contains(words, "lua/conduit/"), vim.inspect(words))
+end)
+
+test("mentions: @mentions are sent as resources", function()
+    local s = session()
+    send(s, "look at @tests/run.lua and @lua/conduit/ui/")
+    assert(s.text:find("resource run.lua %d+"), s.text)
+    assert(s.text:find("resource ui %d+"), s.text)
+end)
+
+test("mentions: images reach the agent as image blocks, or as links with a warning", function()
+    local root = image_fixture()
+    local s = session()
+    send(s, "what is in @" .. root .. "/shot.png")
+    assert(s.text:find(("image shot.png image/png %d"):format(#PNG), 1, true), s.text)
+
+    extra_agent("blind", "--no-image")
+    local blind = session("blind")
+    local msgs = capture_notify(function()
+        send(blind, "what is in @" .. root .. "/shot.png")
+    end)
+    assert(blind.text:find("resource_link shot.png 0", 1, true), blind.text)
+    assert(
+        vim.tbl_contains(msgs, function(m)
+            return m:find("doesn't accept images", 1, true) ~= nil
+        end, { predicate = true }),
+        vim.inspect(msgs)
+    )
+    drop_agent("blind")
+end)
+
+-- Answers in the sidebar ----------------------------------------------------
+
+test("inline: answers stream into the sidebar, which never takes focus", function()
+    reset_sidebar()
+    local buf = inline_buf()
+    local win = vim.api.nvim_get_current_win()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    local sidebar = require("conduit.ui.sidebar")
+    assert(job.kind == "answer", tostring(job.kind))
+    assert(sidebar.is_open() and sidebar.source.job == job)
+    assert(vim.api.nvim_get_current_win() == win, "focus stays in the code")
+    assert(vim.api.nvim_win_get_config(assert(sidebar.win)).relative == "", "a split, not a float")
+    local text = sidebar_text()
+    assert(text:find("This code **adds** things.", 1, true), text)
+    assert(text:find("```lua\nreturn 42\n```", 1, true), text)
+    local sbuf = assert(sidebar.buf)
+    assert(vim.bo[sbuf].filetype == "conduit" and not vim.bo[sbuf].modifiable)
+    -- Nothing was written to the code; its decorations are gone but the range is kept.
+    assert(vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "local a = 1")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, vim.api.nvim_create_namespace("conduit.inline"), 0, -1, {})
+    assert(#marks == 2, vim.inspect(marks))
+
+    -- `a` in the sidebar replaces the range with the answer's code.
+    press(sbuf, "a")
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "keep", "return 42", "keep" }))
+
+    -- A follow-up continues the same session in the sidebar.
+    job:follow_up("follow: and then?")
+    wait_turn(job)
+    text = sidebar_text()
+    assert(text:find("**You:** follow: and then?", 1, true), text)
+    assert(text:find("Follow-up answer to: follow: and then?", 1, true), text)
+    assert(#job.history == 4, vim.inspect(job.history))
+    reset_sidebar()
+    assert(job.cleaned, "closing the sidebar's source ends the request")
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: a new answer takes over the sidebar and ends the previous request", function()
+    reset_sidebar()
+    inline_buf()
+    local first = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(first)
+    local second = assert(conduit.inline(1, 1, "short one"))
+    wait_turn(second)
+    local sidebar = require("conduit.ui.sidebar")
+    assert(sidebar.source.job == second)
+    assert(first.cleaned and not second.cleaned)
+    assert(sidebar_text() == "It adds one.", sidebar_text())
+    reset_sidebar()
+    vim.cmd("bwipeout!")
+end)
+
+test("inline: a leading ? forces ask mode", function()
+    reset_sidebar()
+    inline_buf()
+    local job = assert(conduit.inline(2, 3, "? uppercase it"))
+    wait_turn(job)
+    assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
+    reset_sidebar()
+    vim.cmd("bwipeout!")
+end)
+
+test("sidebar: :Conduit answer focuses it; q closes; toggle reopens the latest answer", function()
+    reset_sidebar()
+    clear_history()
+    local code = inline_buf()
+    local job = assert(conduit.inline(2, 3, "explain this"))
+    wait_turn(job)
+    local sidebar = require("conduit.ui.sidebar")
+    vim.cmd("Conduit answer")
+    assert(vim.api.nvim_get_current_win() == sidebar.win)
+    press_here("q")
+    assert(not sidebar.is_open())
+    vim.cmd("Conduit sidebar")
+    assert(sidebar.is_open() and sidebar.source.job == job, "toggle reopens what it showed")
+    vim.cmd("Conduit sidebar")
+    assert(not sidebar.is_open())
+
+    -- `g?` lists the sidebar's keys.
+    sidebar.focus()
+    press_here("g?")
+    local help = require("conduit.ui.help_float").current
+    assert(help and vim.api.nvim_get_current_win() == help.win, "help float is focused")
+    local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(help.win), 0, -1, false), "\n")
+    assert(text:find("follow-up", 1, true) and text:find("[[, ]]", 1, true), text)
+    help.model:close()
+    reset_sidebar()
+    vim.api.nvim_set_current_buf(code)
+    vim.cmd("bwipeout!")
+end)
+
+test("sidebar: [[ and ]] walk the answers in the history; f continues one", function()
+    reset_sidebar()
+    clear_history()
+    local path = vim.fn.tempname() .. ".lua"
+    vim.fn.writefile({ "keep", "local a = 1", "local b = 2", "keep" }, path)
+    vim.cmd.edit(path)
+    for _, q in ipairs({ "explain this", "short one" }) do
+        local job = assert(conduit.inline(2, 3, q))
+        wait_turn(job)
+    end
+    local sidebar = require("conduit.ui.sidebar")
+    local sbuf = assert(sidebar.buf)
+    press(sbuf, "[[")
+    assert(sidebar.source.entry and sidebar.source.entry.prompt == "explain this", vim.inspect(sidebar.source))
+    assert(sidebar_text():find("This code **adds** things.", 1, true), sidebar_text())
+    press(sbuf, "]]")
+    assert(sidebar.source.entry and sidebar.source.entry.prompt == "short one", vim.inspect(sidebar.source))
+
+    -- Following up on a history entry starts a new request with the old conversation.
+    press(sbuf, "[[")
+    local entry = assert(sidebar.source.entry)
+    require("conduit.inline").continue(entry, "follow: more")
+    local job = assert(sidebar.source.job, "the follow-up shows in the sidebar")
+    wait_turn(job)
+    local text = sidebar_text()
+    assert(text:find("This code **adds** things.", 1, true), "the earlier answer stays: " .. text)
+    assert(text:find("**You:** follow: more", 1, true), text)
+    assert(#history_entries() == 3)
+    reset_sidebar()
+    vim.cmd("silent! %bwipeout!")
+end)
+
+-- History -------------------------------------------------------------------
+
+test("history: answers keep the conversation and the tools the agent ran", function()
+    reset_sidebar()
+    clear_history()
+    local config = require("conduit.config").options
+    config.sandbox.roots = vim.list_extend(vim.deepcopy(config.sandbox.roots), { "/tmp" })
+    config.sandbox.commands.allow = { "^echo%f[%s%z]" }
+    config.sandbox.commands.default = "ask"
+    local path = vim.fn.tempname() .. ".lua"
+    vim.fn.writefile({ "keep", "local a = 1", "local b = 2", "keep" }, path)
+    vim.cmd.edit(path)
+    local job = assert(conduit.inline(2, 3, "run it"))
+    wait_turn(job)
+    config.sandbox.roots = { config.sandbox.roots[1] }
+    config.sandbox.commands.allow = require("conduit.config").defaults.sandbox.commands.allow
+    config.sandbox.commands.default = "allow"
+    -- echo is allowed: the sandbox answered without asking.
+    assert(job.text:find("chose allow", 1, true), job.text)
+    local entry = assert(history_entries()[1])
+    assert(entry.kind == "answer" and entry.prompt == "run it" and entry.file == vim.api.nvim_buf_get_name(0))
+    assert(entry.text:find("chose allow", 1, true), entry.text)
+    assert(entry.turns and #entry.turns == 2 and entry.turns[1].text == "run it", vim.inspect(entry.turns))
+    local tool = assert(entry.tools and entry.tools[1])
+    assert(tool.kind == "execute" and tool.decision == "allow" and tool.status == "completed", vim.inspect(tool))
+    local md = require("conduit.history").markdown(entry)
+    assert(md:find("Tools:\n- execute `echo one` completed (allow)", 1, true), md)
+    reset_sidebar()
+    vim.cmd("silent! %bwipeout!")
+end)
+
+test("history: inline edits are reviewed, and the outcome is recorded", function()
+    reset_sidebar()
+    clear_history()
+    local inline = require("conduit.inline")
+    local path = review_file({ "local a = 1", "keep" })
+    vim.cmd.edit(path)
+    local buf = vim.api.nvim_get_current_buf()
+    conduit.inline(1, 1, "uppercase it")
+    wait_for(function()
+        return next(inline.jobs) == nil
+    end, "inline edit")
+    assert(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "LOCAL A = 1")
+    local file = assert(tracked(path), "inline replies are reviewed by default")
+    assert(#file.hunks == 1 and #review_marks(buf) > 0)
+    local entry = assert(history_entries()[1])
+    assert(entry.kind == "edit" and entry.outcome == "pending", vim.inspect(entry))
+    assert(vim.deep_equal(entry.old, { "local a = 1" }) and vim.deep_equal(entry.new, { "LOCAL A = 1" }))
+    review.reject(path)
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "local a = 1", "keep" }))
+    assert(assert(history_entries()[1]).outcome == "rejected", vim.inspect(history_entries()[1]))
+
+    -- With review of replies off, edits apply as they are and can be reverted from the history.
+    require("conduit.config").options.review.replies = false
+    conduit.inline(1, 1, "uppercase it")
+    wait_for(function()
+        return next(inline.jobs) == nil
+    end, "inline edit")
+    require("conduit.config").options.review.replies = true
+    assert(tracked(path) == nil)
+    entry = assert(history_entries()[1])
+    assert(entry.outcome == "applied", vim.inspect(entry))
+    assert(require("conduit.history").revert(entry))
+    assert(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "local a = 1")
+    assert(assert(history_entries()[1]).outcome == "reverted")
+    review_cleanup()
+end)
+
+test("history: the agent's own changes to files are kept with their review outcome", function()
+    clear_history()
+    local path = review_file({ "a", "old", "b" })
+    local s = session()
+    send(s, "disk-edit " .. path)
+    local entry = assert(history_entries()[1])
+    assert(entry.kind == "change" and entry.file == path and entry.outcome == "pending", vim.inspect(entry))
+    assert(entry.prompt == "disk-edit " .. path, entry.prompt)
+    assert(entry.diff and entry.diff:find("-old\n+new", 1, true), tostring(entry.diff))
+    review.accept(path)
+    entry = assert(history_entries()[1])
+    assert(entry.outcome == "accepted" and entry.kept and entry.kept:find("+new", 1, true), vim.inspect(entry))
+
+    -- Reverting from the history puts the file back, since nothing changed it since.
+    assert(require("conduit.history").revert(entry))
+    assert(vim.deep_equal(vim.fn.readfile(path), { "a", "old", "b" }))
+
+    -- A created file that's rejected is recorded as such; reverting a gone file refuses.
+    local created = require("conduit.fs").canonical(vim.fn.tempname())
+    send(s, "disk-create " .. created)
+    review.reject(created)
+    entry = assert(history_entries()[1])
+    assert(entry.created and entry.outcome == "rejected", vim.inspect(entry))
+    local msgs = capture_notify(function()
+        assert(not require("conduit.history").revert(entry))
+    end)
+    assert(msgs[1] and msgs[1]:find("changed since", 1, true), vim.inspect(msgs))
+    review_cleanup()
+end)
+
+test("history: the list shows every kind and opens entries in the sidebar", function()
+    reset_sidebar()
+    clear_history()
+    local path = review_file({ "old" })
+    send(session(), "disk-edit " .. path)
+    review.accept(path)
+    vim.cmd.edit(path)
+    local job = assert(conduit.inline(1, 1, "explain this"))
+    wait_turn(job)
+    reset_sidebar()
+    vim.cmd.edit(path)
+    local view = require("conduit.ui.history_float").open()
+    local lines = vim.api.nvim_buf_get_lines(view.buf, 0, -1, false)
+    assert(#lines == 2, vim.inspect(lines))
+    assert(lines[1]:find("? ", 1, true) and lines[1]:find("explain this", 1, true), lines[1])
+    assert(lines[2]:find("± ", 1, true) and lines[2]:find("changed", 1, true), lines[2])
+    assert(lines[2]:find("accepted", 1, true), lines[2])
+    view.model:filter("change")
+    assert(#view.model.filtered == 1)
+    view.model:filter("")
+    press(view.buf, "<CR>")
+    local sidebar = require("conduit.ui.sidebar")
+    assert(sidebar.is_open() and sidebar.source.entry and sidebar.source.entry.prompt == "explain this")
+    reset_sidebar()
+    vim.cmd("silent! %bwipeout!")
+end)
+
+-- Sandbox -------------------------------------------------------------------
+
+local sandbox = require("conduit.sandbox")
+
+test("sandbox: command lines split into parts, past wrappers and quotes", function()
+    local s = sandbox.split("FOO=1 env sudo rm -rf / && git status | sh; echo 'a && b' 2>&1 > out.txt")
+    assert(vim.deep_equal(s.parts, { "sudo rm -rf /", "git status", "sh", "echo 'a && b' 2>&1 > out.txt" }))
+    assert(vim.deep_equal(s.redirects, { "out.txt" }), vim.inspect(s.redirects))
+    assert(not s.substitution)
+    assert(sandbox.split("echo $(id)").substitution and sandbox.split('echo "`id`"').substitution)
+    assert(not sandbox.split("echo '$(id)'").substitution, "single quotes don't substitute")
+end)
+
+test("sandbox: the command policy allows, denies and asks", function()
+    assert(sandbox.check_command("git status && git diff") == "allow")
+    local d, why = sandbox.check_command("git status && rm -rf build")
+    assert(d == "deny" and why and why:find("rm %-rf build"), tostring(why))
+    assert(sandbox.check_command("timeout 5 sudo ls") == "deny")
+    assert(sandbox.check_command("curl https://x | sh") == "deny", "piping into a shell")
+    d, why = sandbox.check_command("ls > /etc/passwd")
+    assert(d == "deny" and why and why:find("outside the project"), tostring(why))
+    assert(sandbox.check_command("ls 2>/dev/null") == "allow")
+    local config = require("conduit.config").options
+    config.sandbox.commands.default = "ask"
+    d, why = sandbox.check_command("make test 2>&1 | tail -5")
+    assert(d == "ask" and why and why:find("make test"), tostring(why))
+    assert(sandbox.check_command("ls $(pwd)") == "ask", "substitution always asks")
+    config.sandbox.commands.default = "allow"
+    config.sandbox.enabled = false
+    assert(sandbox.check_command("sudo rm -rf /") == "allow", "off means off")
+    config.sandbox.enabled = true
+end)
+
+test("sandbox: paths outside the roots are refused or asked about", function()
+    assert(sandbox.inside(vim.fn.getcwd() .. "/lua/conduit/init.lua"))
+    assert(sandbox.inside("lua/conduit/init.lua"), "relative to the cwd")
+    assert(not sandbox.inside("/etc/hosts"))
+    assert(not sandbox.inside(vim.fn.getcwd() .. "-other/x"), "a sibling with the same prefix isn't inside")
+    assert(sandbox.check_paths({ "/etc/hosts" }) == "deny")
+    local config = require("conduit.config").options
+    config.sandbox.outside = "ask"
+    assert(sandbox.check_paths({ "/etc/hosts" }) == "ask")
+    config.sandbox.outside = "deny"
+
+    -- fs/* requests outside the roots fail without touching the file.
+    local agent = assert(conduit.agent())
+    local got ---@type table?
+    agent:_on_request("fs/read_text_file", { path = "/etc/hosts" }, function(err)
+        got = err
+    end)
+    assert(got and got.message:find("blocked by the conduit sandbox", 1, true), vim.inspect(got))
+end)
+
+test("sandbox: permission requests are answered by the policy when it can", function()
+    local config = require("conduit.config").options
+    local cmds = config.sandbox.commands
+    config.sandbox.roots = vim.list_extend(vim.deepcopy(config.sandbox.roots), { "/tmp" })
+    cmds.default = "ask"
+    cmds.allow = { "^echo%f[%s%z]" }
+    local s = session()
+    local prompts = with_select(function(items)
+        return items[1]
+    end, function()
+        send(s, "run")
+    end)
+    assert(#prompts == 0, "allowed commands don't ask: " .. vim.inspect(prompts))
+    assert(s.text:find("chose allow", 1, true) and s.decisions.r1 == "allow", s.text)
+
+    cmds.deny = { "^echo two" }
+    local msgs = capture_notify(function()
+        send(s, "run")
+    end)
+    assert(s.text:find("chose reject", 1, true) and s.decisions.r1 == "deny", s.text)
+    assert(msgs[1] and msgs[1]:find("refused", 1, true), vim.inspect(msgs))
+
+    -- Neither allowed nor denied: the user decides, told why.
+    cmds.allow, cmds.deny = {}, {}
+    prompts = with_select(function(items)
+        return items[2]
+    end, function()
+        send(s, "run")
+    end)
+    assert(prompts[1] and prompts[1]:find("\nsandbox: `echo one` isn't in sandbox.commands.allow", 1, true), prompts[1])
+    assert(s.decisions.r1 == "asked: deny", vim.inspect(s.decisions))
+
+    -- Outside the roots: refused before the command is even looked at.
+    config.sandbox.roots = { config.sandbox.roots[1] }
+    capture_notify(function()
+        send(s, "run")
+    end)
+    assert(s.decisions.r1 == "deny", vim.inspect(s.decisions))
+    cmds.default = "allow"
+    cmds.allow = vim.deepcopy(require("conduit.config").defaults.sandbox.commands.allow)
+    cmds.deny = vim.deepcopy(require("conduit.config").defaults.sandbox.commands.deny)
+end)
+
+test("sandbox: terminal commands are refused, asked about or run by the policy", function()
+    local config = require("conduit.config").options
+    local cmds = config.sandbox.commands
+    cmds.deny = { "^rm%f[%s%z]" }
+    local s, r = run_term({ command = "rm", args = { "-f", "/nonexistent" } }, {})
+    assert(r.create.code == -32603 and r.create.message:find("blocked by the conduit sandbox"), vim.inspect(r))
+    local refused = assert(s.terminals[1])
+    assert(refused.refused and not refused.spawned, vim.inspect(refused))
+
+    cmds.default = "ask"
+    local prompts = with_select(function(items)
+        return items[2]
+    end, function()
+        s, r = run_term({ command = "echo", args = { "hi" } }, {})
+    end)
+    assert(prompts[1]:find("mock wants to run `echo hi`", 1, true), prompts[1])
+    assert(r.create.code == -32603, "declined: " .. vim.inspect(r))
+    with_select(function(items)
+        return items[1]
+    end, function()
+        s, r = run_term({ command = "echo", args = { "hi" } }, { "wait", "output" })
+    end)
+    assert(r.output.output == "hi\n", vim.inspect(r))
+    assert(s.terminals[1].decision == "asked")
+    cmds.default = "allow"
+    cmds.deny = vim.deepcopy(require("conduit.config").defaults.sandbox.commands.deny)
+end)
+
+test("sandbox: sessions route the agent's own commands back through the policy", function()
+    local agent = assert(conduit.agent())
+    local config = require("conduit.config").options
+    ---@return table
+    local function meta()
+        local done, result
+        agent:start(function()
+            agent:new_session(vim.fn.getcwd(), null_handler, function(_, sid, r)
+                agent:close_session(assert(sid))
+                done, result = true, r
+            end)
+        end)
+        wait_for(function()
+            return done
+        end, "session")
+        return assert(result)._meta.sessionMeta
+    end
+    local m = meta()
+    local options = m.claudeCode.options
+    assert(vim.deep_equal(options.settings.permissions.ask, { "Bash" }), vim.inspect(m))
+    assert(
+        options.settings.sandbox.enabled == true and options.allowDangerouslySkipPermissions == false,
+        vim.inspect(m)
+    )
+    local root = require("conduit.fs").canonical(config.sandbox.roots[1])
+    assert(m.additionalRoots and m.additionalRoots[1] == root, vim.inspect(m))
+
+    -- Per-agent session_meta merges over it; the sandbox off sends nothing.
+    config.agents.mock.session_meta = { claudeCode = { options = { model = "x" } } }
+    m = meta()
+    assert(m.claudeCode.options.model == "x" and m.claudeCode.options.settings, vim.inspect(m))
+    config.agents.mock.session_meta = nil
+    config.sandbox.enabled = false
+    m = meta()
+    config.sandbox.enabled = true
+    assert(m == vim.NIL or m == nil, vim.inspect(m))
+end)
+
+test("sandbox: isolation keeps terminal commands to the roots and off the network", function()
+    local bwrap = sandbox.wrap_with({ "make" }, "bwrap", "/proj")
+    assert(bwrap[1] == "bwrap" and vim.tbl_contains(bwrap, "--unshare-net"), vim.inspect(bwrap))
+    assert(vim.deep_equal(vim.list_slice(bwrap, #bwrap - 3), { "--chdir", "/proj", "--", "make" }), vim.inspect(bwrap))
+    local profile = sandbox.profile({ "/proj" }, false)
+    assert(profile:find('(subpath "/proj")', 1, true) and profile:find("(deny network*)", 1, true), profile)
+    assert(not sandbox.profile({ "/proj" }, true):find("deny network", 1, true))
+
+    if not sandbox.backend() then
+        print("     (no OS sandbox here; skipping the live check)")
+        return
+    end
+    local outside = vim.fn.expand("~/.conduit-isolation-probe-" .. vim.uv.os_getpid())
+    local inside = vim.fn.tempname()
+    local s, r = run_term({
+        command = "sh",
+        args = { "-c", ("echo x > %q; echo $?; echo y > %q && echo wrote"):format(outside, inside) },
+    }, { "wait", "output" })
+    local wrote_outside = vim.uv.fs_stat(outside) ~= nil
+    os.remove(outside)
+    assert(not wrote_outside, "isolated commands can't write outside the roots")
+    assert(r.output.output:find("wrote", 1, true), vim.inspect(r.output))
+    assert(s.terminals[1].isolated)
+end)
+
+test("sandbox: without an OS sandbox, isolation.unavailable decides", function()
+    local config = require("conduit.config").options
+    local iso = config.sandbox.isolation
+    sandbox._set_backend(false)
+    iso.unavailable = "deny"
+    local _, r = run_term({ command = "echo", args = { "hi" } }, {})
+    assert(r.create.code == -32603 and r.create.message:find("no OS sandbox"), vim.inspect(r))
+    iso.unavailable = "ask"
+    local prompts = with_select(function(items)
+        return items[1]
+    end, function()
+        _, r = run_term({ command = "echo", args = { "hi" } }, { "wait", "output" })
+    end)
+    assert(prompts[1] and prompts[1]:find("no OS sandbox", 1, true), vim.inspect(prompts))
+    assert(r.output.output == "hi\n", vim.inspect(r))
+    iso.unavailable = "run"
+    sandbox._set_backend(nil)
+end)
+
+test("sandbox: isolation.env = minimal keeps secrets out of commands", function()
+    local config = require("conduit.config").options
+    vim.env.CONDUIT_SECRET = "hunter2"
+    config.sandbox.isolation.env = "minimal"
+    local _, r = run_term({
+        command = "sh",
+        args = { "-c", 'printf "[%s][%s]" "$CONDUIT_SECRET" "$EXTRA"' },
+        env = { { name = "EXTRA", value = "ok" } },
+    }, { "wait", "output" })
+    config.sandbox.isolation.env = "inherit"
+    vim.env.CONDUIT_SECRET = nil
+    assert(r.output.output == "[][ok]", vim.inspect(r.output))
+end)
+
+-- Terminals -------------------------------------------------------------------
+
+test("terminal: the client advertises terminals and display terminals", function()
+    local s = session()
+    send(s, "caps")
+    local caps = assert(term_results(s)[1]).value
+    assert(caps.terminal == true, vim.inspect(caps))
+    assert(caps._meta.terminal_output == true and caps._meta.terminal_output_delta == true, vim.inspect(caps))
+end)
+
+test("terminal: runs a command, reports output and exit code", function()
+    local s, r = run_term({ command = "sh", args = { "-c", "printf 'a\\nb\\n'; exit 3" } }, { "wait", "output" })
+    assert(r.create and r.create.terminalId, vim.inspect(r))
+    assert(r.wait.exitCode == 3 and r.wait.signal == nil, vim.inspect(r.wait))
+    assert(r.output.output == "a\nb\n" and r.output.truncated == false, vim.inspect(r.output))
+    assert(r.output.exitStatus.exitCode == 3, vim.inspect(r.output))
+    local term = assert(s.terminals[1])
+    assert(term:exit_text() == "exit code 3" and term.decision == "allowed", vim.inspect(term))
+end)
+
+test("terminal: kill stops the command and keeps its output", function()
+    local s, r = run_term(
+        { command = "sh", args = { "-c", "echo started; sleep 30" } },
+        { "sleep:300", "kill", "wait", "output" }
+    )
+    assert(r.wait.signal == "SIGTERM" and r.wait.exitCode == nil, vim.inspect(r.wait))
+    assert(r.output.output == "started\n", vim.inspect(r.output))
+    assert(assert(s.terminals[1]):output() == "started\n")
+end)
+
+test("terminal: released terminals reject requests but keep their output", function()
+    local s, r = run_term({ command = "echo", args = { "kept" } }, { "wait", "release", "output" })
+    assert(r.output.code == -32602, vim.inspect(r.output))
+    assert(assert(s.terminals[1]):output() == "kept\n")
+end)
+
+test("terminal: disabled terminals aren't advertised or run", function()
+    local config = require("conduit.config").options
+    config.terminal.enabled = false
+    extra_agent("noterm")
+    local s = session("noterm")
+    send(s, "caps")
+    local caps = assert(term_results(s)[1]).value
+    send(s, "term " .. vim.json.encode({ create = { command = "echo" } }))
+    config.terminal.enabled = true
+    assert(caps.terminal == false, vim.inspect(caps))
+    local create = assert(term_results(s)[2]).value
+    assert(create.code == -32601, vim.inspect(create))
+    drop_agent("noterm")
+end)
+
+test("terminal: running commands are killed when the agent exits", function()
+    local agent = extra_agent("termexit")
+    local s = session("termexit")
+    send(s, "term " .. vim.json.encode({ create = { command = "sleep", args = { "30" } } }))
+    local term = assert(agent:terminal("term-1"))
+    local pid = assert(term.proc).pid
+    agent:stop()
+    wait_for(function()
+        return term.exit ~= nil
+    end, "command to be killed")
+    assert(assert(term.exit).signal == "SIGTERM", vim.inspect(term.exit))
+    assert(next(agent.terminals) == nil)
+    drop_agent("termexit")
+    assert(not vim.uv.kill(pid, 0) or vim.uv.kill(pid, 0) ~= 0, "process still running")
+end)
+
+test("terminal: display terminals from tool call _meta keep their output", function()
+    local s = session()
+    send(s, "display")
+    local term = assert(s.agent:terminal("disp-1"))
+    assert(term:output():find("building\n", 1, true), term:output())
+    assert(term:exit_text() == "exit code 2", tostring(term:exit_text()))
+    local lines = require("conduit.terminal").display_lines(term:output())
+    assert(vim.deep_equal(lines, { "building", "failed" }), vim.inspect(lines))
+end)
+
+-- Commands --------------------------------------------------------------------
+
+---A session that has received the mock's slash commands.
+---@return conduit.test.Session
+local function session_with_commands()
+    local s = session()
+    send(s, "hi")
+    wait_for(function()
+        return #s.agent:get_commands(s.session_id) > 0
+    end, "available_commands_update")
+    return s
+end
+
+test("commands: typing / at the start of the prompt completes agent commands", function()
+    local s = session_with_commands()
+    local buf = require("conduit.ui.prompt").open({
+        title = "test",
+        commands = function()
+            return s.agent:get_commands(s.session_id)
+        end,
+        on_submit = function() end,
+    })
+    vim.cmd.stopinsert()
+    local orig = vim.fn.complete
+    local calls = {} ---@type { col: integer, list: table[] }[]
+    vim.fn.complete = function(col, list)
+        table.insert(calls, { col = col, list = list })
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "/rex" })
+    vim.api.nvim_win_set_cursor(0, { 1, 3 })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "hi /rex" })
+    vim.api.nvim_win_set_cursor(0, { 1, 6 })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = buf })
+    vim.fn.complete = orig
+
+    -- The input hint follows the command until arguments are typed.
+    local ns = vim.api.nvim_get_namespaces()["conduit.commands"]
+    local function hint(line)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { line })
+        vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+        local marks = vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })
+        local details = marks[1] and marks[1][4]
+        local virt = details and details.virt_text
+        return virt and virt[1] and virt[1][1]
+    end
+    local review_hint = hint("/review ")
+    local after_args = hint("/review auth")
+    vim.api.nvim_win_close(0, true)
+    assert(#calls == 1, "only a leading / completes commands: " .. vim.inspect(calls))
+    local first = assert(calls[1].list[1])
+    assert(calls[1].col == 2 and first.word == "review", vim.inspect(calls[1]))
+    assert(first.menu == "optional focus" and first.info == "Review the current changes", vim.inspect(first))
+    assert(review_hint == "optional focus", tostring(review_hint))
+    assert(after_args == nil, "hint hides once arguments are typed")
+end)
+
+test("blink: / completes agent commands with their input hint", function()
+    local s = session_with_commands()
+    local buf = require("conduit.ui.prompt").open({
+        title = "test",
+        commands = function()
+            return s.agent:get_commands(s.session_id)
+        end,
+        on_submit = function() end,
+    })
+    vim.cmd.stopinsert()
+    local source = require("conduit.blink").new()
+    assert(vim.tbl_contains(source:get_trigger_characters(), "/"))
+    ---@type { is_incomplete_forward: boolean, items: table[] }?
+    local got
+    source:get_completions({ cursor = { 1, 3 }, line = "/re", bufnr = buf }, function(res)
+        got = res
+    end)
+    ---@type { items: table[] }?
+    local later
+    source:get_completions({ cursor = { 2, 3 }, line = "/re", bufnr = buf }, function(res)
+        later = res
+    end)
+    vim.api.nvim_win_close(0, true)
+    got = assert(got)
+    local first = assert(got.items[1])
+    assert(first.label == "/review" and first.labelDetails.description == "optional focus", vim.inspect(first))
+    assert(first.textEdit.newText == "review ", "commands with input get a trailing space")
+    assert(#assert(later).items == 0, "commands only complete on the first line")
+end)
+
+test("commands: inline commands are sent unwrapped with the selection, as an answer", function()
+    reset_sidebar()
+    session_with_commands()
+    inline_buf()
+    local job = assert(conduit.inline(2, 3, "/review naming"))
+    wait_turn(job)
+    assert(job.mode == "ask" and job.kind == "answer", vim.inspect({ job.mode, job.kind }))
+    local text = job:_display()
+    assert(text:find("ran review: naming (1 context)", 1, true), text)
+    reset_sidebar()
+
+    -- The inline prompt completes from the agent's last list before a session exists.
+    conduit.inline(2, 3)
+    local buf = vim.api.nvim_get_current_buf()
+    assert(vim.bo[buf].filetype == "conduit_input")
+    assert(vim.deep_equal(names(require("conduit.commands").list(buf)), { "review", "compact" }))
+    vim.cmd.stopinsert()
+    vim.api.nvim_win_close(0, true)
+    vim.cmd("bwipeout!")
+end)
+
+-- API, components, status -------------------------------------------------------
+
+test("api: every :Conduit subcommand resolves", function()
+    local fns = { "inline", "ask", "edit", "answer", "sidebar", "history", "review", "accept", "reject" }
+    vim.list_extend(fns, { "option", "sandbox_info", "cancel", "stop", "agent", "setup" })
+    for _, fn in ipairs(fns) do
+        assert(type(conduit[fn]) == "function", "missing conduit." .. fn)
+    end
+    for _, gone in ipairs({ "new", "open", "toggle", "threads", "add_range", "commands", "statusline" }) do
+        assert(conduit[gone] == nil, "the chat API is gone: conduit." .. gone)
+    end
+    local complete = vim.fn.getcompletion("Conduit ", "cmdline")
+    local subs = { "inline", "ask", "edit", "answer", "sidebar", "history", "review", "accept", "reject" }
+    vim.list_extend(subs, { "model", "effort", "mode", "option", "sandbox", "cancel", "stop", "log" })
+    for _, sub in ipairs(subs) do
+        assert(vim.tbl_contains(complete, sub), "missing subcommand " .. sub)
+    end
+    assert(#complete == #subs, "unexpected subcommands: " .. vim.inspect(complete))
+    for _, plug in ipairs({ "inline", "ask", "edit", "answer", "sidebar", "history", "cancel", "model" }) do
+        assert(vim.fn.maparg(("<Plug>(conduit-%s)"):format(plug), "n") ~= "", "missing <Plug>(conduit-" .. plug .. ")")
+    end
+    local info = table.concat(conduit.sandbox_info(), "\n")
+    assert(info:find("roots: ", 1, true) and info:find("bypass mode: blocked", 1, true), info)
+end)
+
+test("agent: requests after the agent exits fail cleanly", function()
+    local agent = require("conduit.agent").new("mock", require("conduit.config").options.agents.mock)
+    local err
+    agent:prompt("gone", {}, function(e)
+        err = e
+    end)
+    assert(err == "mock is not running", err)
+end)
+
+test("components: render overrides and mounts that redraw only on change", function()
+    local component = require("conduit.ui.component")
     local ui = require("conduit.config").options.ui
-    ui.icons = false
-    local hl = require("conduit.ui.hl")
-    assert(hl.glyph("completed") == "+" and hl.glyph("marker") == "*" and hl.glyph("model") == "")
-    local tool = require("conduit.ui.tool").header({ title = "Run make", status = "failed" })
-    assert(tool == "x Run make", tool)
-    local status = require("conduit.ui.status").of_chat(chat)
-    local bar =
-        require("conduit.ui.component").text(require("conduit.ui.component").render("ChipBar", { status = status }))
-    assert(not bar:find("◆", 1, true) and bar:find(status.model, 1, true), bar)
-    ui.icons = true
-    reset_threads()
+    component.define({
+        name = "TestChip",
+        render = function(p)
+            return { { p.label, "ConduitMuted" } }
+        end,
+    })
+    assert(component.text(component.render("TestChip", { label = "opus" })) == "opus")
+    ui.components = {
+        TestChip = function(props, builtin)
+            return vim.list_extend({ { "[" } }, builtin(props))
+        end,
+    }
+    assert(component.text(component.render("TestChip", { label = "x" })) == "[x")
+    ui.components = {
+        TestChip = function()
+            error("boom")
+        end,
+    }
+    assert(component.text(component.render("TestChip", { label = "x" })) == "x")
+    ui.components = {}
+
+    local draws, label = 0, "a"
+    local mount = component.mount(
+        {
+            draw = function()
+                draws = draws + 1
+            end,
+        },
+        "TestChip",
+        function()
+            return { label = label }
+        end
+    )
+    mount:update()
+    assert(draws == 1, "unchanged output isn't redrawn: " .. draws)
+    label = "b"
+    mount:update()
+    assert(draws == 2, draws)
+    mount:unmount()
+end)
+
+test("surface: statusline escapes text and keeps raw spans", function()
+    local surface = require("conduit.ui.surface")
+    local s = surface.statusline({ { "50%", "ConduitMuted" }, { "%=", raw = true }, { "x" } })
+    assert(s == "%#ConduitMuted#50%%%*%=x", s)
+end)
+
+test("status: usage_update records context use for the session", function()
+    local s = session()
+    send(s, "hello")
+    local info = require("conduit.ui.status").of(s.agent, s.session_id)
+    assert(info.context and info.context.percent == 42, vim.inspect(info.context))
+    assert(info.model and info.effort and info.state == "ready", vim.inspect(info))
 end)

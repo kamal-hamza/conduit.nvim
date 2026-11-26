@@ -31,6 +31,9 @@ local M = {}
 ---@field sources table<string, conduit.ReviewSource> Tool calls that touched the file, by key
 ---@field conflict? boolean The agent changed the file on disk under unsaved changes in its buffer
 ---@field gone? boolean The file was deleted on disk while its buffer is loaded
+---@field original string[] The baseline when the file was first snapshotted (accepting doesn't move it)
+---@field history_id? string The file's entry in the history
+---@field outcomes table<string, true> What was done to its hunks: accepted, rejected
 
 ---A tool call as far as review cares: what it touches and how it's going.
 ---@class conduit.ReviewTool
@@ -48,10 +51,6 @@ M.files = {}
 -- Tool calls in flight, by key.
 ---@type table<string, conduit.ReviewTool>
 local tools = {}
-
--- How each finished tool call's changes were reviewed, by key.
----@type table<string, "accepted"|"rejected"|"reviewed">
-local outcomes = {}
 
 -- Short ids for handlers, so tool call keys are strings.
 local handler_ids = setmetatable({}, { __mode = "k" }) ---@type table<conduit.SessionHandler, integer>
@@ -73,28 +72,27 @@ local function key_of(handler, id)
     return ("%d/%s"):format(hid, id)
 end
 
----Whether edits made for `handler` are reviewed (`review.enabled` plus the
----`review.chat` or `review.inline` switch for where they come from).
----@param handler conduit.SessionHandler
+---Whether agent edits are reviewed at all.
+---@param _? conduit.SessionHandler
 ---@return boolean
-function M.wants(handler)
+function M.wants(_)
     local opts = config.options.review
-    if not opts or not opts.enabled then
-        return false
-    end
-    return opts[handler.source or "chat"] == true
+    return opts ~= nil and opts.enabled == true
 end
 
----Turn review on or off, everywhere or for one source.
----@param source? "chat"|"inline"
+---Whether inline replies (the rewritten selection) are reviewed.
+---@return boolean
+function M.wants_replies()
+    return M.wants() and config.options.review.replies ~= false
+end
+
+---Turn review on or off.
 ---@return boolean enabled The new state
-function M.toggle(source)
+function M.toggle()
     local opts = config.options.review
-    local key = source or "enabled"
-    opts[key] = not opts[key]
-    local what = source and ("review of %s edits"):format(source) or "review of agent edits"
-    vim.notify(("[conduit] %s %s"):format(what, opts[key] and "on" or "off"), vim.log.levels.INFO)
-    return opts[key]
+    opts.enabled = not opts.enabled
+    vim.notify(("[conduit] review of agent edits %s"):format(opts.enabled and "on" or "off"), vim.log.levels.INFO)
+    return opts.enabled
 end
 
 ---@param text string
@@ -215,8 +213,52 @@ local function ui()
     return require("conduit.ui.review")
 end
 
+---The change between the file's original text and now, as a unified diff.
+---@param file conduit.ReviewFile
+---@return string
+local function net_diff(file)
+    local lines, exists = current(file)
+    local a = file.existed and join(file.original) or ""
+    local b = exists and join(lines) or ""
+    if a == b then
+        return ""
+    end
+    local diff_fn = vim.text.diff or rawget(vim, "diff")
+    return diff_fn(a, b, { result_type = "unified", ctxlen = 3 }) --[[@as string]]
+end
+
+---Record (or update) the file's entry in the history, while its changes wait for review.
+---@param file conduit.ReviewFile
+---@param handler? conduit.SessionHandler
+local function record_pending(file, handler)
+    local history = require("conduit.history")
+    local diff = net_diff(file)
+    if file.history_id then
+        return history.patch(
+            file.history_id,
+            { diff = diff, deleted_file = file.existed and not file.exists or nil },
+            file.path
+        )
+    end
+    local h = handler --[[@as { history?: { text: string }[], agent?: { name: string } }?]]
+    file.history_id = history.record_change({
+        file = file.path,
+        diff = diff,
+        before = file.existed and join(file.original) or nil,
+        created = not file.existed,
+        deleted_file = file.existed and not file.exists,
+        prompt = h and h.history and h.history[1] and h.history[1].text or nil,
+        agent = h and h.agent and h.agent.name or nil,
+    })
+end
+
 ---@param file conduit.ReviewFile
 local function drop(file)
+    if file.history_id then
+        local kept = net_diff(file)
+        local outcome = kept == "" and "rejected" or file.outcomes.rejected and "partial" or "accepted"
+        require("conduit.history").patch(file.history_id, { outcome = outcome, kept = kept })
+    end
     M.files[file.path] = nil
     local buf = fs.find_buf(file.path)
     if buf then
@@ -283,9 +325,12 @@ local function snapshot(path, src, pending)
             hunks = {},
             pending = {},
             sources = {},
+            original = {},
+            outcomes = {},
         }
         local lines, exists, buf = current(file)
         file.existed, file.exists, file.baseline = exists, exists, lines
+        file.original = vim.deepcopy(lines)
         if buf then
             file.eol = vim.bo[buf].eol
         elseif exists then
@@ -465,6 +510,9 @@ local function finish(tool)
         if file then
             file.pending[key] = nil
             M.refresh(path, { sync = true, tool = tool })
+            if M.files[path] == file then
+                record_pending(file, tool.handler)
+            end
         end
     end
 end
@@ -507,8 +555,7 @@ function M.on_update(handler, update)
     if kind ~= "tool_call" and kind ~= "tool_call_update" then
         return
     end
-    -- Replayed history (session/load) changed nothing now.
-    if type(update.toolCallId) ~= "string" or handler.replaying or handler.muted or not M.wants(handler) then
+    if type(update.toolCallId) ~= "string" or not M.wants(handler) then
         return
     end
     local tool = merge(handler, update)
@@ -572,13 +619,21 @@ function M.turn_done(handler)
     end
 end
 
+---Tie an inline reply's history entry to the file it changed, so reviewing
+---the file updates the entry's outcome.
+---@param path string
+---@param id? string
+function M.link(path, id)
+    local file = M.files[fs.canonical(path)] ---@type conduit.ReviewFile?
+    if file and id then
+        file.history_id = id
+    end
+end
+
 ---@param file conduit.ReviewFile
 ---@param outcome "accepted"|"rejected"
 local function record(file, outcome)
-    for key in pairs(file.sources) do
-        local was = outcomes[key]
-        outcomes[key] = (was and was ~= outcome) and "reviewed" or outcome
-    end
+    file.outcomes[outcome] = true
 end
 
 ---The hunk at line `lnum` of the file, or the nearest one after it.
@@ -730,24 +785,6 @@ function M.qflist()
     return items
 end
 
----Review state of a tool call, for its status line in the chat.
----@param handler conduit.SessionHandler
----@param id string
----@return string?
-function M.tool_state(handler, id)
-    local hid = handler_ids[handler]
-    if not hid then
-        return nil
-    end
-    local key = key_of(handler, id)
-    for _, file in pairs(M.files) do
-        if file.sources[key] and changed(file) then
-            return "review pending"
-        end
-    end
-    return outcomes[key]
-end
-
 ---How many files changed for `handler` are waiting for review.
 ---@param handler conduit.SessionHandler
 ---@return integer
@@ -772,7 +809,7 @@ function M.reset()
             ui().detach(buf)
         end
     end
-    M.files, tools, outcomes = {}, {}, {}
+    M.files, tools = {}, {}
 end
 
 return M

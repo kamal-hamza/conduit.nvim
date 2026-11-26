@@ -1,10 +1,10 @@
---- The inline history list (`:Conduit history`): one line per entry in a
---- borderless float, driven by a headless history model. Keys: `j`/`k` move, `/`
---- filters, `<Tab>` switches between this buffer and the project, `<CR>` jumps,
---- `p` previews, `r` re-runs, `c` moves to the chat, `u` reverts, `dd` deletes.
+--- The history list (`:Conduit history`): one line per entry in a borderless
+--- float, driven by a headless history model. Keys: `j`/`k` move, `/` filters,
+--- `<Tab>` switches between this buffer and the project, `<CR>` shows the entry
+--- in the sidebar, `gf` jumps, `f` follows up, `r` re-runs, `u` reverts, `dd` deletes.
 local component = require("conduit.ui.component")
+local history = require("conduit.history")
 local hl = require("conduit.ui.hl")
-local inline_history = require("conduit.inline_history")
 local surface = require("conduit.ui.surface")
 
 local M = {}
@@ -13,13 +13,13 @@ local ns = vim.api.nvim_create_namespace("conduit.history")
 
 local HELP = {
     { "j, k", "move (counts work)" },
-    { "/", "filter by prompt, file or answer" },
+    { "/", "filter by prompt, file, answer or diff" },
     { "<Tab>", "this buffer / the whole project" },
-    { "<CR>", "jump to the range" },
-    { "p", "preview the answer or diff" },
-    { "r", "re-run the request on the range" },
-    { "c", "send the entry to a new chat" },
-    { "u", "revert an applied edit (if the lines are unchanged)" },
+    { "<CR>", "show the entry in the sidebar" },
+    { "gf", "go to the lines (or file)" },
+    { "f", "follow up on an answer" },
+    { "r", "re-run the request on the lines" },
+    { "u", "revert an edit or change (if the file is unchanged since)" },
     { "dd", "delete the entry" },
     { "q, <Esc>", "close" },
 }
@@ -52,15 +52,6 @@ local function open_view(model, origin)
     })
     vim.wo[win].winhighlight = hl.WINHIGHLIGHT
     vim.wo[win].cursorline = false
-    local preview ---@type integer?
-
-    local function close_preview()
-        if preview and vim.api.nvim_win_is_valid(preview) then
-            vim.api.nvim_win_close(preview, true)
-        end
-        preview = nil
-    end
-
     local function render()
         if not vim.api.nvim_win_is_valid(win) then
             return
@@ -72,17 +63,15 @@ local function open_view(model, origin)
         end
         if #lines == 0 then
             local where = model.scope == "buffer" and "this buffer" or "this project"
-            lines[1] = { { (" no inline history for %s · <Tab> switches"):format(where), "ConduitMuted" } }
+            lines[1] = { { (" no history for %s · <Tab> switches"):format(where), "ConduitMuted" } }
         end
         view.draw(lines)
         pcall(vim.api.nvim_win_set_cursor, win, { math.max(1, model.cursor), 0 })
-        close_preview()
     end
     model:subscribe(render)
     render()
 
     local function close()
-        close_preview()
         if vim.api.nvim_win_is_valid(win) then
             vim.api.nvim_win_close(win, true)
         end
@@ -115,59 +104,31 @@ local function open_view(model, origin)
         model:toggle_scope()
     end, "Buffer or project")
     map("<CR>", function()
-        local entry = model:selected()
-        if entry then
+        if model:selected() then
             close()
-            inline_history.jump(entry, origin)
+            model:run("show")
+        end
+    end, "Show in the sidebar")
+    map("gf", function()
+        if model:selected() then
+            close()
+            model:run("jump")
         end
     end, "Jump")
-    map("p", function()
+    map("f", function()
         local entry = model:selected()
-        if not entry then
-            return
+        if entry and entry.kind == "answer" then
+            close()
+            model:run("follow_up")
         end
-        if preview then
-            return close_preview()
-        end
-        local pbuf = vim.api.nvim_create_buf(false, true)
-        vim.bo[pbuf].bufhidden = "wipe"
-        vim.bo[pbuf].filetype = "conduit"
-        pcall(vim.treesitter.start, pbuf, "markdown")
-        vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, vim.split(inline_history.markdown(entry), "\n"))
-        vim.bo[pbuf].modifiable = false
-        require("conduit.ui.render").attach(pbuf)
-        -- Under the list when there's room, over its lower half otherwise; never focused.
-        local room = vim.o.lines - (vim.api.nvim_win_get_position(win)[1] + height + 3)
-        preview = vim.api.nvim_open_win(pbuf, false, {
-            relative = "win",
-            win = win,
-            row = room >= 6 and height + 1 or math.floor(height / 2),
-            col = 0,
-            width = width,
-            height = math.max(3, math.min(12, room >= 6 and room or math.ceil(height / 2))),
-            style = "minimal",
-            border = hl.content_border(),
-            focusable = false,
-            zindex = 61,
-        })
-        vim.wo[preview].wrap = true
-        vim.wo[preview].conceallevel = 2
-        vim.wo[preview].winhighlight = "NormalFloat:ConduitAnswer"
-    end, "Preview")
+    end, "Follow up")
     map("r", function()
         local entry = model:selected()
-        if entry then
+        if entry and entry.kind ~= "change" then
             close()
             model:run("rerun")
         end
     end, "Re-run")
-    map("c", function()
-        local entry = model:selected()
-        if entry then
-            close()
-            model:run("to_chat")
-        end
-    end, "Send to a chat")
     map("u", function()
         model:run("revert")
     end, "Revert the edit")
@@ -194,16 +155,22 @@ local function open_view(model, origin)
     return { model = model, buf = buf, win = win }
 end
 
----The default actions: jump, re-run, send to chat, revert, delete.
+---The default actions: show, jump, follow up, re-run, revert, delete.
 ---@param origin integer
 ---@return conduit.HistoryActions
 function M.actions(origin)
     return {
+        show = function(entry)
+            require("conduit.ui.sidebar").show({ entry = entry })
+        end,
         jump = function(entry)
-            inline_history.jump(entry, origin)
+            history.jump(entry, origin)
+        end,
+        follow_up = function(entry)
+            require("conduit.inline").continue(entry)
         end,
         rerun = function(entry)
-            inline_history.jump(entry, origin)
+            history.jump(entry, origin)
             local buf = vim.api.nvim_win_get_buf(origin)
             local last = math.min(entry.line2, vim.api.nvim_buf_line_count(buf))
             require("conduit").inline(
@@ -213,18 +180,11 @@ function M.actions(origin)
                 entry.kind == "edit" and "edit" or "ask"
             )
         end,
-        to_chat = function(entry)
-            local conduit = require("conduit")
-            local chat = conduit.new()
-            if chat then
-                chat:add_context(vim.split(inline_history.markdown(entry), "\n"))
-            end
-        end,
         revert = function(entry)
-            return inline_history.revert(entry)
+            return history.revert(entry)
         end,
         delete = function(entry)
-            inline_history.delete(entry.id)
+            history.delete(entry.id)
         end,
     }
 end
@@ -236,7 +196,7 @@ function M.open(opts)
     hl.setup()
     local origin = vim.api.nvim_get_current_win()
     local model = require("conduit.ui.headless.history").new({
-        entries = inline_history.load(),
+        entries = history.load(),
         file = vim.api.nvim_buf_get_name(0),
         scope = opts and opts.scope,
         actions = M.actions(origin),

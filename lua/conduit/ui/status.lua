@@ -1,7 +1,6 @@
---- The status model: agent, model, effort, mode, state and context use for a
---- chat (or any agent session), and change notifications. Every surface that
---- shows status (chat winbars, the inline prompt title, statuslines) reads from
---- here, so they always agree.
+--- The status model: agent, model, effort, mode, state and context use for an
+--- agent session, and change notifications (the inline prompt title and the
+--- history read from here).
 local M = {}
 
 ---@class conduit.Usage ACP `usage_update`
@@ -100,22 +99,6 @@ function M.of(agent, sid, state)
             percent = math.floor(usage.used / usage.size * 100 + 0.5),
             cost = usage.cost,
         }
-    end
-    return info
-end
-
----Status of a chat.
----@param chat conduit.Chat
----@return conduit.StatusInfo
-function M.of_chat(chat)
-    local state = chat.loading and "loading"
-        or chat.busy and "working"
-        or chat.session_id and "ready"
-        or chat.resume_id and "disconnected"
-        or "not started"
-    local info = M.of(chat.agent, chat.session_id, state)
-    if chat.busy and chat.spinner then
-        info.frame = chat.spinner:frame()
     end
     return info
 end

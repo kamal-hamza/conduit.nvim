@@ -6,29 +6,26 @@ local log = require("conduit.log")
 local mcp = require("conduit.mcp")
 local options = require("conduit.options")
 local review = require("conduit.review")
+local sandbox = require("conduit.sandbox")
 
 local PROTOCOL_VERSION = 1
 local AUTH_REQUIRED = -32000
 local NOT_FOUND = -32002
 
----Optional session features an agent may advertise in `initialize`.
----`load` is the top-level `loadSession`; the rest live in `sessionCapabilities`
----(`fork` and `title` are still unstable in ACP).
----@alias conduit.SessionCap "load"|"list"|"resume"|"close"|"delete"|"fork"|"title"
-
----@class conduit.SessionRef
----@field session_id string
----@field cwd string
+---Optional session features an agent may advertise in `sessionCapabilities`.
+---Requests are one-shot sessions, so only `close` matters.
+---@alias conduit.SessionCap "close"
 
 ---@class conduit.SessionHandler
 ---@field on_update fun(self, update: table)
----@field request_permission fun(self, params: table, respond: fun(err: table?, result: any))
+---@field request_permission fun(self, params: table, respond: fun(err: table?, result: any), reason: string?)
 ---@field on_agent_exit fun(self, code: integer)
 ---@field cwd? string Working directory of the session (default for terminals)
----@field source? "chat"|"inline" Where the session's edits come from, for `review` (default "chat")
----@field replaying? boolean History is being replayed (session/load); nothing is changing now
----@field muted? boolean Replayed content is being ignored
+---@field tools? table<string, table> Tool calls seen so far, by id (permission requests may only carry the id)
 ---@field review_changed? fun(self, tool_call_id: string) The review state of a tool call's files changed
+---@field on_decision? fun(self, tool_call_id: string, decision: conduit.Decision|string, reason: string?) The sandbox
+---answered a permission request (or passed it on to the user)
+---@field on_terminal? fun(self, term: conduit.Terminal) A command started (or was refused) for the session
 
 ---A slash command the agent advertises (`available_commands_update`).
 ---@class conduit.Command
@@ -176,32 +173,28 @@ end
 ---@return boolean
 function Agent:supports(cap)
     local caps = self.info and self.info.agentCapabilities or {}
-    if cap == "load" then
-        return caps.loadSession == true
-    end
     local session_caps = caps.sessionCapabilities
     return type(session_caps) == "table" and session_caps[cap] ~= nil
 end
 
----Open a session with `method` (session/new, load, resume or fork), retrying once
----after authentication, and record its options.
----@param method string
----@param params table
+---Create a session (retrying once after authentication), record its options,
+---then apply the agent's configured default options (`spec.options`) merged
+---with `overrides`.
+---@param cwd string
 ---@param handler conduit.SessionHandler
 ---@param cb fun(err: string?, session_id: string?, result: table?)
----@param defaults? table<string, string> Options to apply once the session exists
-function Agent:_open_session(method, params, handler, cb, defaults)
-    -- session/load replays history as session/update notifications *before* it
-    -- responds, so the handler has to be registered under the known id first.
-    local known = (method == "session/load" or method == "session/resume") and params.sessionId or nil
+---@param overrides? table<string, string>
+---@param opts? { mcp?: boolean } `mcp = false` opens the session without MCP servers
+function Agent:new_session(cwd, handler, cb, overrides, opts)
+    local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
+    local servers = (opts and opts.mcp == false) and {} or mcp.servers(self)
+    local params = { cwd = cwd, mcpServers = servers } ---@type table
+    local meta = vim.tbl_deep_extend("force", sandbox.session_meta() or {}, self.spec.session_meta or {})
+    if next(meta) then
+        params._meta = meta
+    end
     local function attempt(retry)
-        if known then
-            self.sessions[known] = handler
-        end
-        self:_request(method, params, function(err, result)
-            if err and known and self.sessions[known] == handler then
-                self.sessions[known] = nil
-            end
+        self:_request("session/new", params, function(err, result)
             if err and err.code == AUTH_REQUIRED and retry then
                 return self:authenticate(function(auth_err)
                     if auth_err then
@@ -213,90 +206,18 @@ function Agent:_open_session(method, params, handler, cb, defaults)
                 return cb(errmsg(err))
             end
             result = result or {}
-            local sid = known or result.sessionId
+            local sid = result.sessionId
             if type(sid) ~= "string" then
-                return cb(method .. " returned no session id")
+                return cb("session/new returned no session id")
             end
             self.sessions[sid] = handler
             self:_set_options(sid, options.from_session(result))
-            if not defaults then
-                return cb(nil, sid, result)
-            end
             self:_apply_defaults(sid, defaults, function()
                 cb(nil, sid, result)
             end)
         end)
     end
     attempt(true)
-end
-
----Create a session, then apply the agent's configured default options
----(`spec.options`) merged with `overrides`.
----@param cwd string
----@param handler conduit.SessionHandler
----@param cb fun(err: string?, session_id: string?, result: table?)
----@param overrides? table<string, string>
----@param opts? { mcp?: boolean } `mcp = false` opens the session without MCP servers
-function Agent:new_session(cwd, handler, cb, overrides, opts)
-    local defaults = vim.tbl_extend("force", self.spec.options or {}, overrides or {})
-    local servers = (opts and opts.mcp == false) and {} or mcp.servers(self)
-    self:_open_session("session/new", { cwd = cwd, mcpServers = servers }, handler, cb, defaults)
-end
-
----Load a past session (`loadSession`). The agent replays its history through
----`handler:on_update` before `cb` runs. Its options are kept as they were.
----@param ref conduit.SessionRef
----@param handler conduit.SessionHandler
----@param cb fun(err: string?, session_id: string?, result: table?)
-function Agent:load_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
-    self:_open_session("session/load", params, handler, cb)
-end
-
----Resume a past session without replaying its history (`sessionCapabilities.resume`).
----@param ref conduit.SessionRef
----@param handler conduit.SessionHandler
----@param cb fun(err: string?, session_id: string?, result: table?)
-function Agent:resume_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
-    self:_open_session("session/resume", params, handler, cb)
-end
-
----Fork a session into a new one with the same context (`sessionCapabilities.fork`).
----@param ref conduit.SessionRef The session to fork
----@param handler conduit.SessionHandler Handler for the new session
----@param cb fun(err: string?, session_id: string?, result: table?)
-function Agent:fork_session(ref, handler, cb)
-    local params = { sessionId = ref.session_id, cwd = ref.cwd, mcpServers = mcp.servers(self) }
-    self:_open_session("session/fork", params, handler, cb)
-end
-
----List past sessions (`sessionCapabilities.list`), following `nextCursor` pages.
----@param opts { cwd?: string, max?: integer }
----@param cb fun(err: string?, sessions: table[]) ACP SessionInfo objects
-function Agent:list_sessions(opts, cb)
-    local out, max = {}, opts.max or 200
-    local function page(cursor)
-        self:_request("session/list", { cwd = opts.cwd, cursor = cursor }, function(err, result)
-            if err then
-                return cb(errmsg(err), out)
-            end
-            for _, info in ipairs(result and result.sessions or {}) do
-                if #out >= max then
-                    break
-                end
-                if type(info.sessionId) == "string" then
-                    table.insert(out, info)
-                end
-            end
-            local next_cursor = result and result.nextCursor
-            if type(next_cursor) == "string" and #out < max then
-                return page(next_cursor)
-            end
-            cb(nil, out)
-        end)
-    end
-    page(nil)
 end
 
 ---Forget a session and, if the agent supports `session/close`, free its resources
@@ -320,40 +241,6 @@ function Agent:close_session(sid, cb)
     end
     self:_request("session/close", { sessionId = sid }, function(err)
         cb(err and err.code ~= NOT_FOUND and errmsg(err) or nil)
-    end)
-end
-
----Delete a session from the agent's history (`sessionCapabilities.delete`).
----@param sid string
----@param cb fun(err: string?, deleted: boolean) `deleted` is false when unsupported
-function Agent:delete_session(sid, cb)
-    if not self:supports("delete") then
-        return cb(nil, false)
-    end
-    self.commands[sid] = nil
-    self:_release_terminals(sid)
-    self:_request("session/delete", { sessionId = sid }, function(err)
-        if err and err.code ~= NOT_FOUND then
-            return cb(errmsg(err), false)
-        end
-        cb(nil, true)
-    end)
-end
-
----Set a session's title (`sessionCapabilities.title`). `cb` gets the title the
----agent stored, which may be normalized.
----@param sid string
----@param title string
----@param cb fun(err: string?, title: string?)
-function Agent:set_title(sid, title, cb)
-    if not self:supports("title") then
-        return cb(nil, title)
-    end
-    self:_request("session/set_title", { sessionId = sid, title = title }, function(err, result)
-        if err then
-            return cb(errmsg(err))
-        end
-        cb(nil, type(result) == "table" and type(result.title) == "string" and result.title or title)
     end)
 end
 
@@ -426,6 +313,12 @@ function Agent:set_option(sid, id, value, cb)
     if not option then
         return cb(("unknown option %q"):format(id))
     end
+    if option.category == "mode" or option.legacy == "mode" or option.id == "mode" then
+        local cfg = require("conduit.config").options.sandbox
+        if sandbox.enabled() and not cfg.bypass and sandbox.is_bypass(value) then
+            return cb(("mode %q skips every permission check; set sandbox.bypass = true to allow it"):format(value))
+        end
+    end
     local method, params
     if option.legacy == "mode" then
         method, params = "session/set_mode", { sessionId = sid, modeId = value }
@@ -496,20 +389,52 @@ function Agent:stop()
     end
 end
 
+---Run `fn` if the sandbox lets the agent touch `paths`; otherwise answer with an error.
+---@param paths string[]
+---@param what string For the prompt, e.g. "write foo.lua"
+---@param respond fun(err: table?, result: any)
+---@param fn fun()
+function Agent:_guard_paths(paths, what, respond, fn)
+    local decision, reason = sandbox.check_paths(paths)
+    if decision == "allow" then
+        return fn()
+    end
+    local function refuse()
+        log.debug(("%s: refused to %s: %s"):format(self.name, what, reason or ""))
+        respond({ code = -32603, message = ("blocked by the conduit sandbox: %s"):format(reason or what) })
+    end
+    if decision == "deny" then
+        return refuse()
+    end
+    sandbox.ask(self.name, what, reason, function(allowed)
+        if allowed then
+            fn()
+        else
+            refuse()
+        end
+    end)
+end
+
 function Agent:_on_request(method, params, respond)
     if method == "fs/read_text_file" then
-        local result, err = require("conduit.fs").read(params)
-        respond(err, result)
+        local path = tostring(params.path)
+        self:_guard_paths({ path }, "read " .. vim.fn.fnamemodify(path, ":~:."), respond, function()
+            local result, err = require("conduit.fs").read(params)
+            respond(err, result)
+        end)
     elseif method == "fs/write_text_file" then
-        local session = self.sessions[params.sessionId] ---@type conduit.SessionHandler?
-        if session then
-            review.before_write(session, params.path)
-        end
-        local result, err = require("conduit.fs").write(params)
-        if session and not err then
-            review.after_write(params.path)
-        end
-        respond(err, result)
+        local path = tostring(params.path)
+        self:_guard_paths({ path }, "write " .. vim.fn.fnamemodify(path, ":~:."), respond, function()
+            local session = self.sessions[params.sessionId] ---@type conduit.SessionHandler?
+            if session then
+                review.before_write(session, params.path)
+            end
+            local result, err = require("conduit.fs").write(params)
+            if session and not err then
+                review.after_write(params.path)
+            end
+            respond(err, result)
+        end)
     elseif vim.startswith(method, "terminal/") then
         self:_terminal_request(method, params, respond)
     elseif method == "session/request_permission" then
@@ -518,10 +443,53 @@ function Agent:_on_request(method, params, respond)
             return respond(nil, { outcome = { outcome = "cancelled" } })
         end
         review.on_permission(session, params.toolCall)
-        session:request_permission(params, respond)
+        self:_permission(session, params, respond)
     else
         respond({ code = -32601, message = "Method not found: " .. method })
     end
+end
+
+---Answer a permission request from the sandbox policy when it can, else ask the user.
+---@param session conduit.SessionHandler
+---@param params table
+---@param respond fun(err: table?, result: any)
+function Agent:_permission(session, params, respond)
+    local call = params.toolCall or {}
+    local known = session.tools and session.tools[call.toolCallId]
+    local merged = require("conduit.ui.permission").merge(known, call)
+    local decision, reason = sandbox.check_tool(merged, session.cwd)
+    local id = type(call.toolCallId) == "string" and call.toolCallId or ""
+    local option = decision ~= "ask" and sandbox.option_for(params.options, decision) or nil
+    if decision == "deny" and not option then
+        -- No way to say no once: cancelling the request refuses it too.
+        option = { optionId = nil }
+    end
+    if option then
+        log.debug(("%s: sandbox %s %s: %s"):format(self.name, decision, merged.title or id, reason or ""))
+        if session.on_decision then
+            session:on_decision(id, decision, reason)
+        end
+        if decision == "deny" then
+            vim.notify(("[conduit] refused: %s"):format(reason or (merged.title or "tool call")), vim.log.levels.WARN)
+        end
+        if not option.optionId then
+            return respond(nil, { outcome = { outcome = "cancelled" } })
+        end
+        return respond(nil, { outcome = { outcome = "selected", optionId = option.optionId } })
+    end
+    session:request_permission(params, function(err, result)
+        if session.on_decision then
+            local chosen = result and result.outcome and result.outcome.optionId
+            local picked = "deny"
+            for _, o in ipairs(params.options or {}) do
+                if o.optionId == chosen and type(o.kind) == "string" and vim.startswith(o.kind, "allow") then
+                    picked = "allow"
+                end
+            end
+            session:on_decision(id, "asked: " .. picked, reason)
+        end
+        respond(err, result)
+    end, reason)
 end
 
 ---@param method string
@@ -533,16 +501,7 @@ function Agent:_terminal_request(method, params, respond)
     end
     local sid = params.sessionId
     if method == "terminal/create" then
-        local session = self.sessions[sid]
-        self.terminal_count = self.terminal_count + 1
-        local id = "term-" .. self.terminal_count
-        local term, err = Terminal.spawn(id, params, session and session.cwd or vim.fn.getcwd())
-        if not term then
-            return respond({ code = -32603, message = ("could not run %s: %s"):format(params.command, err) })
-        end
-        log.debug(("%s: terminal %s runs %s"):format(self.name, id, term.command))
-        self.terminals[id] = term
-        return respond(nil, { terminalId = id })
+        return self:_terminal_create(params, respond)
     end
     local term = self.terminals[params.terminalId]
     if not term or not term.spawned or term.released or term.session_id ~= sid then
@@ -563,6 +522,72 @@ function Agent:_terminal_request(method, params, respond)
     else
         respond({ code = -32601, message = "Method not found: " .. method })
     end
+end
+
+---`terminal/create`, under the sandbox: the command policy decides whether it
+---runs (or asks), and isolation wraps it in the OS sandbox.
+---@param params table
+---@param respond fun(err: table?, result: any)
+function Agent:_terminal_create(params, respond)
+    local sid = params.sessionId
+    local session = self.sessions[sid] ---@type conduit.SessionHandler?
+    local cwd = Terminal.cwd(params, session and session.cwd or vim.fn.getcwd())
+    local argv, shown = Terminal.argv(params)
+    local exe = argv and argv[1]
+    if not argv or not exe then
+        return respond({ code = -32602, message = "missing command" })
+    elseif vim.fn.executable(exe) == 0 then
+        -- Checked here: wrapped in the OS sandbox, a missing command would only fail later.
+        return respond({ code = -32603, message = ("could not run %s: executable not found"):format(exe) })
+    end
+    local function report(term)
+        if session and session.on_terminal then
+            session:on_terminal(term)
+        end
+    end
+    local function refuse(reason)
+        log.debug(("%s: refused to run %s: %s"):format(self.name, shown, reason))
+        local term = Terminal.new("refused", { session_id = sid, command = shown })
+        term.refused = reason
+        report(term)
+        respond({ code = -32603, message = ("blocked by the conduit sandbox: %s"):format(reason) })
+    end
+    local wrapped, isolated, wrap_err, unavailable = sandbox.wrap(argv, cwd)
+    if not wrapped then
+        return refuse(wrap_err or "isolation unavailable")
+    end
+    local function run(decision)
+        self.terminal_count = self.terminal_count + 1
+        local id = "term-" .. self.terminal_count
+        local term, err = Terminal.spawn(id, params, cwd, { argv = wrapped, isolated = isolated })
+        if not term then
+            return respond({ code = -32603, message = ("could not run %s: %s"):format(params.command, err) })
+        end
+        term.decision = decision
+        log.debug(("%s: terminal %s runs %s%s"):format(self.name, id, shown, isolated and " (isolated)" or ""))
+        self.terminals[id] = term
+        report(term)
+        respond(nil, { terminalId = id })
+    end
+    local decision, reason = sandbox.check_command(shown, cwd)
+    if decision == "deny" then
+        return refuse(reason or "denied")
+    end
+    if unavailable == "ask" then
+        -- No OS sandbox: even allowed commands need a yes, since nothing contains them.
+        decision = "ask"
+        reason = (reason and (reason .. "; ") or "") .. "no OS sandbox (sandbox-exec or bwrap) is installed"
+    end
+    if decision == "ask" then
+        return sandbox.ask(self.name, ("run `%s`"):format(shown), reason, function(ok)
+            if ok then
+                run("asked")
+            else
+                refuse("declined")
+            end
+        end)
+    end
+    run("allowed")
 end
 
 ---Track a display terminal from a tool call's `_meta` (the `terminal_output`

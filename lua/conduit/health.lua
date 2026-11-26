@@ -8,14 +8,11 @@ function M.check()
         vim.health.error("Neovim >= 0.11 is required")
     end
 
-    local ok, has_diff = pcall(vim.treesitter.language.add, "diff")
-    if ok and has_diff then
-        vim.health.ok("treesitter `diff` parser (highlights tool call diffs)")
+    local ok, has_md = pcall(vim.treesitter.language.add, "markdown")
+    if ok and has_md then
+        vim.health.ok("treesitter `markdown` parser (highlights answers in the sidebar)")
     else
-        vim.health.warn(
-            "treesitter `diff` parser not found: tool call diffs in the chat won't be highlighted",
-            { "Install it, e.g. `:TSInstall diff` with nvim-treesitter" }
-        )
+        vim.health.warn("treesitter `markdown` parser not found: answers in the sidebar won't be highlighted")
     end
 
     local options = require("conduit.config").options
@@ -88,41 +85,54 @@ function M.check()
         vim.health.info("Start an agent to see whether it accepts images and embedded context")
     end
 
-    vim.health.start("conduit.nvim: threads")
-    local any = false
-    for name, agent in vim.spairs(agents) do
-        if agent.info then
-            any = true
-            local caps = vim.tbl_filter(function(cap)
-                return agent:supports(cap)
-            end, { "load", "list", "resume", "close", "delete", "fork", "title" })
-            if #caps == 0 then
-                vim.health.info(("%s: live threads only (no session capabilities)"):format(name))
-            else
-                vim.health.ok(("%s: %s"):format(name, table.concat(caps, ", ")))
-            end
-        end
-    end
-    if not any then
-        vim.health.info("Start an agent to see which thread features it supports")
-    end
-
-    local threads = options.threads
-    vim.health.info(
-        threads.persist and ("Thread index: " .. require("conduit.history").path) or "Thread index disabled"
-    )
+    vim.health.info("History: " .. require("conduit.history").path())
     vim.health.info("Log file: " .. require("conduit.log").path)
 
+    vim.health.start("conduit.nvim: sandbox")
+    local sandbox = require("conduit.sandbox")
+    local scfg = options.sandbox
+    if not sandbox.enabled() then
+        vim.health.warn("The sandbox is off (`sandbox.enabled`): agents may touch any file and run any command")
+    else
+        for _, line in ipairs(require("conduit").sandbox_info()) do
+            vim.health.info(line)
+        end
+        if scfg.isolation.enabled then
+            local backend = sandbox.backend()
+            if backend then
+                vim.health.ok(("Terminal commands run in `%s`"):format(backend))
+            else
+                local msg = ("No OS sandbox found: terminal commands %s"):format(
+                    scfg.isolation.unavailable == "deny" and "are refused"
+                        or scfg.isolation.unavailable == "run" and "run unisolated"
+                        or "ask before running unisolated"
+                )
+                if vim.fn.has("linux") == 1 then
+                    vim.health.warn(msg, { "Install bubblewrap (`bwrap`)" })
+                else
+                    vim.health.warn(msg)
+                end
+            end
+        end
+        if scfg.bypass then
+            vim.health.warn("`sandbox.bypass` lets agents switch to a mode that skips every check")
+        end
+    end
+    vim.health.info(
+        "Agents that run commands themselves are checked through their permission requests;"
+            .. " Claude's adapter is told to ask for every Bash command and to use Claude Code's sandbox"
+    )
+
     vim.health.start("conduit.nvim: terminals")
-    local tcfg = require("conduit.config").options.terminal
+    local tcfg = options.terminal
     if tcfg.enabled then
-        vim.health.ok(("Agents can run commands (output limit %d bytes)"):format(tcfg.output_limit))
+        vim.health.ok(("Agents can run commands through Neovim (output limit %d bytes)"):format(tcfg.output_limit))
     else
         vim.health.info("Terminals are off (`terminal.enabled`); agents run commands themselves")
     end
 
     vim.health.start("conduit.nvim: commands")
-    any = false
+    local any = false
     for name, agent in vim.spairs(agents) do
         local list = agent.last_commands or {}
         if #list > 0 then
@@ -134,7 +144,7 @@ function M.check()
         end
     end
     if not any then
-        vim.health.info("No agent has advertised slash commands yet (start a chat to see them)")
+        vim.health.info("No agent has advertised slash commands yet (make a request to see them)")
     end
 end
 

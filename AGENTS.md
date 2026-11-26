@@ -5,12 +5,20 @@ Guidance for AI coding agents (and humans) working on conduit.nvim. Read
 
 ## What this is
 
-conduit.nvim makes Neovim an [Agent Client Protocol](https://agentclientprotocol.com)
-(ACP) **client**. It spawns an ACP agent (Claude Code via
-`@agentclientprotocol/claude-agent-acp`, Codex, Gemini CLI, ...) as a subprocess
-and talks newline-delimited JSON-RPC 2.0 to it over stdio. Features: a chat
-window, inline edits/answers on a selection, `@` context mentions, session
-options (model, effort, mode), and buffer-aware `fs/*` handlers.
+conduit.nvim is a minimal way to use AI agents in Neovim. It makes Neovim an
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP) **client**: it
+spawns an ACP agent (Claude Code via `@agentclientprotocol/claude-agent-acp`,
+Codex, Gemini CLI, ...) as a subprocess and talks newline-delimited JSON-RPC 2.0
+to it over stdio.
+
+The product is deliberately small and stays a text editor, not an agent IDE.
+**The only way to use the agent is inline**, on a selection: edits are applied
+to the file (as hunks to accept or reject), explanations stream into a
+read-only sidebar that never takes focus. There is no chat panel, no threads,
+no tool-call transcript. Everything is kept in a per-project history (answers,
+edits, agent file changes, commands), and a sandbox decides which files the
+agent may touch and which commands it may run. Keep new features inside that
+shape; don't grow a chat back.
 
 Pure Lua, no build step, no runtime dependencies. Requires Neovim >= 0.11.
 blink.cmp and markview.nvim are optional integrations.
@@ -35,45 +43,47 @@ CI, but changes must not introduce EmmyLua diagnostics (see the guidelines).
 plugin/conduit.lua      :Conduit command, filetype → markdown parser registration,
                         last-buffer tracking. Keep it cheap: no requires at load.
 lua/conduit/
-  init.lua              Public API (setup, open, new, inline, ask, edit, option, ...)
+  init.lua              Public API (setup, inline, ask, edit, answer, sidebar, history,
+                        review/accept/reject, option, sandbox_info, cancel, stop)
   config.lua            Defaults and setup()
   rpc.lua               JSON-RPC transport over vim.system stdio
-  agent.lua             ACP client: initialize, auth, sessions, prompts, options,
-                        and agent→client requests (fs/*, request_permission)
+  agent.lua             ACP client: initialize, auth, sessions, prompts, options, and
+                        agent→client requests (fs/*, terminal/*, request_permission),
+                        each passed through the sandbox
+  sandbox.lua           Path roots, the command policy (split, allow/deny/ask), OS
+                        isolation (sandbox-exec, bwrap), bypass-mode guard
   options.lua           Session options: ACP configOptions + legacy modes/models
   fs.lua                fs/read_text_file, fs/write_text_file (buffers first)
-  review.lua            Review of agent edits: per-file baselines, hunks, accept/reject
+  review.lua            Review of agent edits: per-file baselines, hunks, accept/reject;
+                        records agent changes in the history
   terminal.lua          terminal/* commands (vim.system, own process group) and display
-                        terminals from tool call _meta; output kept for the chat
-  mcp.lua               mcp_servers config → ACP mcpServers for session/new, load, resume, fork
+                        terminals from tool call _meta
+  mcp.lua               mcp_servers config → ACP mcpServers for session/new
   mentions.lua          @ mentions: completion items, ranking, specials, content blocks;
                         mentions.attach also wires up / commands
   commands.lua          / agent commands: per-buffer sources, items, input-hint ghost text
   blink.lua             blink.cmp source for @ mentions and / commands
-  inline.lua            Inline requests: auto/edit/ask, peek answers (collapse, focus), follow-ups
-  inline_history.lua    Inline answers and edits per project (JSONL), separate from threads
-  threads.lua           Threads: live registry, switching (MRU, goto, resume), picker, search,
-                        thread bar, events, past threads, close/delete/fork
-  history.lua           Local thread index (ids, titles, cwd, timestamps; never transcripts)
+  inline.lua            Inline requests (the only entry point): auto/edit/ask routing,
+                        edits applied in place, answers to the sidebar, follow-ups,
+                        continuing a history entry
+  history.lua           Per-project history (JSONL): answers, edits, changes, tools and
+                        commands; revert; markdown for the sidebar
   health.lua            :checkhealth conduit
   log.lua               File log + vim.notify
+  ui/sidebar.lua        The answer sidebar: read-only split, never takes focus
   ui/component.lua      Component core: define/render (ui.components overrides), mount
-  ui/components.lua     Built-in components (Chip, ChipBar, RoleRule, AnswerPeek, ...)
+  ui/components.lua     Built-in components (HelpFloat, Picker, PromptTitle, HistoryLine)
   ui/surface.lua        Surfaces: spans → statusline strings, extmarks, float titles, buffers
-  ui/status.lua         Status model (model, effort, mode, state, context) + change events
-  ui/headless/          Headless models: picker, options, answer, fold, help, history
+  ui/status.lua         Status model (model, effort, mode, context) + change events
+  ui/headless/          Headless models: picker, options, help, history
   ui/picker_float.lua   Keyboard picker view (j/k, 1-9, /) over the headless picker
   ui/help_float.lua     g? key list view
   ui/history_float.lua  :Conduit history list view
-  ui/chat.lua           Chat transcript + prompt buffers, session/update rendering, decorations
-  ui/tool.lua           Tool call blocks: status line, locations, diff and output previews
   ui/prompt.lua         Floating prompt (modes, @ completion)
-  ui/answer.lua         Answer windows: unfocused peek float, legacy focused float
   ui/review.lua         Review overlay in file buffers (extmarks, virtual lines, keys)
   ui/hl.lua             Highlight groups (re-applied on ColorScheme), borders, key hints
   ui/spinner.lua        Animated progress indicator (uv timer)
-  ui/permission.lua     Permission requests via vim.ui.select
-  ui/picker.lua         Picker specs shown with snacks/telescope/fzf-lua/mini.pick or vim.ui.select
+  ui/permission.lua     Permission requests via vim.ui.select (with the sandbox's reason)
   ui/render.lua         markview.nvim integration
 tests/
   run.lua               Minimal test runner (test(), wait_for())
@@ -86,44 +96,59 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 
 - `Agent` owns one subprocess and any number of sessions. Each session has a
   **handler** (`conduit.SessionHandler`: `on_update`, `request_permission`,
-  `on_agent_exit`), either a `Chat` or an inline `Job`. Session option state
-  lives on the agent (`agent.options[sid]`), not on handlers.
-- Every chat is a **thread** registered in `threads.lua`; `conduit.current` reads
-  `threads.current`. Switching swaps the thread's buffers into the existing chat
-  windows (`Chat:show`) rather than opening new ones.
-- Thread features beyond live chats are gated on capabilities via
-  `Agent:supports()` (`load` = `loadSession`, the rest are
-  `sessionCapabilities.*`). Never call an optional session method without it.
-- Moving an inline conversation into the chat (`Job:to_chat`) re-points
-  `agent.sessions[sid]` at a new `Chat`. The ACP session itself is reused.
+  `on_agent_exit`, and optionally `on_decision`, `on_terminal`). In the plugin
+  that's always an inline `Job`; tests use a small harness. Session option
+  state lives on the agent (`agent.options[sid]`), not on handlers.
+- Every inline request opens its own session and closes it when the request is
+  over (an edit lands, or the sidebar moves on from an answer).
+- `Job:_route()` decides from the first few streamed characters whether the
+  reply is an edit (`<replace>` + fenced block + `</replace>`) or an answer.
+  Edits are applied when the turn ends; answers stream into `ui/sidebar.lua`.
+  The sidebar shows one source at a time: a live job or a history entry.
+- Everything agent→client goes through `sandbox.lua` first: `fs/*` paths
+  (`_guard_paths`), `terminal/create` (policy, then OS isolation) and
+  `session/request_permission` (`_permission`: the policy picks an
+  allow_once/reject_once option itself, or passes the request to the handler
+  with a reason). Decisions reach the handler through `on_decision`, so the
+  history can record them.
+- `review.lua` snapshots files before agent tool calls touch them and turns the
+  difference into hunks. When a tool call finishes it records a `change` entry
+  in the history; accepting/rejecting patches the entry's outcome. Inline
+  replies are linked to their `edit` entry with `review.link`.
+- History is append-only JSONL with patches (`{ id, outcome }`), merged on
+  load. Never rewrite an entry in place except in `_compact`.
 - Prompts are lists of ACP content blocks. `mentions.blocks()` turns typed
   text into a text block plus one block per `@` mention.
 - UI is components + headless models. Components are pure `render(props)` →
-  spans; surfaces draw them; `component.mount` redraws on status changes only
-  when the output differs. Interactive state (pickers, answer phases, folds,
-  history) lives in `ui/headless/*`; keys call model actions, views subscribe.
-  Test the models directly; test views through their spans or buffer lines.
-- Inline auto mode relies on a reply protocol: edits come back as
-  `<replace>` + fenced block + `</replace>`; anything else is an answer.
-  `Job:_route()` decides from the first few streamed characters.
+  spans; surfaces draw them. Interactive state (pickers, help, history list)
+  lives in `ui/headless/*`; keys call model actions, views subscribe. Test the
+  models directly; test views through their spans or buffer lines.
 
 ## Testing
 
 - Tests run against `tests/mock_agent.lua`, never a real agent. When you add
   protocol behaviour, teach the mock to exercise it and assert on the result.
+- `session()` / `send(s, text)` in the spec are a minimal session handler for
+  driving the agent directly (terminals, review, permissions); inline tests use
+  `conduit.inline` and `wait_turn`. `reset_sidebar()` ends the sidebar's job.
+- The suite's config adds the temp dir to `sandbox.roots`, sets
+  `commands.default = "allow"` and `isolation.unavailable = "run"`, so CI
+  without bwrap still runs terminals. Sandbox tests change these and restore
+  them. The live isolation check only runs where an OS sandbox exists.
 - The mock runs under `nvim -l`, so it can use `vim.json`. It reads stdin
   synchronously; `request()` blocks until the matching response arrives.
 - The mock takes flags: `--legacy` (modes/models instead of configOptions),
-  `--threads=load,list,...` (session capabilities), `--seed` (past sessions
-  to list and load), `--mcp=http,sse` (MCP transports) and `--no-image` (no
-  `promptCapabilities.image`; image blocks are echoed as `image <name> <mime> <bytes>`).
+  `--threads=close,...` (session capabilities), `--mcp=http,sse` (MCP
+  transports) and `--no-image` (no `promptCapabilities.image`; image blocks are
+  echoed as `image <name> <mime> <bytes>`).
   Echoed turns end with a `usage_update` (42% of 10k, 0.50 USD); inline requests
-  starting "short" get a one-line answer (virtual lines, not the float).
+  starting "short" get a one-line answer.
   Prompts `term <json>` (terminal/create plus steps), `display` (the `_meta`
   display-terminal extension) and `caps` exercise terminals. `disk-edit`,
   `disk-create`, `disk-delete` and `disk-edit-fast <path>` change files directly,
-  the way Claude does, reporting them through tool calls only. Session methods echo
-  the `mcpServers` they received in `result._meta.mcpServers`. Thread tests register extra mock agents with these.
+  the way Claude does, reporting them through tool calls only. `session/new`
+  echoes the `mcpServers` it received in `result._meta.mcpServers`. Tests
+  register extra mock agents with flags through `extra_agent`.
 - Use `wait_for(fn, what)` for anything async; it fails after 5 s.
 - Tests share one Neovim instance. Clean up buffers (`bwipeout!`), restore
   stubs such as `vim.ui.select`, and reset config you change.
@@ -133,8 +158,8 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
 
 ## Gotchas learned the hard way
 
-- **Filetypes.** Chat buffers use `conduit` / `conduit_input`, not `markdown`,
-  so markdown linters and LSPs leave them alone. The
+- **Filetypes.** The sidebar uses `conduit` and the prompt `conduit_input`, not
+  `markdown`, so markdown linters and LSPs leave them alone. The
   `vim.treesitter.language.register` call lives in `plugin/conduit.lua`. If it
   only runs when some module loads, highlighting and markview silently break
   for code paths that never load that module.
@@ -153,27 +178,22 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   that every `:Conduit` subcommand still resolves; there's a test for it, so
   keep it up to date when adding subcommands.
 
-- **session/load replays before it responds.** The history arrives as
-  `session/update` notifications ahead of the response, so `_open_session`
-  registers the handler under the known session id *before* sending the
-  request. Otherwise the replay is silently dropped.
 - **Slash commands arrive after `session/new` responds** (Claude's adapter
   sends `available_commands_update` a moment later), and the inline prompt
   opens before any session exists. Read commands lazily through the buffer's
   source function, and fall back to `agent.last_commands`.
-- **Tool call output is usually fenced already** (Claude sends ```` ```console ````).
-  Truncating it as-is can drop the closing fence and turn the rest of the
-  transcript into a code block, so `ui/tool.lua` strips a fence that wraps the
-  whole text and re-fences the cut body with a longer fence.
-- **Tool calls are blocks redrawn in place** (extmark + line count, like the
-  plan). The mark has left gravity so replacing the block keeps it on the
-  header line. `content` and `locations` in an update replace the old lists.
 - **Claude doesn't use ACP terminals.** Claude Code runs Bash itself, so the
   adapter ignores `clientCapabilities.terminal`. It reports output through the
   `_meta` display-terminal extension instead (`terminal_info`,
   `terminal_output[_delta]`, `terminal_exit`, opted into with
   `clientCapabilities._meta.terminal_output[_delta]`). Codex does the same.
-  Both paths feed `conduit.Terminal`, so the chat renders them identically.
+  Both paths feed `conduit.Terminal`. Claude's own Bash is visible to us only
+  as a permission request, and Claude's settings may allow commands without
+  one. `sandbox.session_meta()` fixes that through the adapter's
+  `_meta.claudeCode.options`: a Bash `ask` rule (ask beats the user's allow
+  rules), Claude Code's own `sandbox.enabled`, and no bypass mode. Verified
+  against claude-agent-acp 0.112: `ls` is allowed, `sudo ls` refused, anything
+  else asked, all by the policy.
 - **Agents write files themselves.** Claude's adapter never calls
   `fs/write_text_file`; Claude Code edits the disk, and its Edit diffs are
   snippets, not whole files. So `review.lua` snapshots a file when a running
@@ -182,20 +202,21 @@ doc/conduit.txt         Vimdoc; keep in sync with README.md
   `acceptEdits` mode the write can beat our snapshot; the completed call's diff
   is then undone on the current text to rebuild the baseline.
 - **Tool titles can contain newlines** (multi-line shell commands). Anything
-  written with `nvim_buf_set_lines` must be split or trimmed first.
-- **Inline answers must never take focus on their own.** Peek floats open with
-  `enter = false` and `focusable = false`; only `:Conduit answer` focuses one.
-  Focus changes inside `nvim_buf_call` are undone when it returns, so tests that
-  check focus run mappings in the current window (`press_here`), not `press`.
-- **`conceal_lines` concealing needs 'conceallevel' > 0**, and a ranged mark's
-  `end_row` is inclusive. The transcript window sets conceallevel 2. Section
-  headers are tracked with marks (`conduit.sections`), never by matching
-  `## ` lines, since agents write markdown headings too.
-- **Statusline click handlers must be named functions**, so `ui.mouse` defines
-  a global `ConduitClick`. Its handler tables are weak, so whoever renders
-  clickable spans (the chat's `actions`) must keep the callbacks alive.
-- **Inline history writes to stdpath("state")**; the suite points
-  `inline_history.dir` at a temp dir, like `history.path`.
+  written with `nvim_buf_set_lines` or virtual text must be split or trimmed first.
+- **Answers must never take focus on their own.** The sidebar opens with
+  `nvim_open_win(buf, false, { split = ... })`; only `:Conduit answer` (and the
+  history list's `<CR>`) focuses it. Focus changes inside `nvim_buf_call` are
+  undone when it returns, so tests that check focus run mappings in the current
+  window (`press_here`), not `press`.
+- **macOS paths go through symlinks** (`/tmp` → `/private/tmp`, `/var` →
+  `/private/var`). Sandbox roots and paths are compared after `fs.canonical`,
+  and the sandbox-exec profile needs real paths (`fs_realpath`), or writes to
+  temp dirs are denied.
+- **Wrapped commands hide missing executables**: `sandbox-exec missing-cmd`
+  spawns fine and fails later, so `terminal/create` checks `executable()` before
+  wrapping.
+- **History writes to stdpath("state")**; the suite points `history.dir` at a
+  temp dir.
 
 ## Making changes
 
