@@ -1,5 +1,5 @@
 --- Headless session options: model, effort, mode and the live choices, with
---- actions to cycle, set or pick a value. Views: the chat's chips, the inline
+--- actions to cycle, set or pick a value. Views: the inline
 --- prompt title and statuslines; keys call the actions.
 local options = require("conduit.options")
 

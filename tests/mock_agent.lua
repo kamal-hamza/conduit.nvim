@@ -754,7 +754,11 @@ for line in io.lines() do
     if msg.id ~= nil and handler then
         local result, err = handler(msg.params or {})
         if type(result) == "table" and OPENS_SESSION[msg.method] then
-            rawset(result, "_meta", { mcpServers = msg.params.mcpServers or vim.NIL })
+            rawset(
+                result,
+                "_meta",
+                { mcpServers = msg.params.mcpServers or vim.NIL, sessionMeta = msg.params._meta or vim.NIL }
+            )
         end
         if err then
             send({ id = msg.id, error = err })

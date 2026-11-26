@@ -1,13 +1,9 @@
---- Inline requests on a range of a buffer. In "auto" mode the agent decides
---- whether to rewrite the range in place or answer; "edit" and "ask" force one
---- or the other. Each request runs in its own session, so it doesn't touch chat
---- history (but can be moved into the chat).
----
---- Answers never take focus (`inline.answer = "peek"`): short ones are virtual
---- lines under the range, longer ones an unfocused float beside or under it. They
---- collapse to a marker when the cursor leaves and come back when it returns;
---- `:Conduit answer` focuses one. A headless answer model (`ui/headless/answer`)
---- owns the phase; this module renders it.
+--- Inline requests on a range of a buffer: the only way to use the agent. In
+--- "auto" mode the agent decides whether to rewrite the range in place or
+--- answer; "edit" and "ask" force one or the other. Edits land in the file as
+--- they're ready (as hunks to review); answers stream into the sidebar, which
+--- never takes focus. Each request runs in its own session and is kept in the
+--- history.
 local config = require("conduit.config")
 local hl = require("conduit.ui.hl")
 
@@ -19,31 +15,27 @@ local ns = vim.api.nvim_create_namespace("conduit.inline")
 ---@field agent conduit.Agent
 ---@field buf integer
 ---@field win integer Window the request was made from
+---@field line1 integer 1-based first line when the request was made
+---@field line2 integer
 ---@field mode conduit.InlineMode
 ---@field kind? "edit"|"answer" What the reply turned out to be; nil until known
 ---@field session_id? string
 ---@field text string The current turn's reply
----@field shown integer How much of `text` the answer float already shows
 ---@field history { role: "user"|"agent", text: string }[]
----@field tools table<string, table> Tool calls seen this session, by id (for permission prompts)
----@field answer? conduit.Answer Legacy focused float (`inline.answer = "float"`)
----@field model? conduit.AnswerModel Phase of a peek answer
----@field peek? conduit.Peek The peek answer's float
+---@field tools table<string, table> Tool calls seen this session, by id
+---@field tool_order string[] Tool call ids in the order they started
+---@field terminals conduit.Terminal[] Commands run (or refused) through ACP terminals
 ---@field prior string Earlier turns of the answer conversation, as shown
----@field chat? conduit.Chat The chat the answer went to (`inline.answer = "chat"`)
----@field group? integer Autocmds that collapse and expand the answer
----@field created integer Order of creation, for "most recent answer"
----@field history_id? string The job's entry in the inline history
+---@field history_id? string The job's entry in the history
 ---@field busy boolean
 ---@field cancelled boolean
----@field marks { first: integer, last: integer, hl: integer, status?: integer, virt?: integer, marker?: integer } Extmark ids
+---@field detached? boolean The sidebar moved on while this was still answering
+---@field marks { first: integer, last: integer, hl?: integer, status?: integer } Extmark ids
 ---@field spinner conduit.Spinner
 ---@field phase? string What the agent is doing, while busy
 ---@field indent string Leading whitespace of the range's first line, for the status line
 ---@field writes integer `b:conduit_writes` when the request started
 ---@field cleaned? boolean
----@field adopted? boolean The chat took over the session
----@field source "inline"
 local Job = {}
 Job.__index = Job
 
@@ -51,18 +43,9 @@ Job.__index = Job
 ---@type table<conduit.InlineJob, true>
 M.jobs = {}
 
----Peek answers that are still around (shown, collapsed or focused).
----@type table<conduit.InlineJob, true>
-M.answers = {}
-
-local created = 0
-
--- How far (in lines) the cursor may stray from the range before an answer collapses.
-local MARGIN = 3
-
 local CONTEXT = [[
 
-Never use tools to edit files: the editor applies replacements itself. Files and context mentioned with @ in the request are attached.
+Don't use tools to edit the selected lines: the editor applies your replacement itself. If the request needs changes to other files, make them with your tools; the user reviews them. Files and context mentioned with @ in the request are attached.
 
 Request: %s
 
@@ -80,19 +63,14 @@ Reply with ONLY <replace>, then the full replacement for the selected lines in o
     ask = [[You are answering a question about a selection in Neovim. Answer the request below concisely in Markdown. Do not rewrite the code unless asked to show an example.]],
 }
 
+local CONTINUE = [[
+
+This continues an earlier conversation about the same lines:
+<conversation>
+%s
+</conversation>]]
+
 local REPLACE = "<replace>"
-
----Answer float keys shown in its footer.
-local KEYS = { { "a", "apply" }, { "f", "follow up" }, { "c", "chat" }, { "q", "close" }, { "g?", "keys" } }
-
----Answer float keys listed by `g?`.
-local HELP = {
-    { "a", "replace the lines with the answer's last code block" },
-    { "f", "ask a follow-up in the same session" },
-    { "c", "move the conversation into the chat" },
-    { "<C-c>", "cancel the reply" },
-    { "q, <Esc>", "close" },
-}
 
 ---Pull the replacement out of a reply: the body of `<replace>…</replace>` if
 ---present, then everything between the first opening fence and the last
@@ -106,6 +84,9 @@ end
 
 ---@return integer? first, integer? last 0-based rows of the range
 function Job:_range()
+    if not vim.api.nvim_buf_is_valid(self.buf) then
+        return nil, nil
+    end
     local first = vim.api.nvim_buf_get_extmark_by_id(self.buf, ns, self.marks.first, {})[1]
     local last = vim.api.nvim_buf_get_extmark_by_id(self.buf, ns, self.marks.last, {})[1]
     return first, last
@@ -122,25 +103,17 @@ function Job:_status(msg)
     self:_render_status()
 end
 
----Show the phase above the range, or in the answer float's footer once it's open.
+---Show the spinner above the range, and the phase in the sidebar while it shows this job.
 function Job:_render_status()
-    local msg = self.phase
-    if self.answer then
-        if not msg then
-            return self.answer:footer(hl.keys(KEYS))
-        end
-        ---@type conduit.Chunks
-        local chunks = {
-            { " " .. self.spinner:frame() .. " ", "ConduitSpinner" },
-            { msg, "ConduitInlineStatus" },
-        }
-        return self.answer:footer(vim.list_extend(chunks, hl.keys({ { "<C-c>", "cancel" } })))
+    local sidebar = require("conduit.ui.sidebar")
+    if sidebar.source.job == self then
+        sidebar.status()
     end
     local first = self:_range()
     if self.cleaned or not first then
         return
     end
-    if not msg then
+    if not self.phase then
         if self.marks.status then
             vim.api.nvim_buf_del_extmark(self.buf, ns, self.marks.status)
             self.marks.status = nil
@@ -149,11 +122,11 @@ function Job:_render_status()
     end
     self.marks.status = vim.api.nvim_buf_set_extmark(self.buf, ns, first, 0, {
         id = self.marks.status,
-        -- Just the spinner and the agent: what it's doing and how to cancel are in g?.
         virt_lines = {
             {
                 { self.indent },
                 { self.spinner:frame() .. " ", "ConduitSpinner" },
+                -- Just the spinner and the agent: what it's doing shows in the sidebar.
                 { self.agent.name, "ConduitInlineStatus" },
             },
         },
@@ -180,21 +153,18 @@ function Job:_route()
     end
 end
 
+---The reply is an explanation: show it in the sidebar, without taking focus.
 function Job:_open_answer()
     self.kind = "answer"
-    local where = config.options.inline.answer
-    if where == "float" then
-        self:_status(nil)
-        return self:_open_float()
-    elseif where == "chat" then
-        return self:_answer_in_chat()
-    end
-    self:_open_peek()
+    require("conduit.ui.sidebar").show({ job = self })
 end
 
 ---The window showing the code, if any.
 ---@return integer?
 function Job:_code_win()
+    if not vim.api.nvim_buf_is_valid(self.buf) then
+        return nil
+    end
     if vim.api.nvim_win_is_valid(self.win) and vim.api.nvim_win_get_buf(self.win) == self.buf then
         return self.win
     end
@@ -208,267 +178,14 @@ function Job:_display()
     return self.prior .. self.text
 end
 
----Answer keys listed by `g?`.
-local PEEK_HELP = {
-    { "a", "replace the lines with the answer's last code block" },
-    { "f", "ask a follow-up in the same session" },
-    { "c", "move the conversation into the chat" },
-    { "<C-c>", "cancel the reply" },
-    { "<Esc>", "back to the code (the answer stays)" },
-    { "q", "close the answer" },
-    { ":Conduit answer", "focus the nearest answer (from the code)" },
-    { ":Conduit answers", "list the answers in open buffers" },
-}
-
-function Job:_open_peek()
-    created = created + 1
-    self.created = created
-    self.model = require("conduit.ui.headless.answer").new({
-        apply = function()
-            self:apply_code()
-        end,
-        follow_up = function()
-            self:follow_up()
-        end,
-        to_chat = function()
-            self:to_chat()
-        end,
-        cancel = function()
-            self:cancel()
-        end,
-    })
-    local model = self.model
-    local function back()
-        model:blur()
-        local win = self:_code_win()
-        if win then
-            vim.api.nvim_set_current_win(win)
-        end
+---@param id string
+---@param fields table
+function Job:_tool(id, fields)
+    if not self.tools[id] then
+        table.insert(self.tool_order, id)
     end
-    self.peek = require("conduit.ui.answer").peek({
-        anchor = {
-            win = function()
-                return self:_code_win()
-            end,
-            range = function()
-                return self:_range()
-            end,
-        },
-        keys = {
-            a = function()
-                model:apply()
-            end,
-            f = function()
-                model:follow_up()
-            end,
-            c = function()
-                model:to_chat()
-            end,
-            q = function()
-                self:close()
-            end,
-            ["<Esc>"] = back,
-            ["<C-c>"] = function()
-                model:cancel()
-            end,
-            ["g?"] = function()
-                require("conduit.ui.help_float").open("conduit answer", PEEK_HELP)
-            end,
-        },
-        on_leave = function()
-            model:blur()
-        end,
-        on_closed = function()
-            self:close()
-        end,
-    })
-    M.answers[self] = true
-    model:subscribe(function()
-        self:_render_answer()
-    end)
-    self:_watch()
-    model:stream(self:_display())
-    if self:_away() then
-        -- The cursor already left (or insert mode started elsewhere): don't pop up.
-        model:collapse()
-    end
-end
-
----Whether the user has moved on from the range: the cursor is in this buffer
----but away from the range, or typing in another buffer.
----@return boolean
-function Job:_away()
-    local win = vim.api.nvim_get_current_win()
-    if self.peek and win == self.peek.win then
-        return false
-    end
-    local first, last = self:_range()
-    if not first or not last then
-        return true
-    end
-    if vim.api.nvim_win_get_buf(win) ~= self.buf then
-        return vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
-    end
-    local row = vim.api.nvim_win_get_cursor(win)[1] - 1
-    return row < first - MARGIN or row > last + MARGIN
-end
-
----Collapse the answer when the cursor leaves the range (or insert mode starts
----elsewhere); bring it back when the cursor returns to the range.
-function Job:_watch()
-    self.group = vim.api.nvim_create_augroup(("conduit.inline.%d"):format(self.created), { clear = true })
-    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
-        group = self.group,
-        buffer = self.buf,
-        callback = function()
-            local model = self.model
-            if not model then
-                return
-            end
-            local first, last = self:_range()
-            local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-            if first and last and row >= first and row <= last then
-                model:expand()
-            elseif self:_away() then
-                model:collapse()
-            end
-            if model.phase == "peek" and self.peek and not self.peek:is_open() then
-                -- It couldn't open while the buffer was off screen.
-                self:_render_answer()
-            end
-        end,
-    })
-    vim.api.nvim_create_autocmd("WinScrolled", {
-        group = self.group,
-        callback = function(ev)
-            -- Lines that scrolled into view may reach under a float beside the code.
-            -- Only the code window counts: the float scrolls itself to follow the text.
-            if tonumber(ev.match) ~= self:_code_win() then
-                return
-            end
-            if self.model and self.model.phase == "peek" and self.peek and self.peek:is_open() then
-                self.peek:show(false)
-            end
-        end,
-    })
-    vim.api.nvim_create_autocmd("InsertEnter", {
-        group = self.group,
-        callback = function()
-            if self.model and self:_away() then
-                self.model:collapse()
-            end
-        end,
-    })
-end
-
----Draw the answer for its phase: virtual lines, the float, or the marker.
-function Job:_render_answer()
-    local model, peek = self.model, self.peek
-    if not model or not peek or self.cleaned or not vim.api.nvim_buf_is_valid(self.buf) then
-        return
-    end
-    local phase = model.phase
-    local first, last = self:_range()
-    local component = require("conduit.ui.component")
-    local surface = require("conduit.ui.surface")
-    if phase == "short" and last then
-        local lines = component.render("AnswerPeek", { text = self:_display(), indent = self.indent })
-        self.marks.virt = vim.api.nvim_buf_set_extmark(self.buf, ns, last, 0, {
-            id = self.marks.virt,
-            virt_lines = vim.tbl_map(surface.chunks, lines),
-        })
-    elseif self.marks.virt then
-        vim.api.nvim_buf_del_extmark(self.buf, ns, self.marks.virt)
-        self.marks.virt = nil
-    end
-    if phase == "collapsed" and first then
-        self.marks.marker = vim.api.nvim_buf_set_extmark(self.buf, ns, first, 0, {
-            id = self.marks.marker,
-            virt_text = surface.chunks(component.render("AnswerMarker", {})),
-            virt_text_pos = "eol",
-        })
-    elseif self.marks.marker then
-        vim.api.nvim_buf_del_extmark(self.buf, ns, self.marks.marker)
-        self.marks.marker = nil
-    end
-    if phase == "peek" or phase == "focused" then
-        peek:set_text(self:_display())
-        if not peek:is_open() or peek.focused ~= (phase == "focused") then
-            peek:show(phase == "focused")
-        end
-    else
-        peek:hide()
-    end
-end
-
----Send the answer to the chat as it streams (`inline.answer = "chat"`): the chat
----takes over the session, and focus stays where it is.
-function Job:_answer_in_chat()
-    local sid = assert(self.session_id)
-    require("conduit.history").unhide(self.agent.name, sid)
-    local chat = require("conduit").adopt(self.agent, sid, self.history)
-    self.adopted, self.chat = true, chat
-    self.agent.sessions[sid] = chat
-    chat:_set_busy(true)
-    if self.text ~= "" then
-        chat:on_update({ sessionUpdate = "agent_message_chunk", content = { type = "text", text = self.text } })
-    end
-    -- The range has nothing more to show.
-    self.spinner:stop()
-    if vim.api.nvim_buf_is_valid(self.buf) then
-        vim.api.nvim_buf_clear_namespace(self.buf, ns, 0, -1)
-    end
-end
-
----The legacy answer float: focused, under the range.
-function Job:_open_float()
-    local _, last = self:_range()
-    local win = self.win
-    if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= self.buf then
-        win = vim.fn.bufwinid(self.buf)
-    end
-    if win == -1 then
-        -- The buffer isn't visible any more; anchor to the current window.
-        win, last = vim.api.nvim_get_current_win(), nil
-    end
-    local first = self.history[1]
-    local request = first and (first.text:gsub("\n.*", "")) or ""
-    if vim.fn.strchars(request) > 50 then
-        request = vim.fn.strcharpart(request, 0, 49) .. "…"
-    end
-    self.answer = require("conduit.ui.answer").open({
-        win = win,
-        row = last or vim.api.nvim_win_get_cursor(win)[1] - 1,
-        title = { hl.agent(self.agent.name), { (" %s "):format(request), "ConduitTitle" } },
-        keys = {
-            q = function()
-                self:close()
-            end,
-            ["<Esc>"] = function()
-                self:close()
-            end,
-            a = function()
-                self:apply_code()
-            end,
-            f = function()
-                self:follow_up()
-            end,
-            c = function()
-                self:to_chat()
-            end,
-            ["<C-c>"] = function()
-                self:cancel()
-            end,
-            ["g?"] = function()
-                require("conduit.ui.help_float").open("conduit answer", HELP)
-            end,
-        },
-        on_close = function()
-            self:_cleanup()
-        end,
-    })
-    self.answer:append(self.text)
-    self.shown = #self.text
+    -- Remember what we learn about tool calls: permission requests may only carry the id.
+    self.tools[id] = vim.tbl_extend("force", self.tools[id] or {}, fields)
 end
 
 function Job:on_update(update)
@@ -476,12 +193,11 @@ function Job:on_update(update)
     if kind == "agent_message_chunk" and update.content and update.content.type == "text" then
         self.text = self.text .. update.content.text
         self:_route()
-        if self.kind == "answer" and self.answer then
-            self.answer:append(self.text:sub(self.shown + 1))
-            self.shown = #self.text
+        if self.kind == "answer" then
             self:_status("writing…")
-        elseif self.kind == "answer" and self.model then
-            self.model:stream(self:_display())
+            if not self.detached then
+                require("conduit.ui.sidebar").update(self)
+            end
         elseif self.kind == "edit" then
             -- Completed lines inside the code block streamed so far.
             local _, lines = (self.text:match("```[^\n]*\n(.*)$") or ""):gsub("\n", "")
@@ -489,20 +205,36 @@ function Job:on_update(update)
         end
     elseif kind == "agent_thought_chunk" then
         self:_status("thinking…")
-    elseif kind == "tool_call" then
-        self.tools[update.toolCallId] = vim.deepcopy(update)
-        self:_status(update.title or "running a tool…")
-    elseif kind == "tool_call_update" then
-        -- Remember what we learn about tool calls: permission requests may only carry the id.
-        local tool = self.tools[update.toolCallId] or {}
-        self.tools[update.toolCallId] = vim.tbl_extend("force", tool, update)
+    elseif kind == "tool_call" and type(update.toolCallId) == "string" then
+        self:_tool(update.toolCallId, update)
+        local title = type(update.title) == "string" and update.title:match("^[^\n]*") or nil
+        self:_status(title or "running a tool…")
+    elseif kind == "tool_call_update" and type(update.toolCallId) == "string" then
+        self:_tool(update.toolCallId, update)
     end
 end
 
-function Job:request_permission(params, respond)
+---@param params table
+---@param respond fun(err: table?, result: any)
+---@param reason? string Why the sandbox is asking
+function Job:request_permission(params, respond, reason)
     local permission = require("conduit.ui.permission")
     local call = params.toolCall or {}
-    permission.ask(self.agent.name, permission.merge(self.tools[call.toolCallId], call), params, respond)
+    permission.ask(self.agent.name, permission.merge(self.tools[call.toolCallId], call), params, respond, reason)
+end
+
+---@param id string
+---@param decision string
+---@param reason? string
+function Job:on_decision(id, decision, reason)
+    if id ~= "" then
+        self:_tool(id, { toolCallId = id, decision = decision, reason = reason })
+    end
+end
+
+---@param term conduit.Terminal
+function Job:on_terminal(term)
+    table.insert(self.terminals, term)
 end
 
 function Job:on_agent_exit(code)
@@ -517,7 +249,6 @@ end
 function Job:_send(text, request, extra)
     self.busy = true
     self.text = ""
-    self.shown = 0
     M.jobs[self] = true
     table.insert(self.history, { role = "user", text = request })
     local blocks = require("conduit.mentions").blocks(request, self.agent, { buf = self.buf })
@@ -547,17 +278,7 @@ function Job:_turn_done(err)
         self:_open_answer()
     end
 
-    if self.kind == "answer" and self.answer then
-        if err then
-            self.answer:append(("\n\n> error: %s"):format(err))
-        elseif self.cancelled then
-            self.answer:append("\n\n> cancelled")
-            self.cancelled = false
-        end
-        require("conduit.inline_history").record_answer(self)
-        return self:_status(nil)
-    end
-    if self.kind == "answer" and self.model then
+    if self.kind == "answer" then
         if err then
             self.text = self.text .. ("\n\n> error: %s"):format(err)
         elseif self.cancelled then
@@ -565,25 +286,20 @@ function Job:_turn_done(err)
             self.cancelled = false
         end
         self:_status(nil)
-        self.model:stream(self:_display())
-        self.model:finish()
-        require("conduit.inline_history").record_answer(self)
-        return
-    end
-    if self.kind == "answer" and self.chat then
-        local chat = self.chat
-        chat:_set_busy(false)
-        chat:_record()
-        if not chat:_visible() then
-            vim.notify("[conduit] the answer is in the chat (:Conduit open)", vim.log.levels.INFO)
+        self:_undecorate()
+        require("conduit.history").record_answer(self)
+        if self.detached then
+            return self:close()
         end
-        require("conduit.inline_history").record_answer(self)
-        return self:_cleanup()
+        require("conduit.ui.sidebar").update(self)
+        return
     end
 
     -- Edit (or nothing at all): apply and finish.
     local first, last = self:_range()
     self:_cleanup()
+    local review = require("conduit.review")
+    local history = require("conduit.history")
     if self.cancelled then
         return vim.notify("[conduit] inline request cancelled", vim.log.levels.INFO)
     elseif err then
@@ -591,18 +307,39 @@ function Job:_turn_done(err)
     elseif (vim.b[self.buf].conduit_writes or 0) ~= self.writes then
         return vim.notify("[conduit] the agent edited the file directly; not applying its reply", vim.log.levels.WARN)
     elseif not first or not last or vim.trim(self.text) == "" then
+        if #self.tool_order > 0 then
+            -- It worked through tools alone (e.g. edited other files): keep a record.
+            history.record_answer(self)
+            return vim.notify("[conduit] the agent replied with tools only; see :Conduit review", vim.log.levels.INFO)
+        end
         return vim.notify("[conduit] inline request produced nothing to apply", vim.log.levels.WARN)
     end
     local lines = vim.split(M.extract(self.text), "\n", { plain = true })
-    local review = require("conduit.review")
-    local path = review.wants(self) and review.snapshot_buf(self, self.buf) or nil
+    local path = review.wants_replies() and review.snapshot_buf(self, self.buf) or nil
     local old = vim.api.nvim_buf_get_lines(self.buf, first, last + 1, false)
     vim.api.nvim_buf_set_lines(self.buf, first, last + 1, false, lines)
+    M.flash(self.buf, first, first + #lines - 1)
+    history.record_edit(self, first, old, lines, path ~= nil)
     if path then
+        review.link(path, self.history_id)
         review.refresh(path)
     end
-    M.flash(self.buf, first, first + #lines - 1)
-    require("conduit.inline_history").record_edit(self, first, old, lines)
+end
+
+---Remove the request's highlight and spinner, keeping the range marks (for `a`).
+function Job:_undecorate()
+    if not vim.api.nvim_buf_is_valid(self.buf) then
+        return
+    end
+    local marks = self.marks
+    if marks.hl then
+        pcall(vim.api.nvim_buf_del_extmark, self.buf, ns, marks.hl)
+        marks.hl = nil
+    end
+    if marks.status then
+        pcall(vim.api.nvim_buf_del_extmark, self.buf, ns, marks.status)
+        marks.status = nil
+    end
 end
 
 ---Drop the session and buffer decorations. Idempotent.
@@ -612,94 +349,70 @@ function Job:_cleanup()
     end
     self.cleaned = true
     self.spinner:stop()
-    M.answers[self] = nil
-    if self.group then
-        pcall(vim.api.nvim_del_augroup_by_id, self.group)
-        self.group = nil
-    end
     if self.busy then
         self:cancel()
     end
     M.jobs[self] = nil
-    if self.session_id and not self.adopted then
+    if self.session_id then
         self.agent:close_session(self.session_id)
     end
     if vim.api.nvim_buf_is_valid(self.buf) then
-        vim.api.nvim_buf_clear_namespace(self.buf, ns, 0, -1)
+        for _, id in pairs(self.marks) do
+            pcall(vim.api.nvim_buf_del_extmark, self.buf, ns, id)
+        end
     end
 end
 
 function Job:close()
-    if self.answer then
-        self.answer:close()
-    end
-    local peek = self.peek
-    if peek then
-        self.peek = nil
-        peek:destroy()
-    end
-    if self.model then
-        self.model:close()
-    end
     self:_cleanup()
 end
 
 ---Replace the range with the last code block of the answer.
 function Job:apply_code()
-    if not self.answer and not self.model then
-        return
-    end
-    local code = self.answer and self.answer:code_block()
-        or require("conduit.ui.answer").last_code_block(self:_display())
+    local code = require("conduit.ui.sidebar").last_code_block(self:_display())
     local first, last = self:_range()
-    if not code then
+    if self.cleaned then
+        return vim.notify("[conduit] that request is over", vim.log.levels.WARN)
+    elseif not code then
         return vim.notify("[conduit] the answer has no code block to apply", vim.log.levels.WARN)
     elseif not first or not last then
         return vim.notify("[conduit] the original lines are gone", vim.log.levels.WARN)
     end
+    local review = require("conduit.review")
+    local path = review.wants_replies() and review.snapshot_buf(self, self.buf) or nil
     local old = vim.api.nvim_buf_get_lines(self.buf, first, last + 1, false)
     vim.api.nvim_buf_set_lines(self.buf, first, last + 1, false, code)
-    require("conduit.inline_history").outcome(self, "applied", { first = first, old = old, new = code })
+    vim.api.nvim_buf_set_extmark(self.buf, ns, first + #code - 1, 0, { id = self.marks.last })
+    require("conduit.history").outcome(self, path and "pending" or "applied", { first = first, old = old, new = code })
+    if path then
+        review.link(path, self.history_id)
+        review.refresh(path)
+    end
     M.flash(self.buf, first, first + #code - 1)
-    self:close()
 end
 
 ---Ask a follow-up question in the same session.
 ---@param question? string Prompted for when omitted
 function Job:follow_up(question)
-    local answer = self.answer
-    if not answer and not self.model then
-        return
-    elseif self.busy then
+    if self.busy then
         return vim.notify("[conduit] still answering, <C-c> to cancel", vim.log.levels.WARN)
-    elseif not self.session_id then
+    elseif not self.session_id or self.cleaned then
         return vim.notify("[conduit] the session has ended", vim.log.levels.WARN)
     end
     local function send(text)
-        local quoted = ("\n\n---\n\n**You:** %s\n\n"):format(text)
-        if answer then
-            answer:append(quoted)
-        else
-            self.prior = self:_display() .. quoted
-            self.text = ""
-        end
+        self.prior = self:_display() .. ("\n\n---\n\n**You:** %s\n\n"):format(text)
+        self.text = ""
         self:_send(text, text)
-        if self.model then
-            self.model:stream(self:_display())
-        end
+        require("conduit.ui.sidebar").update(self)
         self:_status("thinking…")
     end
     if question then
         return send(question)
     end
     local anchor ---@type conduit.PromptAnchor?
-    if answer then
-        vim.api.nvim_set_current_win(answer.win)
-    elseif not (self.peek and self.peek.focused) then
-        local win, first, last = self:_code_win(), self:_range()
-        if win and first and last then
-            anchor = { win = win, first = first, last = last }
-        end
+    local win, first, last = self:_code_win(), self:_range()
+    if win and first and last and vim.api.nvim_get_current_win() == win then
+        anchor = { win = win, first = first, last = last }
     end
     require("conduit.ui.prompt").open({
         title = "Follow up",
@@ -712,19 +425,14 @@ function Job:follow_up(question)
     })
 end
 
----Move the conversation into the chat window, keeping the session.
-function Job:to_chat()
-    if self.busy then
-        return vim.notify("[conduit] still answering, <C-c> to cancel", vim.log.levels.WARN)
-    elseif not self.session_id then
-        return vim.notify("[conduit] the session has ended", vim.log.levels.WARN)
+function Job:cancel()
+    if not self.busy then
+        return
     end
-    require("conduit.history").unhide(self.agent.name, self.session_id)
-    local chat = require("conduit").adopt(self.agent, self.session_id, self.history)
-    self.adopted = true
-    self.agent.sessions[self.session_id] = chat
-    self:close()
-    chat:open()
+    self.cancelled = true
+    if self.session_id then
+        self.agent:cancel(self.session_id)
+    end
 end
 
 ---The options an inline request on `agent` would start with: the agent's last
@@ -757,31 +465,37 @@ end
 ---@field instruction string
 ---@field mode? conduit.InlineMode Defaults to "auto"
 ---@field options? table<string, string> Session options for this request, over `inline.options`
+---@field continues? conduit.HistoryEntry An earlier answer this request follows up on
 
 ---@param opts conduit.InlineOpts
 ---@return conduit.InlineJob
 function M.run(opts)
     hl.setup()
-    local buf, line1, line2 = opts.buf, opts.line1, opts.line2
+    local buf = opts.buf
+    local count = vim.api.nvim_buf_line_count(buf)
+    local line2 = math.max(1, math.min(opts.line2, count))
+    local line1 = math.max(1, math.min(opts.line1, line2))
     local lines = vim.api.nvim_buf_get_lines(buf, line1 - 1, line2, false)
     local self = setmetatable({
         agent = opts.agent,
         buf = buf,
         win = opts.win or vim.api.nvim_get_current_win(),
+        line1 = line1,
+        line2 = line2,
         mode = opts.mode or "auto",
         text = "",
-        shown = 0,
         prior = "",
-        created = 0,
         history = {},
         tools = {},
+        tool_order = {},
+        terminals = {},
         busy = false,
         cancelled = false,
-        source = "inline",
         writes = vim.b[buf].conduit_writes or 0,
         indent = (" "):rep(vim.api.nvim_buf_call(buf, function()
             return vim.fn.indent(line1)
         end)),
+        cwd = vim.fn.getcwd(),
     }, Job)
     self.spinner = require("conduit.ui.spinner").new(function()
         self:_render_status()
@@ -792,7 +506,7 @@ function M.run(opts)
         -- One ranged mark puts the line highlight and the sign on every line.
         hl = vim.api.nvim_buf_set_extmark(buf, ns, line1 - 1, 0, {
             end_row = line2 - 1,
-            end_col = #lines[#lines],
+            end_col = #(lines[#lines] or ""),
             line_hl_group = "ConduitInlinePending",
             sign_text = "▎",
             sign_hl_group = "ConduitInlineSign",
@@ -806,7 +520,13 @@ function M.run(opts)
     local ft = vim.bo[buf].filetype
     local code = table.concat(lines, "\n")
     local prompt, extra
-    if require("conduit.commands").parse(opts.instruction) then
+    if opts.continues then
+        self.mode = "ask"
+        self.prior = (opts.continues.text or "") .. ("\n\n---\n\n**You:** %s\n\n"):format(opts.instruction)
+        prompt = PROMPTS.ask
+            .. CONTINUE:format(opts.continues.text or "")
+            .. CONTEXT:format(opts.instruction, line1, line2, path, ft, code)
+    elseif require("conduit.commands").parse(opts.instruction) then
         -- An agent command only runs when the prompt starts with it, so send it
         -- unwrapped with the selection attached, and show the result as an answer.
         self.mode = "ask"
@@ -828,6 +548,11 @@ function M.run(opts)
         prompt = PROMPTS[self.mode] .. CONTEXT:format(opts.instruction, line1, line2, path, ft, code)
     end
 
+    if opts.continues then
+        -- Asked from the sidebar: it shows the conversation from the start.
+        self:_open_answer()
+    end
+
     local function fail(err)
         self.busy = true
         self:_turn_done(err)
@@ -837,14 +562,10 @@ function M.run(opts)
             return fail(err)
         end
         self.agent:new_session(
-            vim.fn.getcwd(),
+            self.cwd,
             self,
             function(serr, sid)
                 self.session_id = sid
-                if sid and config.options.threads.hide_inline then
-                    -- Agents list every session; keep inline requests out of thread lists.
-                    require("conduit.history").hide(self.agent.name, sid)
-                end
                 if serr or self.cancelled then
                     return fail(serr)
                 end
@@ -852,22 +573,52 @@ function M.run(opts)
                 self:_send(prompt, opts.instruction, extra)
             end,
             vim.tbl_extend("force", config.options.inline.options, opts.options or {}),
-            {
-                mcp = config.options.inline.mcp_servers,
-            }
+            { mcp = config.options.inline.mcp_servers }
         )
     end)
     return self
 end
 
-function Job:cancel()
-    if not self.busy then
+---Follow up on a history entry: a new request on the same lines, with the
+---earlier conversation as context, answered in the sidebar.
+---@param entry conduit.HistoryEntry
+---@param question? string Prompted for when omitted
+function M.continue(entry, question)
+    local buf = require("conduit.history").entry_buf(entry)
+    if not buf then
+        return vim.notify("[conduit] that entry's file is gone", vim.log.levels.WARN)
+    end
+    local agent = require("conduit").agent(entry.agent or config.options.inline.agent)
+    if not agent then
         return
     end
-    self.cancelled = true
-    if self.session_id then
-        self.agent:cancel(self.session_id)
+    local function run(text)
+        if not text or vim.trim(text) == "" then
+            return
+        end
+        local win = vim.fn.bufwinid(buf)
+        M.run({
+            agent = agent,
+            buf = buf,
+            win = win ~= -1 and win or require("conduit.ui.sidebar").code_win(),
+            line1 = entry.line1,
+            line2 = entry.line2,
+            instruction = text,
+            mode = "ask",
+            continues = entry,
+        })
     end
+    if question then
+        return run(question)
+    end
+    require("conduit.ui.prompt").open({
+        title = "Follow up",
+        agent = agent.name,
+        commands = function()
+            return agent:get_commands()
+        end,
+        on_submit = run,
+    })
 end
 
 local flash_ns = vim.api.nvim_create_namespace("conduit.inline.flash")
@@ -891,68 +642,21 @@ function M.flash(buf, first, last)
     end, 1500)
 end
 
----Live peek answers, most recent first.
----@return conduit.InlineJob[]
-function M.list()
-    local out = vim.tbl_keys(M.answers)
-    table.sort(out, function(a, b)
-        return a.created > b.created
-    end)
-    return out
-end
-
----Focus the answer nearest the cursor in the current buffer, else the most
----recent one whose buffer is on screen.
----@return boolean focused
-function M.focus()
-    local buf = vim.api.nvim_get_current_buf()
-    local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-    local best, best_dist ---@type conduit.InlineJob?, integer?
-    for _, job in ipairs(M.list()) do
-        local first, last = job:_range()
-        if job.buf == buf and first and last then
-            local dist = row < first and first - row or row > last and row - last or 0
-            if not best_dist or dist < best_dist then
-                best, best_dist = job, dist
-            end
-        end
-    end
-    if not best then
-        for _, job in ipairs(M.list()) do
-            local win = job:_code_win()
-            if win then
-                vim.api.nvim_set_current_win(win)
-                best = job
-                break
-            end
-        end
-    end
-    if not best or not best.model then
-        vim.notify("[conduit] no inline answer to focus", vim.log.levels.INFO)
-        return false
-    end
-    best.model:focus()
-    return true
-end
-
----Go to `job`'s range and show its answer.
+---Go to `job`'s range in `win` (default: the window showing it, else the current one).
 ---@param job conduit.InlineJob
-function M.reveal(job)
+---@param win? integer
+function M.reveal(job, win)
     if not vim.api.nvim_buf_is_valid(job.buf) then
         return
     end
-    local win = job:_code_win()
-    if win then
-        vim.api.nvim_set_current_win(win)
-    else
-        vim.api.nvim_win_set_buf(0, job.buf)
+    win = job:_code_win() or win or vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(win)
+    if vim.api.nvim_win_get_buf(win) ~= job.buf then
+        vim.api.nvim_win_set_buf(win, job.buf)
     end
     local first = job:_range()
     if first then
-        vim.api.nvim_win_set_cursor(0, { first + 1, 0 })
-    end
-    if job.model then
-        job.model:expand()
+        vim.api.nvim_win_set_cursor(win, { first + 1, 0 })
     end
 end
 

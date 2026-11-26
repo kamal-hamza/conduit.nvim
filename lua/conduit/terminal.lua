@@ -1,7 +1,8 @@
 --- Terminals: commands the agent runs through the client (ACP `terminal/*`), and
 --- "display terminals" that agents running commands themselves (Claude, Codex)
 --- report in tool call `_meta` (`terminal_info`, `terminal_output[_delta]`,
---- `terminal_exit`). Both keep their output here so the chat can show it.
+--- `terminal_exit`). Both keep their output here; the sandbox decides whether
+--- and how spawned commands run (see `conduit.sandbox`).
 --- Spec: https://agentclientprotocol.com/protocol/terminals
 local config = require("conduit.config")
 
@@ -39,6 +40,9 @@ local KILL_GRACE_MS = 2000
 ---@field spawned boolean conduit runs the command (`terminal/create`), not a display terminal
 ---@field released boolean
 ---@field waiters fun(status: conduit.ExitStatus)[] Pending `terminal/wait_for_exit` replies
+---@field isolated? boolean The command runs in the OS sandbox
+---@field decision? "allowed"|"asked" How the sandbox let it run
+---@field refused? string Why the sandbox refused to run it (never spawned)
 ---@field subscribers table<any, fun(term: conduit.Terminal)>
 local Terminal = {}
 Terminal.__index = Terminal
@@ -267,44 +271,66 @@ local function display_command(command, args)
     return table.concat(parts, " ")
 end
 
+---The argv for a `terminal/create` request, and the command line to show.
+---@param params table ACP `CreateTerminalRequest`
+---@return string[]? argv, string shown
+function Terminal.argv(params)
+    local command = params.command
+    if type(command) ~= "string" or command == "" then
+        return nil, ""
+    end
+    local args = type(params.args) == "table" and params.args or {}
+    local shown = display_command(command, args)
+    if is_shell_line(command, args) then
+        -- Some agents send a whole shell line as the command.
+        return vim.fn.has("win32") == 1 and { "cmd.exe", "/s", "/c", command } or { "sh", "-c", command }, shown
+    end
+    return { command, unpack(args) }, shown
+end
+
+---The request's working directory, if absolute, else `default`.
+---@param params table
+---@param default string
+---@return string
+function Terminal.cwd(params, default)
+    local cwd = params.cwd
+    if type(cwd) ~= "string" or not vim.startswith(cwd, "/") and not cwd:match("^%a:[/\\]") then
+        return default
+    end
+    return cwd
+end
+
 ---Start a command for `terminal/create`.
 ---@param id string
 ---@param params table ACP `CreateTerminalRequest`
----@param default_cwd string Used when the request has no absolute `cwd`
+---@param cwd string
+---@param opts? { argv?: string[], isolated?: boolean } `argv` replaces the request's (the sandboxed command)
 ---@return conduit.Terminal?, string?
-function Terminal.spawn(id, params, default_cwd)
-    local command = params.command
-    if type(command) ~= "string" or command == "" then
+function Terminal.spawn(id, params, cwd, opts)
+    opts = opts or {}
+    local argv, shown = Terminal.argv(params)
+    local cmd = opts.argv or argv
+    if not cmd then
         return nil, "missing command"
-    end
-    local args = type(params.args) == "table" and params.args or {}
-    local cmd
-    if is_shell_line(command, args) then
-        -- Some agents send a whole shell line as the command.
-        cmd = vim.fn.has("win32") == 1 and { "cmd.exe", "/s", "/c", command } or { "sh", "-c", command }
-    else
-        cmd = { command, unpack(args) }
-    end
-    local cwd = params.cwd
-    if type(cwd) ~= "string" or not vim.startswith(cwd, "/") and not cwd:match("^%a:[/\\]") then
-        cwd = default_cwd
     end
     if vim.fn.isdirectory(cwd) == 0 then
         return nil, "no such directory: " .. cwd
     end
-    local env ---@type table<string, string>?
+    local extra ---@type table<string, string>?
     for _, var in ipairs(type(params.env) == "table" and params.env or {}) do
         if type(var.name) == "string" then
-            env = env or {}
-            env[var.name] = tostring(var.value or "")
+            extra = extra or {}
+            extra[var.name] = tostring(var.value or "")
         end
     end
+    local env, clear_env = require("conduit.sandbox").env(extra)
 
     local term = Terminal.new(id, {
         session_id = params.sessionId,
-        command = display_command(command, args),
+        command = shown,
         limit = type(params.outputByteLimit) == "number" and math.floor(params.outputByteLimit) or nil,
     })
+    term.isolated = opts.isolated == true
     local function on_output(_, data)
         if data then
             vim.schedule(function()
@@ -315,6 +341,7 @@ function Terminal.spawn(id, params, default_cwd)
     local ok, proc = pcall(vim.system, cmd, {
         cwd = cwd,
         env = env,
+        clear_env = clear_env,
         -- Its own process group, so kill() reaches the whole command.
         detach = true,
         stdout = on_output,

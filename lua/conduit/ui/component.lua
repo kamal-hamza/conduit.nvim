@@ -12,7 +12,6 @@ local M = {}
 ---@class conduit.Span
 ---@field [1] string
 ---@field [2]? string
----@field click? fun() Mouse handler, used by winbar surfaces when `ui.mouse` is on
 ---@field raw? boolean Statusline code (e.g. `%=`), passed through by statusline surfaces and dropped elsewhere
 
 ---@alias conduit.Spans conduit.Span[]
@@ -34,7 +33,7 @@ end
 
 ---Render component `name` with `props`, honouring `ui.components` overrides. An
 ---override that errors falls back to the built-in, so a broken config can't
----break the chat.
+---break the view.
 ---@param name string
 ---@param props? table
 ---@return table
@@ -83,7 +82,7 @@ local function key(out)
         for _, v in ipairs(t) do
             if type(v) == "table" then
                 if type(v[1]) == "string" then
-                    parts[#parts + 1] = v[1] .. "\1" .. (v[2] or "") .. (v.click and "\2" or "")
+                    parts[#parts + 1] = v[1] .. "\1" .. (v[2] or "")
                 else
                     parts[#parts + 1] = "\3"
                     walk(v)

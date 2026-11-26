@@ -3,41 +3,16 @@
 --- lines, overlays), float titles, or the lines of a scratch buffer.
 local M = {}
 
----Mouse handlers for winbar spans, by id (see `M.statusline`). Weak both ways,
----so handlers of redrawn winbars are collected instead of piling up.
----@type table<integer, fun()>
-local clicks = setmetatable({}, { __mode = "v" })
----@type table<fun(), integer>
-local click_ids = setmetatable({}, { __mode = "k" })
-local next_click = 0
-
----Called by `%@…@` click regions. Statusline click handlers must be named
----functions, so this one is global; it is only defined when `ui.mouse` is on.
----@param id integer
-local function on_click(id)
-    local fn = clicks[id]
-    if fn then
-        vim.schedule(fn)
-    end
-end
-
 ---@param s string
 ---@return string
 local function escape(s)
     return (s:gsub("%%", "%%%%"))
 end
 
----Spans as a statusline string (`%#Group#text`). Clickable spans get `%@…@`
----regions when `ui.mouse` is on.
+---Spans as a statusline string (`%#Group#text`). `raw` spans pass through.
 ---@param spans conduit.Spans
 ---@return string
 function M.statusline(spans)
-    local mouse = require("conduit.config").options.ui.mouse
-    if mouse and not rawget(_G, "ConduitClick") then
-        rawset(_G, "ConduitClick", function(minwid)
-            on_click(minwid)
-        end)
-    end
     local out = {}
     for _, span in ipairs(spans) do
         local text = span[1]
@@ -45,15 +20,6 @@ function M.statusline(spans)
             text = escape(text)
             if span[2] then
                 text = ("%%#%s#%s%%*"):format(span[2], text)
-            end
-            if mouse and span.click then
-                local id = click_ids[span.click]
-                if not id then
-                    next_click = next_click + 1
-                    id = next_click
-                    click_ids[span.click], clicks[id] = id, span.click
-                end
-                text = ("%%%d@ConduitClick@%s%%X"):format(id, text)
             end
         end
         out[#out + 1] = text

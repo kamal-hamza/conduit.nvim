@@ -1,17 +1,26 @@
 # conduit.nvim
 
-Chat with CLI coding agents from inside Neovim over the
+A minimal way to use AI coding agents in Neovim, over the
 [Agent Client Protocol](https://agentclientprotocol.com) (ACP).
 
-Neovim acts as the ACP **client**: conduit launches an agent (Claude Code,
-Gemini CLI, Codex, or any other ACP-speaking agent) as a subprocess and talks
-JSON-RPC to it over stdio. The agent streams its replies, tool calls and plans
-into a chat buffer. It reads and writes files **through your buffers**, so it
-sees unsaved changes and its edits land in buffers you can undo.
+conduit keeps Neovim a text editor. There is no chat panel and no agent
+dashboard: you select some lines and say what you want.
 
-> Status: early. The core protocol (initialize, auth, sessions, prompts,
-> streaming updates, permissions, `fs/*`, terminals, session config options,
-> threads) works, along with inline edits and answers.
+- **Changes land in the file.** If you asked for a change, the agent's rewrite
+  replaces the selection while you keep working, as hunks you accept or reject.
+- **Explanations open in a sidebar.** If you asked a question, the answer
+  streams into a read-only split that never steals focus.
+- **Everything is kept.** Every answer (the whole conversation and the tools it
+  ran), every edit and every change the agent made to a file itself goes into a
+  per-project history you can browse, reopen, follow up on and revert.
+- **The agent is sandboxed.** It can only touch files in your project, a policy
+  decides which commands it may run (or asks you), and commands Neovim runs for
+  it are isolated by the OS.
+
+Neovim acts as the ACP **client**: conduit launches an agent (Claude Code,
+Gemini CLI, Codex, or any other ACP agent) as a subprocess and talks JSON-RPC to
+it over stdio. The agent reads and writes files **through your buffers**, so it
+sees unsaved changes and its edits land in buffers you can undo.
 
 ## Requirements
 
@@ -20,6 +29,8 @@ sees unsaved changes and its edits land in buffers you can undo.
   - Claude Code: `npx @agentclientprotocol/claude-agent-acp` (needs Node)
   - Gemini CLI: `gemini --experimental-acp`
   - Codex: `npx @agentclientprotocol/codex-acp`
+- For terminal isolation: macOS (`sandbox-exec` is built in) or Linux with
+  [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`)
 
 ## Installation
 
@@ -31,293 +42,86 @@ sees unsaved changes and its edits land in buffers you can undo.
   cmd = "Conduit",
   opts = {},
   keys = {
-    { "<leader>at", "<cmd>Conduit toggle<cr>", desc = "Toggle agent chat" },
-    { "<leader>an", "<cmd>Conduit new<cr>", desc = "New agent chat" },
-    { "<leader>am", "<cmd>Conduit model<cr>", desc = "Pick agent model" },
-    { "<leader>ai", ":Conduit inline<cr>", mode = { "n", "v" }, desc = "Inline edit or question" },
-    { "<leader>aa", "<Plug>(conduit-answer)", desc = "Focus the inline answer" },
-    { "<leader>ah", "<cmd>Conduit history<cr>", desc = "Inline history" },
-    { "<leader>as", ":Conduit add<cr>", mode = "v", desc = "Add selection to chat" },
+    { "<leader>ai", "<Plug>(conduit-inline)", mode = { "n", "x" }, desc = "Ask or edit inline" },
+    { "<leader>ae", "<Plug>(conduit-edit)", mode = { "n", "x" }, desc = "Edit inline" },
+    { "<leader>a?", "<Plug>(conduit-ask)", mode = { "n", "x" }, desc = "Ask about the lines" },
+    { "<leader>aa", "<Plug>(conduit-answer)", desc = "Focus the answer sidebar" },
+    { "<leader>as", "<Plug>(conduit-sidebar)", desc = "Toggle the answer sidebar" },
+    { "<leader>ah", "<Plug>(conduit-history)", desc = "Agent history" },
   },
 }
 ```
 
-Every action is also a `<Plug>` mapping, so you can bind any key to it:
-`<Plug>(conduit-toggle)`, `-new`, `-threads`, `-model`, `-effort`,
-`-effort-next`, `-effort-prev`, `-mode-next`, `-options`, `-answer`,
-`-answers`, `-history`, `-cancel`, and `-inline`, `-ask`, `-edit` (normal or
-visual mode). The cycling ones take a count.
-
-## Configuration
-
-These are the defaults:
-
-```lua
-require("conduit").setup({
-  default_agent = "claude",
-  agents = {
-    claude = { cmd = "npx", args = { "-y", "@agentclientprotocol/claude-agent-acp" } },
-    gemini = { cmd = "gemini", args = { "--experimental-acp" } },
-    codex = { cmd = "npx", args = { "-y", "@agentclientprotocol/codex-acp" } },
-    -- my_agent = { cmd = "my-agent", args = { "--acp" }, env = { FOO = "bar" } },
-  },
-  ui = {
-    width = 0.4,       -- fraction of the editor width, or a column count
-    input_height = 6,
-    icons = true,      -- glyphs: true (Unicode ◆ ◐ ⏵ ✓), false (ASCII only) or "nerd" (Nerd Font)
-    spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }, -- one frame turns the animation off
-    picker = "auto",   -- threads picker: "auto", "snacks", "telescope", "fzf_lua", "mini_pick", "select" or a function
-    thread_bar = true, -- threads as tabs in the chat winbar
-    inline = {
-      width = { min = 40, max = 84 }, -- inline prompt and answer float width
-      max_height = 10,                -- most lines an unfocused answer float shows
-    },
-    keys = {           -- chat keys (input and transcript); false disables one
-      model = "<M-m>", effort_next = "<M-e>", effort_prev = "<M-E>",
-      mode_next = "<S-Tab>", options = "go", help = "g?",
-    },
-    mouse = false,     -- click the status chips to change options
-    border = nil,      -- border for conduit floats; nil: answers have none, prompts follow 'winborder'
-    components = {},   -- replace or add UI components, see "Components" below
-    remember_options = false, -- options you pick in a chat become defaults for new threads
-  },
-  inline = {
-    agent = nil,       -- agent for inline edits, defaults to default_agent
-    options = {},      -- session options for inline edits, e.g. { model = "haiku", effort = "low" }
-    mcp_servers = false, -- give inline sessions the MCP servers too
-    answer = "peek",   -- where answers go: "peek" (beside the code, never focused), "chat" or "float"
-    history = { enabled = true, max_entries = 500 }, -- keep inline answers and edits per project
-  },
-  mcp_servers = {},    -- MCP servers handed to the agent, see below
-  mentions = {
-    completion = "auto", -- "auto" (blink.cmp if loaded), "blink" or "native"
-  },
-  threads = {
-    scope = "cwd",       -- past threads to offer: "cwd" (this directory) or "all"
-    persist = true,      -- remember thread ids and titles (not transcripts) on disk
-    max_listed = 200,    -- most past threads to fetch from the agent
-    hide_inline = true,  -- leave inline requests' sessions out of thread lists
-    notify = true,       -- notify when a thread you aren't looking at replies or needs permission
-  },
-  tools = {
-    diff_lines = 20,     -- diff lines previewed under a tool call, before <CR> expands it
-    output_lines = 8,    -- output lines previewed under a tool call
-    hide_output = { read = true, search = true, fetch = true }, -- kinds whose output starts hidden
-  },
-  terminal = {
-    enabled = true,          -- let agents run commands through Neovim (ACP terminals)
-    output_limit = 1048576,  -- most bytes of output kept per command (oldest dropped first)
-  },
-  review = {
-    enabled = true,  -- review agent edits; false applies them as they come
-    chat = true,     -- review edits made during chat turns
-    inline = false,  -- review edits from inline requests (off: fire-and-forget)
-    keys = {         -- buffer-local, in files with changes to review; false disables one
-      next = "]r", prev = "[r",
-      accept = "<localleader>a", reject = "<localleader>r",
-      accept_file = "<localleader>A", reject_file = "<localleader>R",
-    },
-  },
-  log_level = vim.log.levels.WARN,
-})
-```
-
-Each agent also takes `options`, which are applied to every new session:
-
-```lua
-agents = {
-  claude = {
-    cmd = "npx",
-    args = { "-y", "@agentclientprotocol/claude-agent-acp" },
-    options = { model = "opus", effort = "high", mode = "acceptEdits" },
-  },
-},
-```
-
-Keys are option ids or ACP categories (`model`, `mode`, `thought_level`), and
-`effort` is accepted as an alias for `thought_level`. The values depend on the
-agent; `:Conduit option` lists what yours offers.
-
-### MCP servers
-
-`mcp_servers` lists [MCP](https://modelcontextprotocol.io) servers that conduit
-passes to the agent when it opens a session (`mcpServers` in ACP). The agent
-starts them and can use their tools in that session. conduit never runs or talks
-to them itself.
-
-```lua
-require("conduit").setup({
-  mcp_servers = {
-    github = {
-      command = "github-mcp",  -- looked up in PATH and sent as an absolute path
-      args = {},
-      env = { GITHUB_TOKEN = function() return os.getenv("GH_TOKEN") end },
-    },
-    docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer ..." } },
-  },
-  agents = {
-    -- Per-agent servers replace global ones of the same name; false leaves one out.
-    gemini = { cmd = "gemini", args = { "--experimental-acp" }, mcp_servers = { docs = false } },
-  },
-})
-```
-
-- `type` is `"stdio"` (the default), `"http"` or `"sse"`. Stdio servers take
-  `command`, `args` and `env`. HTTP and SSE servers take `url` and `headers`.
-- Values in `env`, `headers` and `args` can be functions. They're called when
-  a session opens, so tokens don't have to live in your config.
-- `enabled = false` (or a function that returns false) turns a server off.
-- A list of servers with `name` fields works too.
-- Servers that can't be sent are skipped with a warning: the command isn't in
-  PATH, `url` is missing, or the agent doesn't support the transport. Agents
-  advertise HTTP and SSE support in `mcpCapabilities`; every agent supports stdio.
-- Inline requests open a new session each time, so they leave MCP servers out
-  unless you set `inline.mcp_servers = true`. An inline conversation moved into
-  the chat keeps its session, and with it no servers.
-- `:checkhealth conduit` shows what each agent would get.
-
-Claude Code already loads servers from its own config (`~/.claude.json`,
-`.mcp.json`). A server listed there and here starts twice, so use `mcp_servers`
-for servers you want with every agent.
+`<Plug>` mappings: `(conduit-inline)`, `-ask`, `-edit` (normal or visual mode),
+`-answer`, `-sidebar`, `-history`, `-cancel`, `-model`, `-options`.
 
 ## Usage
 
+Select some lines and press your inline key (or run `:'<,'>Conduit`). A small
+prompt opens under the selection with `@` completion. Its title shows the
+agent, the mode, the model and effort the request will use, and the lines it's
+about.
+
+- **Auto** (default): the agent decides. Ask for a change and the selection is
+  rewritten in place as one undoable change; ask a question and the answer
+  opens in the sidebar.
+- **Edit** / **Ask** force one or the other. Cycle with `<C-t>`, or start the
+  prompt with `!` (edit) or `?` (ask).
+
+In the prompt, `<CR>` sends, `<S-CR>` adds a line, `<C-o>` changes the model,
+effort or any other option for this request only, `<C-c>` (insert) or `q` /
+`<Esc>` (normal) closes it, and `g?` lists every key. While the agent works, a
+spinner and its name sit above the lines.
+
+If the request needs changes to other files, the agent makes them with its own
+tools; they show up as hunks to review in those files (see below).
+
 | Command | Description |
 | --- | --- |
-| `:Conduit` / `:Conduit toggle` | Toggle the chat window |
-| `:Conduit open [agent]` | Open the current thread, or the latest thread with `agent` (starting one if needed) |
-| `:Conduit new [agent]` | Start a new thread (fresh session); earlier threads stay alive |
-| `:Conduit threads [agent]` | Pick a live or past thread, or start a new one |
-| `:Conduit continue [agent]` | Go back to the latest thread, reopening a past one if none is live |
-| `:Conduit resume [session-id]` | Reopen a thread by session id, or pick one of the agent's past threads |
-| `:Conduit thread new\|next\|prev` | Start or cycle through threads |
-| `:Conduit thread alt` | Switch to the thread you used before this one |
-| `:Conduit thread goto {n\|title\|id}` | Go to a thread by its number in the thread bar, its title (or a unique part of it) or its session id |
-| `:Conduit thread search [--qf] [text]` | Search the transcripts of live threads; `--qf` sends matches to the quickfix list |
-| `:Conduit thread close` | Close the current thread (it stays in the history) |
-| `:Conduit thread delete` | Delete the current thread for good, after confirming |
-| `:Conduit thread fork` | Fork the current thread into a new one with the same context |
-| `:Conduit thread rename [title]` | Rename the current thread |
-| `:'<,'>Conduit add` | Add the selected lines to the prompt as a fenced block |
-| `:'<,'>Conduit inline [request]` | Edit the selection or answer a question about it, inline |
-| `:'<,'>Conduit ask [question]` | Answer a question about the selection, beside it |
-| `:'<,'>Conduit edit [instruction]` | Rewrite the selection in place |
-| `:Conduit answer` | Focus the inline answer nearest the cursor |
-| `:Conduit answers` | List the inline answers in open buffers and go to one |
-| `:Conduit history [qf\|all]` | Browse the inline history (this buffer, or `all` of the project); `qf` sends it to the quickfix list |
-| `:Conduit model [value]` | Pick or set the model |
-| `:Conduit effort [value]` | Pick or set the reasoning effort |
-| `:Conduit mode [value]` | Pick or set the mode (e.g. plan, accept edits) |
-| `:Conduit option [id] [value]` | Pick or set any session option |
-| `:Conduit commands [name]` | Pick one of the agent's slash commands and start the prompt with it |
-| `:Conduit review` | List the agent's changes waiting for review in the quickfix list |
-| `:Conduit review toggle [chat\|inline]` | Turn review of agent edits on or off, everywhere or for one source |
-| `:Conduit accept [all]` | Accept the agent's changes to the current file, or to every file |
-| `:Conduit reject [all]` | Reject the agent's changes to the current file, or to every file |
-| `:Conduit cancel` | Cancel running inline edits, or else the current turn |
+| `:'<,'>Conduit` | Open the prompt for the lines |
+| `:'<,'>Conduit inline [request]` | Edit the lines or answer a question about them |
+| `:'<,'>Conduit ask [question]` | Answer a question about the lines, in the sidebar |
+| `:'<,'>Conduit edit [instruction]` | Rewrite the lines in place |
+| `:Conduit answer` | Focus the sidebar (opening it on the latest answer) |
+| `:Conduit sidebar` | Open or close the sidebar |
+| `:Conduit history [qf\|all]` | Browse the history (this buffer, or `all` of the project); `qf` sends it to the quickfix list |
+| `:Conduit review [toggle]` | List the agent's changes waiting for review, or turn review on or off |
+| `:Conduit accept [all]` / `:Conduit reject [all]` | Accept or reject the agent's changes to the current file, or every file |
+| `:Conduit model [value]` / `effort` / `mode` | Pick or set the model, effort or mode for new requests |
+| `:Conduit option [id] [value]` | Pick or set any session option for new requests |
+| `:Conduit sandbox` | Show what the sandbox allows |
+| `:Conduit cancel` | Cancel running requests |
 | `:Conduit stop` | Kill all agent processes |
 | `:Conduit log` | Open the log file |
 
-In the prompt buffer, `<CR>` (normal mode) or `<C-s>` (insert mode) sends the
-prompt and `<C-c>` cancels the turn; `q` closes the chat and `g?` lists every
-key. The chat's winbar shows the thread bar (see below). Permission requests
-open in `vim.ui.select`, showing the tool's kind (`edit`, `execute`, ...), the
-paths it touches and the full command, every line of it.
+### The answer sidebar
 
-### Model, effort and mode
-
-The prompt's winbar shows the session's options as chips, and how full the
-context window is when the agent reports it (ACP `usage_update`):
-
-```
- ◆ Opus 4.x   ◐ high   ⏵ auto-edit                ctx 42% · 0.50 USD
-```
-
-While the agent works, a spinner takes the first chip. Everything is on keys
-(`ui.keys`), in both chat buffers:
+Answers stream into a read-only split on the right (`ui.sidebar`). It never
+takes focus on its own, so you keep editing while the agent explains. The
+sidebar's winbar shows what the agent is doing. A new answer replaces the
+previous one, which stays in the history. In the sidebar:
 
 | Key | Action |
 | --- | --- |
-| `<M-m>` | Pick the model |
-| `<M-e>` / `<M-E>` | Next / previous effort level, no picker (`2<M-e>` skips one) |
-| `<S-Tab>` | Next mode (normal mode) |
-| `go` | Pick any session option |
-| `g?` | List the chat's keys (`/` filters) |
+| `f` | Ask a follow-up in the same session (on a history entry: a new request with the old conversation as context) |
+| `a` | Replace the request's lines with the answer's last code block |
+| `gf` | Go to the request's lines |
+| `[[` / `]]` | Older / newer answer from the history |
+| `gh` | Browse the history |
+| `<C-c>` | Cancel the reply |
+| `q` | Close the sidebar |
+| `g?` | List the keys |
 
-Pickers are small keyboard floats: `j` / `k` move, `1`-`9` pick a row
-directly, `/` filters, `<CR>` picks and `<Esc>` cancels. With `ui.mouse = true`
-the chips are also clickable. `ui.remember_options = true` makes what you pick
-the default for new threads.
-
-For a statusline, `require("conduit").statusline()` returns the same chips
-(refresh on the `User ConduitStatus` autocmd), e.g. with lualine:
-`lualine_x = { function() return require("conduit").statusline() end }`.
-
-### Components
-
-The UI is built from small components: pure functions from props to
-highlighted spans, drawn into winbars, extmarks and floats. Interactive parts
-(pickers, answers, folds, the history list, help) are headless models that own
-their state and keys, with thin views on top. To change how something looks,
-replace a component in `ui.components`. Each gets its props and the built-in:
-
-```lua
-ui = {
-  components = {
-    -- Wrap the model chip in brackets.
-    Chip = function(props, builtin)
-      return vim.list_extend({ { "[" } }, vim.list_extend(builtin(props), { { "]" } }))
-    end,
-  },
-},
-```
-
-Components: `Chip`, `ChipBar`, `Spinner`, `TitleBar`, `Placeholder`,
-`HelpFloat`, `Picker`, `PromptTitle`, `RoleRule`, `ToolCallLine`,
-`ThinkingFold`, `AnswerMarker`, `AnswerPeek`, `VirtLines` and `HistoryLine`.
-A span is `{ text, highlight_group }`. See `:h conduit-components` for each
-one's props.
-
-### Transcript
-
-The transcript buffer is plain markdown (search it, yank from it, fork it),
-drawn more quietly: `## You` and the agent's header become thin labelled rules,
-your turns get a subtle background, and the agent's thinking folds to one line
-(`▸ thought for 12 lines`) that `<CR>` opens.
-
-### Tool calls
-
-Each tool call shows its status and title in the transcript. Below that come
-the files it touched, the diff of any edit it made or proposes, and its output.
-Diffs and output are cut to `tools.diff_lines` and `tools.output_lines`. Output
-from `read`, `search` and `fetch` calls (often a whole file) stays hidden until
-you expand it. When an agent asks permission for an edit, the proposed diff is
-drawn before the prompt opens. In the transcript:
-
-| Key | Action |
-| --- | --- |
-| `<CR>` | Expand or collapse the tool call under the cursor |
-| `gd` | Open its diff side by side in a new tab (`q` closes it) |
-| `gf` | Open the first file it touched, at the reported line |
-| `<localleader>A` / `<localleader>R` | Accept / reject the changes it made (see below) |
-
-Diffs are highlighted by the treesitter `diff` parser, which Neovim doesn't
-bundle (`:TSInstall diff`); `:checkhealth conduit` reports whether it's there.
-
-### Reviewing agent edits
+### Reviewing edits
 
 Agents like Claude Code and Codex write files themselves, so conduit can't hold
 an edit back for approval. Instead it keeps each file's content from before the
-agent first touched it, and shows what changed since as hunks you accept or
-reject. That works the same whether the agent asked permission first or runs in
-`acceptEdits` mode.
+agent first touched it, and shows what changed as hunks you accept or decline.
+Inline rewrites of your selection work the same way (`review.replies`).
 
-When an edit lands, the file's buffer (if it's open and has no unsaved changes)
-reloads, the agent's lines are highlighted, and the lines it removed show as
-virtual lines above them. The tool call's status line reads `review pending`
-until you're done, then `accepted`, `rejected` or `reviewed` (some of each), and
-the chat notes how many files are waiting at the end of the turn. In a file with
-changes to review:
+When an edit lands, the file's buffer reloads (if it has no unsaved changes),
+the agent's lines are highlighted and the lines it removed show as virtual
+lines above them:
 
 | Key | Action |
 | --- | --- |
@@ -326,124 +130,92 @@ changes to review:
 | `<localleader>r` | Reject it: its old lines come back, and the file is saved |
 | `<localleader>A` / `<localleader>R` | Accept / reject every change in the file |
 
-Accepting keeps the agent's text; rejecting puts the old text back, deleting a
-file the agent created or recreating one it deleted. Editing a reviewed buffer
-yourself updates the hunks, and undoing a change by hand clears it.
-`:Conduit review` lists every change in the quickfix list, and `:Conduit accept
-all` / `:Conduit reject all` settle everything at once. If the agent rewrites a
-file whose buffer has unsaved changes, the buffer is left alone and the file is
-marked as a conflict in the list; rejecting it writes back what the buffer had
-when the agent started.
+Rejecting a created file deletes it; rejecting a deletion recreates the file.
+Editing a reviewed buffer yourself updates the hunks, and undoing a change by
+hand clears it. `:Conduit review` lists every change in the quickfix list. If
+the agent rewrites a file whose buffer has unsaved changes, the buffer is left
+alone and the file is marked as a conflict; rejecting it writes back what the
+buffer had when the agent started. `review.enabled = false` applies edits as
+they come. conduit fires `User ConduitReviewChanged` (with `{ path }` in
+`data`) whenever a file's review state changes.
 
-Review is on for chat turns and off for inline requests, so those stay
-fire-and-forget. `review.chat` and `review.inline` switch each one, and
-`review.enabled = false` turns review off entirely: edits apply as they come, as
-they did before. `:Conduit review toggle [chat|inline]` flips them for the
-session. For no prompts at all, combine `review.enabled = false` with the
-agent's `mode = "acceptEdits"` option. conduit fires a `User ConduitReviewChanged`
-autocmd, with `{ path }` in `data`, whenever a file's review state changes.
+### History
 
-Edits are tracked through tool calls that report their files (`edit`, `delete`
-and `move` kinds, or any call with a diff), `fs/write_text_file` and inline
-replies. Files a shell command changes aren't tracked.
+Everything the agent does is kept per project in
+`stdpath("state")/conduit/history`:
 
-### Terminals
+- **Answers**: the request, the whole conversation (follow-ups included), and
+  the tools the agent ran with how each permission request was answered.
+- **Edits**: the lines before and after, and whether they were applied,
+  accepted, rejected or reverted.
+- **Changes**: files the agent changed with its own tools, as a diff, with what
+  you kept after review.
+- **Commands**: commands run through Neovim, whether the sandbox allowed,
+  asked or refused them, whether they were isolated, and how they exited.
 
-Agents can ask Neovim to run commands for them (ACP terminals). conduit runs
-each one as a process in the session's directory with the environment the agent
-asks for, and sends back its combined stdout and stderr, how much was dropped,
-and how it exited. Commands are killed when the agent releases them, when their
-thread closes, when the agent exits, and when Neovim quits. A command that
-arrives as a whole shell line with no arguments runs through `sh -c`.
-
-A tool call that runs a command shows the last `tools.output_lines` lines of
-its output, updated live, then the exit code or signal if it failed. `<CR>`
-expands it to the whole output. Agents that run commands themselves, such as
-Claude Code and Codex, report their output the same way. Set
-`terminal.enabled = false` to stop offering terminals to agents; output from
-agents that run commands themselves is still shown.
-
-### Threads
-
-Each chat is a thread: one ACP session with its own transcript. `:Conduit new`
-starts another thread without discarding the current one, and switching swaps
-the thread into the same chat windows. In the chat buffers, `gs` picks a thread,
-`]t` / `[t` cycle through them, `g<Tab>` goes back to the previous one and `gn`
-starts a new one. Threads are titled by the agent (`session_info_update`), by
-you (`:Conduit thread rename`), or by your first prompt until then. Inline
-answers moved into the chat become threads too.
-
-The thread bar lists every live thread as a numbered tab (the numbers work with
-`:Conduit thread goto`) and marks the ones that are working (`◐`), waiting for a
-permission answer (`!`) or finished a turn you haven't seen yet (`●`). When the
-window is too narrow, titles shrink and `‹` / `›` mark tabs that don't fit. Set
-`ui.thread_bar = false` for a plain title instead. With `threads.notify` on,
-conduit also tells you when a thread you aren't looking at replies or asks for
-permission.
-
-What else you get depends on what the agent advertises, so it works with any ACP
-agent:
-
-| Agent capability | What it adds |
-| --- | --- |
-| none | Live threads for as long as Neovim runs |
-| `loadSession` | Reopen past threads with their transcript (from conduit's local index) |
-| `sessionCapabilities.list` | Past threads come from the agent, including ones started elsewhere (e.g. its CLI) |
-| `sessionCapabilities.resume` | Threads reconnect without replaying history after the agent restarts |
-| `sessionCapabilities.close` / `delete` | Closing frees the session; deleting removes it from the agent's history |
-| `sessionCapabilities.fork` / `title` | `:Conduit thread fork`; renames are stored by the agent |
-
-The picker lists live threads (most recently used first, the current one last),
-then past threads, then "New thread". Past threads come from the current agent
-and from any other agent that's already running, in this directory
-(`threads.scope`). It uses [snacks.nvim](https://github.com/folke/snacks.nvim),
-[telescope.nvim](https://github.com/nvim-telescope/telescope.nvim),
-[fzf-lua](https://github.com/ibhagwan/fzf-lua) or
-[mini.pick](https://github.com/echasnovski/mini.pick) when one is loaded
-(`ui.picker`), with a preview of each thread's transcript. Snacks, telescope and
-mini.pick open at once and add past threads as they arrive. In those pickers:
+`:Conduit history` lists the current buffer's entries (`<Tab>` switches to the
+whole project):
 
 | Key | Action |
 | --- | --- |
-| `<CR>` | Open the thread |
-| `<C-d>` | Delete the thread (after confirming) |
-| `<C-r>` | Rename the thread (past threads are renamed locally) |
-| `<C-f>` | Fork the thread |
-| `<C-n>` | Start a new thread |
-| `<C-g>` | Switch between this directory's past threads and all of them |
+| `j` / `k` | Move |
+| `/` | Filter by prompt, file, answer, diff or kind (`answer`, `edit`, `change`) |
+| `<CR>` | Show the entry in the sidebar |
+| `gf` | Go to its lines (or file) |
+| `f` | Follow up on an answer |
+| `r` | Re-run the request on the lines |
+| `u` | Revert an edit or change, if the file hasn't changed since |
+| `dd` | Delete the entry |
 
-Without a picker plugin, `vim.ui.select` lists the same threads and opens the
-chosen one; the `:Conduit thread` commands cover the rest.
+`history.max_entries` caps it per project (default 1000).
 
-`:Conduit thread search` looks through live transcripts only (past transcripts
-stay with the agent), matching case-insensitively unless the text has capitals.
-Statuslines can show `require("conduit").status()`, which returns the current
-thread and how many threads are live, busy, unread or waiting. conduit fires
-`User` autocmds as threads change: `ConduitThreadCreated`,
-`ConduitThreadSwitched`, `ConduitThreadUpdated` and `ConduitThreadClosed`, with
-`{ agent, session_id, title }` in `data`.
+### Sandbox
 
-If the agent process exits, the
-transcript stays and the next prompt restores the session (resume, else a silent
-reload, else a fresh session with a notice). `:checkhealth conduit` shows what
-each running agent supports. The local index lives at
-`stdpath("data")/conduit/threads.json` and holds only ids, titles, directories
-and timestamps.
+conduit decides what the agent may do in three layers (`sandbox`):
 
-Chat buffers use the `conduit` and `conduit_input` filetypes, so markdown
-linters and LSPs leave them alone, and they get markdown highlighting from
-treesitter. If [markview.nvim](https://github.com/OXY2DEV/markview.nvim) is
-loaded, conduit attaches it to the transcript and answer floats itself (markview
-skips scratch buffers by default). For other renderers, add the `conduit`
-filetype to their config.
+1. **Paths.** `fs/*` requests, edits and shell redirections must stay inside
+   the roots: the working directory plus `sandbox.roots`. Outside them they're
+   refused (`outside = "deny"`, the default) or asked about (`"ask"`).
+2. **Commands.** Before a command runs, its line is split at `&&`, `||`, `;`,
+   `|` and newlines, wrappers like `env`, `nohup` and `timeout` are looked
+   through, and each part is matched against `sandbox.commands`: refused if any
+   part matches `deny`, run without asking if every part matches `allow`,
+   otherwise `default` (`"ask"`). Command substitution (`$(...)`, backticks)
+   always asks. The policy answers both ACP terminal requests and the
+   permission requests of agents that run commands themselves (Claude Code's
+   Bash tool, Codex), so a denied command is refused without a prompt and an
+   allowed one runs without one. When it asks, the prompt says why.
+3. **Isolation.** Commands Neovim runs for the agent (ACP terminals) run in an
+   OS sandbox: `sandbox-exec` on macOS, `bwrap` on Linux. They can write only
+   to the roots, `isolation.writable` and temp dirs, and have no network unless
+   `isolation.network = true`. `isolation.env = "minimal"` passes only `PATH`,
+   `HOME`, locale and the like, keeping tokens in your environment away from
+   them. Without an OS sandbox, `isolation.unavailable` decides: `"ask"`
+   (default), `"run"` or `"deny"`.
+
+**Claude Code** runs Bash itself rather than through Neovim, and its own
+permission settings may let it run commands without asking. So conduit passes
+settings to Claude's adapter with every session (`_meta.claudeCode.options`):
+an `ask` rule for Bash, which beats any allow rule in your Claude settings, so
+every command comes back to conduit as a permission request for the policy to
+answer; Claude Code's own sandbox (`sandbox.enabled`), which OS-isolates the
+commands it runs when `isolation.enabled` is on; and the sandbox roots as
+additional directories. Other agents ignore this. Add your own with an agent's
+`session_meta`, which is merged over it.
+
+Agents' "bypass permissions" modes skip every check, so conduit refuses to
+switch to one, and removes it from Claude's sessions, unless
+`sandbox.bypass = true`.
+
+The patterns are a guardrail, not a security boundary: a determined command can
+get past a pattern. OS isolation is the boundary. `:Conduit sandbox` and
+`:checkhealth conduit` show what's in effect.
 
 ### `@` mentions
 
-Type `@` in the chat prompt or the inline prompt to attach context. A
-completion menu fuzzy-matches project paths (git-tracked and untracked files,
-respecting `.gitignore`), ranking path and file-name prefix matches first, then
-directories and open buffers. With nothing typed yet it shows the special
-mentions, your open buffers and the top-level directories.
+Type `@` in the prompt to attach context. A completion menu fuzzy-matches
+project paths (git-tracked and untracked files, respecting `.gitignore`), then
+directories and open buffers.
 
 | Mention | Sends |
 | --- | --- |
@@ -456,149 +228,139 @@ mentions, your open buffers and the top-level directories.
 | `@quickfix` | The quickfix list |
 | `@diff` | Uncommitted changes (`git diff HEAD`) |
 
-Absolute and `~/` paths work too. Mentions that don't match anything are left
-as plain text, so email addresses and decorators are safe. Use `@./diff` for a
-file that shares a name with a special mention.
-
-**Completion:** with [blink.cmp](https://github.com/saghen/blink.cmp) loaded,
-conduit registers a `conduit` source for its prompt buffers automatically. You
-get file-type icons and previews in the documentation window, the menu stays
-open while you type a path (even with `menu.auto_show = false`), and accepting
-a directory reopens it so you can keep drilling down. Without blink it uses the
-native completion popup. Force one with `mentions = { completion = "blink" }`
-or `"native"`.
-
-If an agent doesn't accept embedded context, mentions are sent as links for it
-to read itself. Files over 256 KB and binary files are always sent as links.
-
-**Images:** screenshots, mockups and diagrams are sent as ACP `image` blocks
-when the agent advertises image support (`promptCapabilities.image`). Images
-are recognised by their contents (PNG, JPEG, GIF or WebP), not their
-extension. Images over 5 MB, or mentioned to an agent without image support,
-are sent as links with a warning. `:checkhealth conduit` shows which running
-agents accept images.
+Absolute and `~/` paths work too. Mentions that don't match anything are left as
+plain text. With [blink.cmp](https://github.com/saghen/blink.cmp) loaded,
+conduit registers a `conduit` source for its prompt automatically; otherwise it
+uses the native completion popup (`mentions.completion`). Agents that don't
+accept embedded context get links instead; files over 256 KB and binary files
+are always links.
 
 ### Slash commands
 
 Agents advertise their own commands (Claude Code has `/review`, `/compact`,
-`/init`, ...). Type `/` at the very start of the chat prompt or the inline
-prompt to complete them, with each command's description in the menu (blink's
-documentation window, or the native popup's info). Commands that take
-arguments show their input hint as ghost text after `/name ` until you type
-some. `:Conduit commands` lists them in `vim.ui.select` instead, and
-`:checkhealth conduit` shows what each running agent offers.
+...). Type `/` at the start of the prompt to complete them; commands that take
+arguments show their input hint as ghost text. A command is sent as is, with
+the selected lines attached, and the reply opens in the sidebar.
 
-A prompt that starts with `/name` is sent unchanged, and the agent runs the
-command. In the inline prompt, a command is sent as is (not wrapped in
-conduit's edit instructions), with the selected lines attached as context, and
-the reply opens in an answer float.
+## Configuration
 
-### Inline requests
+These are the defaults:
 
-Select some lines and run `:'<,'>Conduit inline` (`<leader>ai` in the example
-keymaps). A floating prompt opens under the selection (or above it, near the
-bottom of the window), with `@` completion. Its title shows the agent, the
-mode, the model and effort the request will use, and the lines it's about. Ask
-for a change or ask a question in the same prompt:
+```lua
+require("conduit").setup({
+  default_agent = "claude",
+  agents = {
+    claude = { cmd = "npx", args = { "-y", "@agentclientprotocol/claude-agent-acp" } },
+    gemini = { cmd = "gemini", args = { "--experimental-acp" } },
+    codex = { cmd = "npx", args = { "-y", "@agentclientprotocol/codex-acp" } },
+    -- Any agent: { cmd = "...", args = { ... }, env = { ... },
+    --   options = { model = "...", effort = "high", mode = "default" },
+    --   session_meta = { ... } }  -- extra `_meta` for session/new
+  },
+  ui = {
+    icons = true,          -- true (Unicode), false (ASCII) or "nerd"
+    spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+    inline = { width = { min = 40, max = 84 } },  -- the prompt
+    sidebar = { width = 0.35, position = "right" }, -- fraction of the editor, or columns
+    border = nil,          -- nil follows 'winborder'
+    components = {},       -- see :h conduit-components
+  },
+  inline = {
+    agent = nil,           -- defaults to default_agent
+    options = {},          -- session options for every request, e.g. { effort = "low" }
+    mcp_servers = false,   -- give requests the MCP servers (each request is a new session)
+  },
+  history = { enabled = true, max_entries = 1000 },
+  mcp_servers = {},
+  mentions = { completion = "auto" },  -- "auto" | "blink" | "native"
+  terminal = {
+    enabled = true,                -- let agents run commands through Neovim (ACP terminals)
+    output_limit = 1024 * 1024,    -- bytes of output kept per command
+  },
+  review = {
+    enabled = true,
+    replies = true,        -- review inline rewrites of the selection too
+    keys = {
+      next = "]r", prev = "[r",
+      accept = "<localleader>a", reject = "<localleader>r",
+      accept_file = "<localleader>A", reject_file = "<localleader>R",
+    },
+  },
+  sandbox = {
+    enabled = true,
+    roots = {},            -- directories besides the working directory
+    outside = "deny",      -- "deny" | "ask"
+    commands = {
+      default = "ask",     -- "ask" | "allow" | "deny"
+      allow = { "^ls%f[%s%z]", "^cat%f[%s%z]", "^rg%f[%s%z]", "^git status%f[%s%z]", "^git diff%f[%s%z]", ... },
+      deny = { "^sudo%f[%s%z]", "^rm%s.*%-%a*[rR]%a*f", "^git push%s.*%-%-force", "^git reset%s+%-%-hard", "^sh$", ... },
+    },
+    isolation = {
+      enabled = true,
+      network = false,
+      writable = {},
+      env = "inherit",     -- "inherit" | "minimal"
+      unavailable = "ask", -- "ask" | "run" | "deny"
+    },
+    bypass = false,        -- allow the agent's bypass-permissions mode
+  },
+  log_level = vim.log.levels.WARN,
+})
+```
 
-- **Auto** (default): the agent decides. If you ask for a change, the
-  selection is rewritten in place as one undoable change, and the new lines
-  flash briefly. If you ask a question, the answer shows up beside the code.
-- **Edit** / **Ask** force one or the other. Cycle modes with `<C-t>`, or start
-  the prompt with `!` (edit) or `?` (ask); the title updates as you type.
+`commands.allow` and `commands.deny` are Lua patterns; setting either replaces
+the default list rather than merging with it. `:Conduit model`, `effort`, `mode`
+and `option` change `inline.options` for the rest of the session.
 
-In the prompt, `<CR>` sends, `<S-CR>` adds a line, `<C-o>` changes the model,
-effort or any other option for this request only, `<C-c>` (insert) or `q` /
-`<Esc>` (normal) closes it, and `g?` (normal) lists every key.
+### MCP servers
 
-#### Answers stay out of your way
+`mcp_servers` lists [MCP](https://modelcontextprotocol.io) servers that conduit
+passes to the agent when it opens a session. The agent starts them; conduit
+never runs or talks to them itself.
 
-Answers never take focus, so you can keep working while one streams in, the
-same way edits apply while you do your thing:
+```lua
+require("conduit").setup({
+  mcp_servers = {
+    github = {
+      command = "github-mcp",  -- looked up in PATH and sent as an absolute path
+      env = { GITHUB_TOKEN = function() return os.getenv("GH_TOKEN") end },
+    },
+    docs = { type = "http", url = "https://example.com/mcp", headers = { Authorization = "Bearer ..." } },
+  },
+  inline = { mcp_servers = true },
+})
+```
 
-- While the agent works, a spinner and the agent's name sit above the range.
-- Short answers (two lines or fewer) appear as dim virtual lines under the
-  range. No window.
-- Longer answers stream into a borderless float beside the code when the
-  window has room, else under the range, capped at `ui.inline.max_height`
-  lines (`+N lines` says when there's more).
-- Move the cursor away from the range, or start typing somewhere else, and the
-  answer collapses to a `◆` at the end of the range's first line. Move back
-  onto the range and it shows again.
-- `:Conduit answer` (or `<Plug>(conduit-answer)`) jumps into the nearest
-  answer. `:Conduit answers` lists them all.
+- `type` is `"stdio"` (the default), `"http"` or `"sse"`. Stdio servers take
+  `command`, `args` and `env`; HTTP and SSE servers take `url` and `headers`.
+- Values in `env`, `headers` and `args` can be functions, called when a session
+  opens. `enabled = false` (or a function returning false) turns one off.
+- Per-agent `mcp_servers` replace global ones of the same name; `false` leaves
+  one out.
+- Every request opens a new session, so servers are left out unless
+  `inline.mcp_servers = true`.
 
-In a focused answer:
+Claude Code already loads servers from its own config (`~/.claude.json`,
+`.mcp.json`); a server listed there and here starts twice.
 
-| Key | Action |
-| --- | --- |
-| `a` | Apply the answer's last code block to the selection |
-| `f` | Ask a follow-up in the same session |
-| `c` | Move the conversation into the chat window, keeping the session |
-| `<C-c>` | Cancel the answer |
-| `<Esc>` | Back to the code; the answer stays |
-| `q` | Close the answer |
-| `g?` | List these keys |
+### Components
 
-Set `inline.answer = "chat"` to send answers to the chat panel instead (focus
-stays in your code; you're told when one is ready if the chat is closed), or
-`"float"` for the old behaviour: a focused float under the selection.
+The few drawn pieces (the prompt title, pickers, help, history lines) are
+components: pure functions from props to highlighted spans. Replace one in
+`ui.components`; each gets its props and the built-in:
 
-You can also pass the request on the command line, e.g.
-`:'<,'>Conduit inline why is this slow?`. `:Conduit ask` and `:Conduit edit`
-force a mode. Each request runs in its own throwaway session, so set
-`inline.options` to a fast model and low effort to make them quick.
+```lua
+ui = {
+  components = {
+    HistoryLine = function(props, builtin)
+      return vim.list_extend({ { "» " } }, builtin(props))
+    end,
+  },
+},
+```
 
-#### Inline history
-
-Every inline answer and edit is kept in its own history, separate from chat
-threads: when you asked, the file and lines, the prompt, the model and effort,
-the answer or the diff, and what happened (applied, reverted, ...). It lives in
-one file per project under `stdpath("state")/conduit/inline/`, capped at
-`inline.history.max_entries`. `:Conduit history` lists the current buffer's
-entries (or the project's when it has none):
-
-| Key | Action |
-| --- | --- |
-| `j` / `k` | Move |
-| `/` | Filter by prompt, file or answer |
-| `<Tab>` | This buffer / the whole project |
-| `<CR>` | Jump to the range |
-| `p` | Preview the answer or diff |
-| `r` | Re-run the request on the range |
-| `c` | Send the entry to a new chat |
-| `u` | Revert an applied edit, if its lines haven't changed since |
-| `dd` | Delete the entry |
-| `q` / `<Esc>` | Close |
-
-`:Conduit history qf` sends the entries to the quickfix list instead.
-
-The floats and inline decorations use these highlight groups, linked to
-standard groups by default:
-
-| Group | Default link | Used for |
-| --- | --- | --- |
-| `ConduitNormal`, `ConduitBorder`, `ConduitTitle` | `NormalFloat`, `FloatBorder`, `FloatTitle` | Float background, border, answer title |
-| `ConduitAgent` | `Title` | Agent name in titles and the status line |
-| `ConduitContext` | `Comment` | File and lines in the prompt title |
-| `ConduitModeAuto`, `ConduitModeEdit`, `ConduitModeAsk` | `Special`, `DiagnosticWarn`, `DiagnosticInfo` | Mode label |
-| `ConduitHintKey`, `ConduitHintDesc` | `Special`, `Comment` | Key hints in footers |
-| `ConduitPlaceholder` | `Comment` | Empty prompt placeholder |
-| `ConduitSpinner` | `DiagnosticInfo` | Progress spinner |
-| `ConduitInlinePending`, `ConduitInlineSign` | `CursorLine`, `DiagnosticInfo` | The range while a request runs |
-| `ConduitInlineStatus` | `Comment` | Agent name in the running status |
-| `ConduitInlineAdded` | `DiffAdd` | Lines an inline edit just wrote (briefly) |
-| `ConduitAnswer` | `NormalFloat` | Answer float background |
-| `ConduitAnswerVirt`, `ConduitAnswerMarker` | `Comment`, `DiagnosticInfo` | Short answers as virtual lines, the collapsed-answer marker |
-| `ConduitChip`, `ConduitChipIcon` | `Normal`, `Special` | Status chips |
-| `ConduitMuted`, `ConduitAccent`, `ConduitTitleText` | `Comment`, `Special`, `Title` | Quiet text, accents, titles |
-| `ConduitContextHigh` | `DiagnosticWarn` | Context use at 80% or more |
-| `ConduitRule`, `ConduitRoleUser`, `ConduitRoleAgent` | `WinSeparator`, `Title`, `Special` | Transcript role rules |
-| `ConduitUserTurn`, `ConduitThinking` | `CursorLine`, `Comment` | Your turns, folded thinking |
-| `ConduitPickerCursor`, `ConduitPickerCurrent`, `ConduitPickerIndex` | `CursorLine`, `Special`, `Comment` | Picker rows |
-| `ConduitHistoryAnswer`, `ConduitHistoryEdit` | `DiagnosticInfo`, `DiagnosticWarn` | Kind glyphs in the history list |
-
-Run `:checkhealth conduit` to check that your agents can be found.
+Components: `HelpFloat`, `Picker`, `PromptTitle` and `HistoryLine`. See
+`:h conduit-components` for their props.
 
 ## Development
 
@@ -607,26 +369,4 @@ make test     # headless test suite, drives a mock ACP agent (tests/mock_agent.l
 make lint     # stylua --check
 ```
 
-```
-lua/conduit/
-├── init.lua      -- public API, chat/agent registry
-├── config.lua    -- defaults + setup()
-├── rpc.lua       -- newline-delimited JSON-RPC over vim.system stdio
-├── agent.lua     -- ACP client: handshake, sessions, agent→client requests
-├── fs.lua        -- fs/read_text_file, fs/write_text_file (buffer-aware)
-├── options.lua   -- session options (configOptions + legacy modes/models)
-├── inline.lua    -- in-place edits of a buffer range
-├── mentions.lua  -- @ mentions: items, ranking, special context, resource and image blocks
-├── commands.lua  -- / agent commands: completion items, input hints
-├── blink.lua     -- blink.cmp source for @ mentions and / commands
-├── ui/chat.lua   -- transcript + input buffers, session/update rendering
-├── ui/tool.lua   -- tool call blocks: status, locations, diffs, output
-├── ui/prompt.lua  -- floating prompt for inline requests (modes, @ completion)
-├── ui/answer.lua  -- floating answer window anchored under the selection
-├── ui/hl.lua      -- highlight groups and float helpers (borders, key hints)
-├── ui/spinner.lua -- animated progress indicator
-├── ui/render.lua  -- markview.nvim integration
-├── ui/permission.lua
-├── health.lua    -- :checkhealth conduit
-└── log.lua
-```
+See [AGENTS.md](AGENTS.md) for how the pieces fit.

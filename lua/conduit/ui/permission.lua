@@ -106,8 +106,9 @@ end
 ---The prompt text: a header line, then the kind, paths and command.
 ---@param agent_name string
 ---@param info conduit.PermissionInfo
+---@param reason? string Why the sandbox didn't decide on its own
 ---@return string
-function M.format(agent_name, info)
+function M.format(agent_name, info, reason)
     local lines = { ("%s wants to %s"):format(agent_name, info.title) }
     if info.kind then
         table.insert(lines, "kind: " .. info.kind)
@@ -118,6 +119,9 @@ function M.format(agent_name, info)
     for i, line in ipairs(info.command or {}) do
         table.insert(lines, (i == 1 and "$ " or "  ") .. line)
     end
+    if reason then
+        table.insert(lines, "sandbox: " .. reason)
+    end
     return table.concat(lines, "\n")
 end
 
@@ -126,9 +130,10 @@ end
 ---@param call table The request's tool call, merged over what's known about it
 ---@param params table
 ---@param respond fun(err: table?, result: any)
-function M.ask(agent_name, call, params, respond)
+---@param reason? string Why the sandbox is asking
+function M.ask(agent_name, call, params, respond, reason)
     vim.ui.select(params.options or {}, {
-        prompt = M.format(agent_name, M.describe(call)),
+        prompt = M.format(agent_name, M.describe(call), reason),
         format_item = function(option)
             return option.name
         end,
@@ -147,8 +152,8 @@ end
 ---@return table
 function M.merge(known, call)
     local merged = vim.tbl_extend("force", known or {}, call or {})
-    -- Chat-only drawing state, not part of the tool call.
-    merged.block, merged.expanded = nil, nil
+    -- Bookkeeping, not part of the tool call.
+    merged.decision, merged.reason = nil, nil
     return merged
 end
 
